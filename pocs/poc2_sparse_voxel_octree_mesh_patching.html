@@ -2,52 +2,22 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>PoC 2: Sparse Voxel Octree with Dirty AABB Mesh Patching</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Option 2: Adaptive QEF Dual Contouring SVO + Dirty AABB Patching</title>
     <style>
-        body { margin: 0; overflow: hidden; background: #050508; font-family: monospace; color: #00ffcc; }
-        #hud {
-            position: absolute; top: 10px; left: 10px; background: rgba(10, 10, 20, 0.90);
-            border: 1px solid #00ffcc; padding: 15px; border-radius: 6px; pointer-events: none;
-            min-width: 340px; box-shadow: 0 0 15px rgba(0, 255, 204, 0.25);
-        }
-        h2 { margin: 0 0 10px 0; font-size: 16px; color: #fff; letter-spacing: 1px; }
-        .stat-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; }
-        .val { color: #ffff00; font-weight: bold; }
-        #progress-bar-container { width: 100%; background: #222; height: 8px; margin-top: 10px; border-radius: 4px; overflow: hidden; }
-        #progress-bar { width: 0%; height: 100%; background: #00ffcc; transition: width 0.05s linear; }
+        body { margin: 0; overflow: hidden; background: #04060c; }
     </style>
-    <script type="importmap">
-    {
-        "imports": {
-            "three": "../node_modules/three/build/three.module.js",
-            "three/addons/": "../node_modules/three/examples/jsm/"
-        }
-    }
-    </script>
 </head>
 <body>
-    <div id="hud">
-        <h2>PoC 2: SVO & Dirty AABB Patching</h2>
-        <div class="stat-row"><span>Status:</span><span id="st-status" class="val">Building SVO Tree</span></div>
-        <div class="stat-row"><span>Frame:</span><span id="st-frame" class="val">0 / 450</span></div>
-        <div class="stat-row"><span>FPS / Avg:</span><span id="st-fps" class="val">0 / 0</span></div>
-        <div class="stat-row"><span>Frame Time (ms):</span><span id="st-ft" class="val">0.00</span></div>
-        <div class="stat-row"><span>Triangles:</span><span id="st-tris" class="val">0</span></div>
-        <div class="stat-row"><span>SVO Leaves:</span><span id="st-leaves" class="val">0</span></div>
-        <div class="stat-row"><span>Carve Count:</span><span id="st-carves" class="val">0 / 6</span></div>
-        <div class="stat-row"><span>Patch Rebuild Dur:</span><span id="st-patch-dur" class="val">0.00 ms</span></div>
-        <div class="stat-row"><span>Heap RAM:</span><span id="st-heap" class="val">N/A</span></div>
-        <div id="progress-bar-container"><div id="progress-bar"></div></div>
-    </div>
-
     <script type="module">
-        import * as THREE from 'three';
-        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import * as THREE from './vendor/three.module.js';
+        import { PlanetaryBaseSandbox } from './shared/planetary_base_sandbox.js';
 
+        // --- Fast 3D Simplex-Style Noise ---
         class FastNoise3D {
             constructor(seed = 1337) { this.seed = seed; }
             hash(x, y, z) {
-                let s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + this.seed) * 43758.5453123;
+                const s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + this.seed) * 43758.5453123;
                 return s - Math.floor(s);
             }
             noise(x, y, z) {
@@ -75,280 +45,471 @@
             }
         }
 
-        const R = 2800;
-        const DOMAIN_SIZE = 7600;
-        const SVO_DEPTH = 3; // Hierarchical levels
-        const LEAF_RES = 16;
+        const noise = new FastNoise3D(4242);
 
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x020205);
-        scene.fog = new THREE.FogExp2(0x020205, 0.00012);
+        let currentRadius = 2800;
+        const LEAF_RES = 12; // 12x12x12 cells per SVO leaf
+        let LEAF_SIZE = 750;
+        let CELL_SIZE = LEAF_SIZE / LEAF_RES;
 
-        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 10, 50000);
-        camera.position.set(0, 1800, 4800);
+        const svoLeaves = [];
+        const activeLeafMeshes = [];
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        renderer.shadowMap.enabled = true;
-        document.body.appendChild(renderer.domElement);
-
-        const controls = new OrbitControls(camera, renderer.domElement);
-        controls.enableDamping = true;
-        controls.dampingFactor = 0.05;
-
-        scene.add(new THREE.AmbientLight(0x222233, 1.8));
-        const sunLight = new THREE.DirectionalLight(0xfff5e6, 3.2);
-        sunLight.position.set(5000, 8000, 4000);
-        scene.add(sunLight);
-
-        const rockMaterial = new THREE.MeshStandardMaterial({
-            roughness: 0.85,
-            metalness: 0.15,
-            vertexColors: true
+        const leafMaterial = new THREE.MeshStandardMaterial({
+            vertexColors: true,
+            roughness: 0.65,
+            metalness: 0.3,
+            flatShading: false,
+            side: THREE.FrontSide
         });
 
-        const noiseGen = new FastNoise3D(1337);
+        // 8 Corners of a unit cell
+        const corners = [
+            [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
+            [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]
+        ];
 
-        function getDensity(x, y, z) {
-            const dist = Math.sqrt(x*x + y*y + z*z);
-            const noiseVal = noiseGen.fbm(x * 0.0012, y * 0.0012, z * 0.0012, 3) * 450.0;
-            return dist - (R + noiseVal);
-        }
+        // 12 edges
+        const cellEdges = [
+            [0, 1], [2, 3], [4, 5], [6, 7], // parallel to X
+            [0, 2], [1, 3], [4, 6], [5, 7], // parallel to Y
+            [0, 4], [1, 5], [2, 6], [3, 7]  // parallel to Z
+        ];
 
-        // SVO Node & Leaf Patching Structure
-        class SVOLeaf {
+        class SVOLeafNode {
             constructor(minX, minY, minZ, size) {
-                this.minX = minX; this.minY = minY; this.minZ = minZ;
+                this.minX = minX;
+                this.minY = minY;
+                this.minZ = minZ;
                 this.size = size;
+                this.cellSize = size / LEAF_RES;
                 this.mesh = null;
-                this.isHomogeneous = false;
-                this.solid = false;
+
+                // Allocate density and material grid of dimension (LEAF_RES + 1)^3
+                const gRes = LEAF_RES + 1;
+                this.gRes = gRes;
+                this.gRes2 = gRes * gRes;
+                const totalCells = gRes * gRes * gRes;
+                this.density = new Float32Array(totalCells);
+                this.material = new Uint8Array(totalCells);
+
+                this.initField();
             }
 
-            extractMesh() {
-                if (this.mesh) {
-                    scene.remove(this.mesh);
-                    this.mesh.geometry.dispose();
-                }
+            initField() {
+                const gRes = this.gRes;
+                let idx = 0;
+                for (let z = 0; z < gRes; z++) {
+                    const wz = this.minZ + z * this.cellSize;
+                    for (let y = 0; y < gRes; y++) {
+                        const wy = this.minY + y * this.cellSize;
+                        for (let x = 0; x < gRes; x++) {
+                            const wx = this.minX + x * this.cellSize;
+                            const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
+                            const n = noise.fbm(wx * 0.0016, wy * 0.0016, wz * 0.0016, 3) * (currentRadius * 0.16);
+                            const d = dist - (currentRadius + n);
+                            this.density[idx] = d;
 
-                const res = LEAF_RES;
-                const cellSize = this.size / res;
+                            if (d < 0 && Math.sin(wx * 0.008) * Math.cos(wy * 0.008) > 0.6) {
+                                this.material[idx] = 2; // Ore vein
+                            } else {
+                                this.material[idx] = 1; // Rock
+                            }
+                            idx++;
+                        }
+                    }
+                }
+            }
+
+            getD(x, y, z) {
+                return this.density[x + y * this.gRes + z * this.gRes2];
+            }
+
+            getMat(x, y, z) {
+                return this.material[x + y * this.gRes + z * this.gRes2];
+            }
+
+            // Adaptive QEF Dual Contouring extraction
+            extractDualContour(scene) {
+                const gRes = this.gRes;
                 const vertices = [];
                 const normals = [];
                 const colors = [];
                 const indices = [];
 
-                // Simple marching cubes / surface extraction on leaf voxel grid
-                const grid = new Float32Array((res+1)*(res+1)*(res+1));
-                let insideCount = 0;
-                let outsideCount = 0;
+                // Flat map of dual vertices for cells [0 .. LEAF_RES - 1]
+                const cellVertMap = new Int32Array(LEAF_RES * LEAF_RES * LEAF_RES).fill(-1);
 
-                for (let z = 0; z <= res; z++) {
-                    for (let y = 0; y <= res; y++) {
-                        for (let x = 0; x <= res; x++) {
-                            const vx = this.minX + x * cellSize;
-                            const vy = this.minY + y * cellSize;
-                            const vz = this.minZ + z * cellSize;
-                            const d = getDensity(vx, vy, vz);
-                            grid[x + (res+1)*(y + (res+1)*z)] = d;
-                            if (d < 0) insideCount++; else outsideCount++;
+                function cellKey(cx, cy, cz) {
+                    return cx + cy * LEAF_RES + cz * LEAF_RES * LEAF_RES;
+                }
+
+                // Step 1: For each cell, solve QEF to place dual vertex
+                for (let cz = 0; cz < LEAF_RES; cz++) {
+                    for (let cy = 0; cy < LEAF_RES; cy++) {
+                        for (let cx = 0; cx < LEAF_RES; cx++) {
+                            let mask = 0;
+                            const cVals = new Float32Array(8);
+                            let matCounts = { 1: 0, 2: 0, 3: 0 };
+
+                            for (let c = 0; c < 8; c++) {
+                                const px = cx + corners[c][0];
+                                const py = cy + corners[c][1];
+                                const pz = cz + corners[c][2];
+                                const v = this.getD(px, py, pz);
+                                cVals[c] = v;
+                                if (v < 0) {
+                                    mask |= (1 << c);
+                                    const m = this.getMat(px, py, pz);
+                                    if (matCounts[m] !== undefined) matCounts[m]++;
+                                }
+                            }
+
+                            if (mask === 0 || mask === 255) continue; // Pure void or pure solid
+
+                            // Collect edge crossings and normals
+                            const points = [];
+                            const pNorms = [];
+                            let massPoint = new THREE.Vector3(0, 0, 0);
+
+                            for (let e = 0; e < 12; e++) {
+                                const c1 = cellEdges[e][0];
+                                const c2 = cellEdges[e][1];
+                                const v1 = cVals[c1];
+                                const v2 = cVals[c2];
+
+                                if ((v1 < 0) !== (v2 < 0)) {
+                                    const t = v1 / (v1 - v2);
+                                    const p1 = corners[c1];
+                                    const p2 = corners[c2];
+                                    const ix = cx + p1[0] + t * (p2[0] - p1[0]);
+                                    const iy = cy + p1[1] + t * (p2[1] - p1[1]);
+                                    const iz = cz + p1[2] + t * (p2[2] - p1[2]);
+
+                                    const pt = new THREE.Vector3(
+                                        this.minX + ix * this.cellSize,
+                                        this.minY + iy * this.cellSize,
+                                        this.minZ + iz * this.cellSize
+                                    );
+                                    points.push(pt);
+                                    massPoint.add(pt);
+
+                                    // Gradient normal
+                                    const gpx = Math.round(ix);
+                                    const gpy = Math.round(iy);
+                                    const gpz = Math.round(iz);
+                                    const nx = (gpx < gRes - 1 ? this.getD(gpx + 1, gpy, gpz) : v2) - (gpx > 0 ? this.getD(gpx - 1, gpy, gpz) : v1);
+                                    const ny = (gpy < gRes - 1 ? this.getD(gpx, gpy + 1, gpz) : v2) - (gpy > 0 ? this.getD(gpx, gpy - 1, gpz) : v1);
+                                    const nz = (gpz < gRes - 1 ? this.getD(gpx, gpy, gpz + 1) : v2) - (gpz > 0 ? this.getD(gpx, gpy, gpz - 1) : v1);
+                                    const nVec = new THREE.Vector3(nx, ny, nz).normalize();
+                                    pNorms.push(nVec);
+                                }
+                            }
+
+                            if (points.length === 0) continue;
+                            massPoint.divideScalar(points.length);
+
+                            // QEF Minimization:
+                            // Iterative regularized gradient descent to locate sharp feature or smooth average
+                            let qefPos = massPoint.clone();
+                            const lambda = 0.15; // Regularization bias towards mass point
+                            const stepSize = 0.25;
+
+                            for (let iter = 0; iter < 6; iter++) {
+                                const grad = new THREE.Vector3(0, 0, 0);
+                                for (let p = 0; p < points.length; p++) {
+                                    const norm = pNorms[p];
+                                    const diff = qefPos.clone().sub(points[p]);
+                                    const dot = norm.dot(diff);
+                                    grad.addScaledVector(norm, 2.0 * dot);
+                                }
+                                grad.add(qefPos.clone().sub(massPoint).multiplyScalar(2.0 * lambda));
+                                qefPos.sub(grad.multiplyScalar(stepSize));
+                            }
+
+                            // Clamp QEF vertex inside cell bounds
+                            const cellMinX = this.minX + cx * this.cellSize;
+                            const cellMinY = this.minY + cy * this.cellSize;
+                            const cellMinZ = this.minZ + cz * this.cellSize;
+                            const cellMaxX = cellMinX + this.cellSize;
+                            const cellMaxY = cellMinY + this.cellSize;
+                            const cellMaxZ = cellMinZ + this.cellSize;
+
+                            qefPos.x = THREE.MathUtils.clamp(qefPos.x, cellMinX, cellMaxX);
+                            qefPos.y = THREE.MathUtils.clamp(qefPos.y, cellMinY, cellMaxY);
+                            qefPos.z = THREE.MathUtils.clamp(qefPos.z, cellMinZ, cellMaxZ);
+
+                            // Average normal
+                            const avgNorm = new THREE.Vector3();
+                            pNorms.forEach(n => avgNorm.add(n));
+                            avgNorm.normalize();
+
+                            // Material determination
+                            let domMat = 1;
+                            if (matCounts[2] > matCounts[1] && matCounts[2] >= matCounts[3]) domMat = 2;
+                            if (matCounts[3] > 0) domMat = 3; // Titanium bulkhead
+
+                            let rCol, gCol, bCol;
+                            if (domMat === 3) {
+                                rCol = 0.12; gCol = 0.90; bCol = 0.98; // Metallic Cyan
+                            } else if (domMat === 2) {
+                                rCol = 0.95; gCol = 0.70; bCol = 0.15; // Gold Ore
+                            } else {
+                                const strata = 0.5 + 0.5 * Math.sin(qefPos.y * 0.02);
+                                rCol = 0.44 + 0.08 * strata;
+                                gCol = 0.46 + 0.06 * strata;
+                                bCol = 0.50 + 0.10 * strata;
+                            }
+
+                            const vIdx = vertices.length / 3;
+                            cellVertMap[cellKey(cx, cy, cz)] = vIdx;
+
+                            vertices.push(qefPos.x, qefPos.y, qefPos.z);
+                            normals.push(avgNorm.x, avgNorm.y, avgNorm.z);
+                            colors.push(rCol, gCol, bCol);
                         }
                     }
                 }
 
-                if (insideCount === 0 || outsideCount === 0) {
-                    this.isHomogeneous = true;
-                    this.solid = (insideCount > 0);
-                    return; // Skip homogenous leaves (saves GPU memory and draw calls!)
-                }
+                // Step 2: Connect 4 dual vertices sharing sign-changing edges
+                for (let cz = 1; cz < LEAF_RES; cz++) {
+                    for (let cy = 1; cy < LEAF_RES; cy++) {
+                        for (let cx = 1; cx < LEAF_RES; cx++) {
+                            const d0 = this.getD(cx, cy, cz);
 
-                this.isHomogeneous = false;
+                            // X-axis edge
+                            const dX = this.getD(cx + 1, cy, cz);
+                            if ((d0 < 0) !== (dX < 0)) {
+                                const v0 = cellVertMap[cellKey(cx, cy - 1, cz - 1)];
+                                const v1 = cellVertMap[cellKey(cx, cy, cz - 1)];
+                                const v2 = cellVertMap[cellKey(cx, cy, cz)];
+                                const v3 = cellVertMap[cellKey(cx, cy - 1, cz)];
+                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
+                                    if (d0 < 0) {
+                                        indices.push(v0, v1, v2, v0, v2, v3);
+                                    } else {
+                                        indices.push(v0, v2, v1, v0, v3, v2);
+                                    }
+                                }
+                            }
 
-                // Extract surface points via dual contouring / voxel centers near zero crossing
-                const cellVerts = new Map();
-                for (let z = 0; z < res; z++) {
-                    for (let y = 0; y < res; y++) {
-                        for (let x = 0; x < res; x++) {
-                            const d0 = grid[x + (res+1)*(y + (res+1)*z)];
-                            const d1 = grid[(x+1) + (res+1)*(y + (res+1)*z)];
-                            if ((d0 < 0) !== (d1 < 0)) {
-                                const wx = this.minX + (x + 0.5) * cellSize;
-                                const wy = this.minY + (y + 0.5) * cellSize;
-                                const wz = this.minZ + (z + 0.5) * cellSize;
-                                const vIdx = vertices.length / 3;
-                                cellVerts.set(`${x},${y},${z}`, vIdx);
-                                vertices.push(wx, wy, wz);
-                                normals.push(0, 1, 0);
-                                colors.push(0.48, 0.45, 0.42);
+                            // Y-axis edge
+                            const dY = this.getD(cx, cy + 1, cz);
+                            if ((d0 < 0) !== (dY < 0)) {
+                                const v0 = cellVertMap[cellKey(cx - 1, cy, cz - 1)];
+                                const v1 = cellVertMap[cellKey(cx - 1, cy, cz)];
+                                const v2 = cellVertMap[cellKey(cx, cy, cz)];
+                                const v3 = cellVertMap[cellKey(cx, cy, cz - 1)];
+                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
+                                    if (d0 < 0) {
+                                        indices.push(v0, v2, v1, v0, v3, v2);
+                                    } else {
+                                        indices.push(v0, v1, v2, v0, v2, v3);
+                                    }
+                                }
+                            }
+
+                            // Z-axis edge
+                            const dZ = this.getD(cx, cy, cz + 1);
+                            if ((d0 < 0) !== (dZ < 0)) {
+                                const v0 = cellVertMap[cellKey(cx - 1, cy - 1, cz)];
+                                const v1 = cellVertMap[cellKey(cx, cy - 1, cz)];
+                                const v2 = cellVertMap[cellKey(cx, cy, cz)];
+                                const v3 = cellVertMap[cellKey(cx - 1, cy, cz)];
+                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
+                                    if (d0 < 0) {
+                                        indices.push(v0, v1, v2, v0, v2, v3);
+                                    } else {
+                                        indices.push(v0, v2, v1, v0, v3, v2);
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                if (vertices.length > 0) {
-                    const posArr = new Float32Array(vertices);
-                    const normArr = new Float32Array(normals);
-                    const colArr = new Float32Array(colors);
-                    const idxArr = new Uint32Array(indices);
-
-                    const geom = new THREE.BufferGeometry();
-                    geom.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
-                    geom.setAttribute('normal', new THREE.BufferAttribute(normArr, 3));
-                    geom.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
-
-                    const mesh = new THREE.Mesh(geom, rockMaterial);
-                    mesh.castShadow = true;
-                    mesh.receiveShadow = true;
-                    scene.add(mesh);
-                    this.mesh = mesh;
-                }
-            }
-        }
-
-        const leaves = [];
-        const halfDomain = DOMAIN_SIZE / 2;
-        const leafSize = DOMAIN_SIZE / 8; // 8x8x8 leaf grid = 512 potential leaves, culled by SVO homogeneity
-
-        function buildSVO() {
-            for (let z = -halfDomain; z < halfDomain; z += leafSize) {
-                for (let y = -halfDomain; y < halfDomain; y += leafSize) {
-                    for (let x = -halfDomain; x < halfDomain; x += leafSize) {
-                        // Cull leaves far outside asteroid radius
-                        const distToCenter = Math.sqrt(x + leafSize/2)**2 + (y + leafSize/2)**2 + (z + leafSize/2)**2;
-                        if (distToCenter > (R + leafSize * 1.5)**2) continue;
-
-                        const leaf = new SVOLeaf(x, y, z, leafSize);
-                        leaf.extractMesh();
-                        leaves.push(leaf);
+                if (indices.length === 0 || vertices.length === 0) {
+                    if (this.mesh) {
+                        scene.remove(this.mesh);
+                        const idx = activeLeafMeshes.indexOf(this.mesh);
+                        if (idx !== -1) activeLeafMeshes.splice(idx, 1);
+                        this.mesh.geometry.dispose();
+                        this.mesh = null;
                     }
+                    return;
+                }
+
+                if (!this.mesh) {
+                    const geo = new THREE.BufferGeometry();
+                    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertices), 3));
+                    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normals), 3));
+                    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
+                    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+
+                    this.mesh = new THREE.Mesh(geo, leafMaterial);
+                    this.mesh.userData = { leaf: this };
+                    scene.add(this.mesh);
+                    activeLeafMeshes.push(this.mesh);
+                } else {
+                    const geo = this.mesh.geometry;
+                    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertices), 3));
+                    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normals), 3));
+                    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
+                    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+                    geo.attributes.position.needsUpdate = true;
+                    geo.attributes.normal.needsUpdate = true;
+                    geo.attributes.color.needsUpdate = true;
+                    geo.computeBoundingSphere();
+                    geo.computeBoundingBox();
                 }
             }
         }
 
-        buildSVO();
+        function initSVO(scene) {
+            activeLeafMeshes.forEach(m => {
+                scene.remove(m);
+                m.geometry.dispose();
+            });
+            activeLeafMeshes.length = 0;
+            svoLeaves.length = 0;
 
-        // Dirty AABB Patching Carve
-        function carveDirtyAABB(center, radius) {
-            const startTime = performance.now();
-            const minX = center.x - radius, maxX = center.x + radius;
-            const minY = center.y - radius, maxY = center.y + radius;
-            const minZ = center.z - radius, maxZ = center.z + radius;
+            LEAF_SIZE = currentRadius * 0.65;
+            CELL_SIZE = LEAF_SIZE / LEAF_RES;
+            const bound = Math.ceil((currentRadius * 1.3) / LEAF_SIZE);
 
-            let patchedCount = 0;
-            for (let leaf of leaves) {
-                // Check if leaf intersects carve AABB
-                if (leaf.minX + leaf.size < minX || leaf.minX > maxX ||
-                    leaf.minY + leaf.size < minY || leaf.minY > maxY ||
-                    leaf.minZ + leaf.size < minZ || leaf.minZ > maxZ) {
-                    continue;
-                }
-
-                // Re-extract only affected leaf patch!
-                patchedCount++;
-                leaf.extractMesh();
-            }
-
-            const dur = performance.now() - startTime;
-            return dur;
-        }
-
-        let frameCount = 0;
-        let carveCount = 0;
-        const totalFrames = 450;
-        const frameTimes = [];
-        const carveDurations = [];
-        let benchmarkStarted = false;
-        let lastTime = performance.now();
-
-        window.startBenchmark = function() {
-            benchmarkStarted = true;
-            document.getElementById('st-status').innerText = 'Running Benchmark';
-        };
-
-        setTimeout(() => window.startBenchmark(), 1000);
-
-        function animate() {
-            requestAnimationFrame(animate);
-
-            const now = performance.now();
-            const ft = now - lastTime;
-            lastTime = now;
-
-            if (benchmarkStarted && frameCount < totalFrames) {
-                frameTimes.push(ft);
-                frameCount++;
-
-                const carveTriggers = [60, 120, 180, 240, 300, 360];
-                if (carveTriggers.includes(frameCount) && carveCount < 6) {
-                    const angle = carveCount * Math.PI / 3;
-                    const carvePos = new THREE.Vector3(
-                        Math.cos(angle) * 1800,
-                        (carveCount % 2 === 0 ? 400 : -400),
-                        Math.sin(angle) * 1800
-                    );
-                    const dur = carveDirtyAABB(carvePos, 900);
-                    carveDurations.push(dur);
-                    carveCount++;
-                    document.getElementById('st-patch-dur').innerText = dur.toFixed(2) + ' ms';
-                    document.getElementById('st-carves').innerText = `${carveCount} / 6`;
-                }
-
-                const avgFt = frameTimes.reduce((a,b)=>a+b,0) / frameTimes.length;
-                const fps = 1000 / (ft || 1);
-                const avgFps = 1000 / avgFt;
-                document.getElementById('st-frame').innerText = `${frameCount} / ${totalFrames}`;
-                document.getElementById('st-fps').innerText = `${fps.toFixed(1)} / ${avgFps.toFixed(1)}`;
-                document.getElementById('st-ft').innerText = ft.toFixed(2);
-                document.getElementById('progress-bar').style.width = `${(frameCount / totalFrames) * 100}%`;
-
-                let totalTris = 0;
-                let activeLeaves = 0;
-                for (let leaf of leaves) {
-                    if (leaf.mesh) {
-                        activeLeaves++;
-                        if (leaf.mesh.geometry.index) {
-                            totalTris += leaf.mesh.geometry.index.count / 3;
+            for (let z = -bound; z <= bound; z++) {
+                for (let y = -bound; y <= bound; y++) {
+                    for (let x = -bound; x <= bound; x++) {
+                        const minX = x * LEAF_SIZE;
+                        const minY = y * LEAF_SIZE;
+                        const minZ = z * LEAF_SIZE;
+                        const center = new THREE.Vector3(minX + LEAF_SIZE * 0.5, minY + LEAF_SIZE * 0.5, minZ + LEAF_SIZE * 0.5);
+                        const dist = center.length();
+                        if (dist < currentRadius + LEAF_SIZE * 0.9 && dist > currentRadius - LEAF_SIZE * 0.9) {
+                            const leaf = new SVOLeafNode(minX, minY, minZ, LEAF_SIZE);
+                            leaf.extractDualContour(scene);
+                            svoLeaves.push(leaf);
                         }
                     }
                 }
-                document.getElementById('st-tris').innerText = totalTris.toLocaleString();
-                document.getElementById('st-leaves').innerText = `${activeLeaves} / ${leaves.length}`;
-
-                if (performance.memory) {
-                    document.getElementById('st-heap').innerText = (performance.memory.usedJSHeapSize / 1048576).toFixed(2) + ' MB';
-                }
-
-                if (frameCount === totalFrames) {
-                    document.getElementById('st-status').innerText = 'Benchmark Complete';
-                    const sortedFt = [...frameTimes].sort((a,b)=>a-b);
-                    const p99 = sortedFt[Math.floor(sortedFt.length * 0.99)];
-                    const avgCarve = carveDurations.reduce((a,b)=>a+b,0) / carveDurations.length;
-
-                    window.__BENCHMARK_RESULTS__ = {
-                        summary: {
-                            totalFrames,
-                            avgFrameTimeMs: Number(avgFt.toFixed(2)),
-                            p99FrameTimeMs: Number(p99.toFixed(2)),
-                            avgFps: Number(avgFps.toFixed(1)),
-                            minFps: Number((1000 / Math.max(...frameTimes)).toFixed(1)),
-                            trianglesCount: totalTris,
-                            carveCount,
-                            avgCarveDurationMs: Number(avgCarve.toFixed(2)),
-                            heapMemoryMb: performance.memory ? Number((performance.memory.usedJSHeapSize / 1048576).toFixed(2)) : 0
-                        },
-                        frameTimes,
-                        carveDurations
-                    };
-                    console.log("BENCHMARK_COMPLETE", JSON.stringify(window.__BENCHMARK_RESULTS__));
-                }
             }
-
-            controls.update();
-            renderer.render(scene, camera);
         }
 
-        animate();
+        // Shared Sandbox Setup
+        const sandbox = new PlanetaryBaseSandbox({
+            pocId: 'poc2',
+            pocTitle: 'Option 2: QEF Dual Contouring SVO',
+            defaultRadius: currentRadius,
+            getCollisionMesh: () => activeLeafMeshes,
+            getVisualMesh: () => activeLeafMeshes,
+
+            // Localized Dirty AABB Patching Carve
+            onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
+                const affectedLeaves = [];
+                const sphere = new THREE.Sphere(hitPoint, brushRadius + CELL_SIZE * 2);
+
+                svoLeaves.forEach(leaf => {
+                    const box = new THREE.Box3(
+                        new THREE.Vector3(leaf.minX, leaf.minY, leaf.minZ),
+                        new THREE.Vector3(leaf.minX + leaf.size, leaf.minY + leaf.size, leaf.minZ + leaf.size)
+                    );
+                    if (box.intersectsSphere(sphere)) {
+                        affectedLeaves.push(leaf);
+                    }
+                });
+
+                affectedLeaves.forEach(leaf => {
+                    let modified = false;
+                    const gRes = leaf.gRes;
+                    let idx = 0;
+                    for (let z = 0; z < gRes; z++) {
+                        const wz = leaf.minZ + z * leaf.cellSize;
+                        for (let y = 0; y < gRes; y++) {
+                            const wy = leaf.minY + y * leaf.cellSize;
+                            for (let x = 0; x < gRes; x++) {
+                                const wx = leaf.minX + x * leaf.cellSize;
+                                const dist = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
+                                if (dist <= brushRadius) {
+                                    // Exact continuous carving equation
+                                    const carveD = brushRadius - dist;
+                                    if (carveD > leaf.density[idx]) {
+                                        leaf.density[idx] = carveD;
+                                        modified = true;
+                                    }
+                                }
+                                idx++;
+                            }
+                        }
+                    }
+                    if (modified) {
+                        leaf.extractDualContour(sandbox.scene);
+                    }
+                });
+            },
+
+            // Titanium Armor Wall Reinforcement
+            onReinforce: async (hitPoint, hitNormal, brushRadius) => {
+                const sphere = new THREE.Sphere(hitPoint, brushRadius + CELL_SIZE * 2);
+                svoLeaves.forEach(leaf => {
+                    const box = new THREE.Box3(
+                        new THREE.Vector3(leaf.minX, leaf.minY, leaf.minZ),
+                        new THREE.Vector3(leaf.minX + leaf.size, leaf.minY + leaf.size, leaf.minZ + leaf.size)
+                    );
+                    if (box.intersectsSphere(sphere)) {
+                        let modified = false;
+                        const gRes = leaf.gRes;
+                        let idx = 0;
+                        for (let z = 0; z < gRes; z++) {
+                            const wz = leaf.minZ + z * leaf.cellSize;
+                            for (let y = 0; y < gRes; y++) {
+                                const wy = leaf.minY + y * leaf.cellSize;
+                                for (let x = 0; x < gRes; x++) {
+                                    const wx = leaf.minX + x * leaf.cellSize;
+                                    const dist = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
+                                    if (dist <= brushRadius && leaf.density[idx] < 0) {
+                                        leaf.material[idx] = 3; // Reinforced Titanium Bulkhead
+                                        modified = true;
+                                    }
+                                    idx++;
+                                }
+                            }
+                        }
+                        if (modified) {
+                            leaf.extractDualContour(sandbox.scene);
+                        }
+                    }
+                });
+            },
+
+            checkMaterialAtHit: (point, hit) => {
+                if (hit && hit.face) {
+                    const colAttr = hit.object.geometry.attributes.color;
+                    if (colAttr) {
+                        const a = hit.face.a;
+                        if (colAttr.getY(a) > 0.8 && colAttr.getZ(a) > 0.9) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            },
+
+            onScaleChange: (scaleKey, radius) => {
+                currentRadius = radius;
+                initSVO(sandbox.scene);
+            },
+
+            onToggleWireframe: (enabled) => {
+                leafMaterial.wireframe = enabled;
+            },
+
+            onToggleXRay: (enabled, plane) => {
+                leafMaterial.clippingPlanes = enabled ? [plane] : [];
+                leafMaterial.needsUpdate = true;
+            }
+        });
+
+        initSVO(sandbox.scene);
     </script>
 </body>
 </html>

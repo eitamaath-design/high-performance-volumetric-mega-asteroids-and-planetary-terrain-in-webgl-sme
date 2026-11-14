@@ -1,147 +1,224 @@
-// Surface Nets Isosurface Extraction Worker
-// Computes dual-grid surface extraction with 1-voxel padding and transfers buffers back via Transferables.
+/**
+ * Surface Nets Isosurface Extraction Worker
+ * True Dual-Grid Surface Nets with 1-Voxel Halo Seam Stitching & Multi-Material Support
+ * 
+ * Generates watertight 2-manifold mesh from density + material voxel data.
+ */
 
 self.onmessage = function(e) {
-    const { chunkId, res, voxelData, minBounds, maxBounds, cellSize } = e.data;
-    
-    // voxelData is a Float32Array containing density values for (res + 2)^3 due to 1-voxel border padding
-    const paddedRes = res + 2;
+    const { chunkId, res, voxelData, materialData, minBounds, cellSize } = e.data;
+    // voxelData is Float32Array of dimension (res + 3)^3
+    // Padded coordinate: px in [0 .. res + 2]
+    const pRes = res + 3;
+    const pRes2 = pRes * pRes;
+
+    function getIndex(px, py, pz) {
+        return px + py * pRes + pz * pRes2;
+    }
+
+    function getDensity(px, py, pz) {
+        return voxelData[px + py * pRes + pz * pRes2];
+    }
+
+    function getMaterial(px, py, pz) {
+        return materialData ? materialData[px + py * pRes + pz * pRes2] : 1;
+    }
+
+    // Corner offsets of cell (0..1, 0..1, 0..1)
+    const corners = [
+        [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
+        [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]
+    ];
+
+    // Standard 12 cube edges
+    const cubeEdges = [
+        [0, 1], [2, 3], [4, 5], [6, 7], // parallel to X
+        [0, 2], [1, 3], [4, 6], [5, 7], // parallel to Y
+        [0, 4], [1, 5], [2, 6], [3, 7]  // parallel to Z
+    ];
+
     const vertices = [];
     const normals = [];
     const colors = [];
+    const materials = [];
     const indices = [];
 
-    // Surface Nets dual grid polygonization across inner cells [0..res-1]
-    // Each cell (x, y, z) has 8 corners in the padded grid.
-    const cubeEdges = [
-        [0,1,0], [1,1,0], [1,0,0], [0,0,0],
-        [0,1,1], [1,1,1], [1,0,1], [0,0,1]
-    ];
+    // Map cell (cx, cy, cz) to dual vertex index
+    // Using a flat Int32Array for cells [0..res+1]
+    const cellCount = res + 2;
+    const cellCount2 = cellCount * cellCount;
+    const cellVertexIndex = new Int32Array(cellCount * cellCount * cellCount).fill(-1);
 
-    // Helper to get density at local padded coordinates (x, y, z)
-    function getDensity(x, y, z) {
-        return voxelData[x + paddedRes * (y + paddedRes * z)];
+    function getCellKey(cx, cy, cz) {
+        return cx + cy * cellCount + cz * cellCount2;
     }
 
-    // Edge table & dual vertex generation
-    const cellVertices = new Map();
-
-    for (let z = 0; z < res; z++) {
-        for (let y = 0; y < res; y++) {
-            for (let x = 0; x < res; x++) {
-                // Padded indices start at x+1, y+1, z+1
-                const px = x + 1;
-                const py = y + 1;
-                const pz = z + 1;
-
-                // Check 8 corners
+    // Step 1: For each cell [0 .. res+1], check 8 corners and generate dual vertex if sign changes
+    for (let cz = 0; cz < cellCount; cz++) {
+        for (let cy = 0; cy < cellCount; cy++) {
+            for (let cx = 0; cx < cellCount; cx++) {
+                // Corner densities
                 let mask = 0;
-                let dSum = 0;
-                const cornerVals = new Array(8);
-                let edgeIntersections = 0;
+                let cVals = new Float32Array(8);
+                let matCounts = { 1: 0, 2: 0, 3: 0 }; // rock, ore, titanium
 
                 for (let c = 0; c < 8; c++) {
-                    const cx = px + cubeEdges[c][0];
-                    const cy = py + cubeEdges[c][1];
-                    const cz = pz + cubeEdges[c][2];
-                    const val = getDensity(cx, cy, cz);
-                    cornerVals[c] = val;
-                    if (val < 0.0) mask |= (1 << c);
-                    dSum += val;
+                    const px = cx + corners[c][0];
+                    const py = cy + corners[c][1];
+                    const pz = cz + corners[c][2];
+                    const val = getDensity(px, py, pz);
+                    cVals[c] = val;
+                    if (val < 0.0) {
+                        mask |= (1 << c);
+                        const m = getMaterial(px, py, pz);
+                        if (matCounts[m] !== undefined) matCounts[m]++;
+                    }
                 }
 
-                if (mask === 0 || mask === 255) continue; // Completely inside or outside
+                if (mask === 0 || mask === 255) continue; // Completely solid or empty
 
-                // Compute dual vertex position via edge crossing average / relaxation
+                // Calculate edge intersections & dual vertex via relaxation
                 let vx = 0, vy = 0, vz = 0;
                 let edgeCount = 0;
 
-                // Standard 12 cube edges check for surface crossing
-                const edges = [
-                    [0,1], [1,2], [2,3], [3,0],
-                    [4,5], [5,6], [6,7], [7,4],
-                    [0,4], [1,5], [2,6], [3,7]
-                ];
-
                 for (let e = 0; e < 12; e++) {
-                    const c1 = edges[e][0];
-                    const c2 = edges[e][1];
-                    const v1 = cornerVals[c1];
-                    const v2 = cornerVals[c2];
+                    const c1 = cubeEdges[e][0];
+                    const c2 = cubeEdges[e][1];
+                    const v1 = cVals[c1];
+                    const v2 = cVals[c2];
 
                     if ((v1 < 0.0) !== (v2 < 0.0)) {
+                        // Linear interpolation factor t where density = 0
                         const t = v1 / (v1 - v2);
-                        const e1 = cubeEdges[c1];
-                        const e2 = cubeEdges[c2];
-                        const ex = px + e1[0] + t * (e2[0] - e1[0]);
-                        const ey = py + e1[1] + t * (e2[1] - e1[1]);
-                        const ez = pz + e1[2] + t * (e2[2] - e1[2]);
-
-                        vx += ex - 1; // offset back to local chunk coords [0..res]
-                        vy += ey - 1;
-                        vz += ez - 1;
+                        const p1 = corners[c1];
+                        const p2 = corners[c2];
+                        vx += cx + p1[0] + t * (p2[0] - p1[0]);
+                        vy += cy + p1[1] + t * (p2[1] - p1[1]);
+                        vz += cz + p1[2] + t * (p2[2] - p1[2]);
                         edgeCount++;
                     }
                 }
 
-                if (edgeCount > 0) {
-                    vx /= edgeCount;
-                    vy /= edgeCount;
-                    vz /= edgeCount;
+                if (edgeCount === 0) continue;
 
-                    // Map to world coordinates
-                    const wx = minBounds[0] + vx * cellSize;
-                    const wy = minBounds[1] + vy * cellSize;
-                    const wz = minBounds[2] + vz * cellSize;
+                vx /= edgeCount;
+                vy /= edgeCount;
+                vz /= edgeCount;
 
-                    // Approximate normal via central differences on padded grid
-                    const eps = 1.0;
-                    const nx = getDensity(px + 1, py, pz) - getDensity(px - 1, py, pz);
-                    const ny = getDensity(px, py + 1, pz) - getDensity(px, py - 1, pz);
-                    const nz = getDensity(px, py, pz + 1) - getDensity(px, py, pz - 1);
-                    const len = Math.sqrt(nx * nx + ny * ny + nz * nz) + 0.00001;
-                    const normX = nx / len;
-                    const normY = ny / len;
-                    const normZ = nz / len;
+                // Map to world coordinates. Note: cell (1, 1, 1) starts at chunk minBounds
+                const wx = minBounds[0] + (vx - 1) * cellSize;
+                const wy = minBounds[1] + (vy - 1) * cellSize;
+                const wz = minBounds[2] + (vz - 1) * cellSize;
 
-                    // Color based on height / depth strata
-                    const distFromCenter = Math.sqrt(wx * wx + wy * wy + wz * wz);
-                    const rCol = 0.45 + 0.15 * Math.sin(wx * 0.01);
-                    const gCol = 0.42 + 0.12 * Math.cos(wy * 0.01);
-                    const bCol = 0.48 + 0.18 * Math.sin(wz * 0.01);
+                // Compute normal via central differences on density grid
+                const ipx = Math.round(vx);
+                const ipy = Math.round(vy);
+                const ipz = Math.round(vz);
+                const nx = getDensity(ipx + 1, ipy, ipz) - getDensity(ipx - 1, ipy, ipz);
+                const ny = getDensity(ipx, ipy + 1, ipz) - getDensity(ipx, ipy - 1, ipz);
+                const nz = getDensity(ipx, ipy, ipz + 1) - getDensity(ipx, ipy, ipz - 1);
+                const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1.0;
 
-                    const vIndex = vertices.length / 3;
-                    cellVertices.set(`${x},${y},${z}`, vIndex);
+                // Determine dominant material
+                let domMat = 1; // Default Rock
+                if (matCounts[2] > matCounts[1] && matCounts[2] >= matCounts[3]) domMat = 2; // Ore
+                if (matCounts[3] > 0) domMat = 3; // Reinforced Titanium takes precedence
 
-                    vertices.push(wx, wy, wz);
-                    normals.push(normX, normY, normZ);
-                    colors.push(rCol, gCol, bCol);
+                // Vertex color based on material
+                let rCol, gCol, bCol;
+                if (domMat === 3) {
+                    // Reinforced Titanium Bulkhead: Glowing metallic cyan/slate armor
+                    rCol = 0.12; gCol = 0.90; bCol = 0.98;
+                } else if (domMat === 2) {
+                    // Mineral Ore Vein: Gold/amber glow
+                    rCol = 0.95; gCol = 0.70; bCol = 0.15;
+                } else {
+                    // Regolith / Basalt Rock
+                    const strata = 0.5 + 0.5 * Math.sin(wy * 0.02 + wx * 0.01);
+                    rCol = 0.42 + 0.10 * strata;
+                    gCol = 0.44 + 0.08 * strata;
+                    bCol = 0.48 + 0.12 * strata;
                 }
+
+                const vIdx = vertices.length / 3;
+                cellVertexIndex[getCellKey(cx, cy, cz)] = vIdx;
+
+                vertices.push(wx, wy, wz);
+                normals.push(nx / len, ny / len, nz / len);
+                colors.push(rCol, gCol, bCol);
+                materials.push(domMat);
             }
         }
     }
 
-    // Generate quad/triangle faces between adjacent dual vertices in cells sharing an edge
-    for (let z = 0; z < res - 1; z++) {
-        for (let y = 0; y < res - 1; y++) {
-            for (let x = 0; x < res - 1; x++) {
-                // Check edges along x, y, z axes between adjacent cells
-                // For simplicity in Surface Nets, connect cell (x,y,z) with neighbors (x+1,y,z), (x,y+1,z), (x,y,z+1)
-                const v0 = cellVertices.get(`${x},${y},${z}`);
-                if (v0 === undefined) continue;
+    // Step 2: Emit quads (2 triangles) across sign-changing interior grid edges
+    // Edges exist between integer grid points in range [1 .. res+1]
+    for (let pz = 1; pz <= res; pz++) {
+        for (let py = 1; py <= res; py++) {
+            for (let px = 1; px <= res; px++) {
+                const d0 = getDensity(px, py, pz);
 
-                const v1 = cellVertices.get(`${x+1},${y},${z}`);
-                const v2 = cellVertices.get(`${x},${y+1},${z}`);
-                const v3 = cellVertices.get(`${x},${y},${z+1}`);
+                // Edge 1: Along X-axis: (px, py, pz) -> (px+1, py, pz)
+                const dX = getDensity(px + 1, py, pz);
+                if ((d0 < 0.0) !== (dX < 0.0)) {
+                    // Shared by 4 cells:
+                    // c0: (px, py-1, pz-1), c1: (px, py, pz-1), c2: (px, py, pz), c3: (px, py-1, pz)
+                    const v0 = cellVertexIndex[getCellKey(px, py - 1, pz - 1)];
+                    const v1 = cellVertexIndex[getCellKey(px, py, pz - 1)];
+                    const v2 = cellVertexIndex[getCellKey(px, py, pz)];
+                    const v3 = cellVertexIndex[getCellKey(px, py - 1, pz)];
 
-                if (v1 !== undefined && v2 !== undefined) {
-                    indices.push(v0, v1, v2);
+                    if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
+                        if (d0 < 0.0) {
+                            indices.push(v0, v1, v2);
+                            indices.push(v0, v2, v3);
+                        } else {
+                            indices.push(v0, v2, v1);
+                            indices.push(v0, v3, v2);
+                        }
+                    }
                 }
-                if (v1 !== undefined && v3 !== undefined) {
-                    indices.push(v0, v3, v1);
+
+                // Edge 2: Along Y-axis: (px, py, pz) -> (px, py+1, pz)
+                const dY = getDensity(px, py + 1, pz);
+                if ((d0 < 0.0) !== (dY < 0.0)) {
+                    // Shared by 4 cells:
+                    // c0: (px-1, py, pz-1), c1: (px, py, pz-1), c2: (px, py, pz), c3: (px-1, py, pz)
+                    const v0 = cellVertexIndex[getCellKey(px - 1, py, pz - 1)];
+                    const v1 = cellVertexIndex[getCellKey(px, py, pz - 1)];
+                    const v2 = cellVertexIndex[getCellKey(px, py, pz)];
+                    const v3 = cellVertexIndex[getCellKey(px - 1, py, pz)];
+
+                    if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
+                        if (d0 < 0.0) {
+                            indices.push(v0, v2, v1);
+                            indices.push(v0, v3, v2);
+                        } else {
+                            indices.push(v0, v1, v2);
+                            indices.push(v0, v2, v3);
+                        }
+                    }
                 }
-                if (v2 !== undefined && v3 !== undefined) {
-                    indices.push(v0, v2, v3);
+
+                // Edge 3: Along Z-axis: (px, py, pz) -> (px, py, pz+1)
+                const dZ = getDensity(px, py, pz + 1);
+                if ((d0 < 0.0) !== (dZ < 0.0)) {
+                    // Shared by 4 cells:
+                    // c0: (px-1, py-1, pz), c1: (px, py-1, pz), c2: (px, py, pz), c3: (px-1, py, pz)
+                    const v0 = cellVertexIndex[getCellKey(px - 1, py - 1, pz)];
+                    const v1 = cellVertexIndex[getCellKey(px, py - 1, pz)];
+                    const v2 = cellVertexIndex[getCellKey(px, py, pz)];
+                    const v3 = cellVertexIndex[getCellKey(px - 1, py, pz)];
+
+                    if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
+                        if (d0 < 0.0) {
+                            indices.push(v0, v1, v2);
+                            indices.push(v0, v2, v3);
+                        } else {
+                            indices.push(v0, v2, v1);
+                            indices.push(v0, v3, v2);
+                        }
+                    }
                 }
             }
         }
@@ -150,6 +227,7 @@ self.onmessage = function(e) {
     const posArray = new Float32Array(vertices);
     const normArray = new Float32Array(normals);
     const colArray = new Float32Array(colors);
+    const matArray = new Uint8Array(materials);
     const idxArray = new Uint32Array(indices);
 
     self.postMessage({
@@ -158,6 +236,7 @@ self.onmessage = function(e) {
         positions: posArray,
         normals: normArray,
         colors: colArray,
+        materials: matArray,
         indices: idxArray
-    }, [posArray.buffer, normArray.buffer, colArray.buffer, idxArray.buffer]);
+    }, [posArray.buffer, normArray.buffer, colArray.buffer, matArray.buffer, idxArray.buffer]);
 };

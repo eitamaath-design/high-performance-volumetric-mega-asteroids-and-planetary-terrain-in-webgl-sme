@@ -7,27 +7,33 @@ const PORT = 8085;
 const ROOT_DIR = path.resolve(__dirname, '..');
 
 const server = http.createServer((req, res) => {
-    let filePath = path.join(ROOT_DIR, req.url === '/' ? 'benchmarks/rockets_baseline.html' : req.url);
-    if (!fs.existsSync(filePath)) {
-        res.writeHead(404);
+    const cleanUrl = req.url.split('?')[0];
+    const relPath = cleanUrl === '/' ? 'benchmarks/rockets_baseline.html' : cleanUrl.replace(/^\//, '');
+    const filePath = path.join(ROOT_DIR, relPath);
+
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not found: ' + req.url);
         return;
     }
-    const ext = path.extname(filePath);
+
+    const ext = path.extname(filePath).toLowerCase();
     const mimeTypes = {
-        '.html': 'text/html',
-        '.js': 'text/javascript',
-        '.css': 'text/css',
-        '.json': 'application/json'
+        '.html': 'text/html; charset=utf-8',
+        '.js': 'text/javascript; charset=utf-8',
+        '.mjs': 'text/javascript; charset=utf-8',
+        '.css': 'text/css; charset=utf-8',
+        '.json': 'application/json; charset=utf-8'
     };
     const contentType = mimeTypes[ext] || 'application/octet-stream';
+
     fs.readFile(filePath, (err, content) => {
         if (err) {
-            res.writeHead(500);
-            res.end('Server error');
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('Server error: ' + err.message);
         } else {
             res.writeHead(200, { 'Content-Type': contentType });
-            res.end(content, 'utf-8');
+            res.end(content);
         }
     });
 });
@@ -49,7 +55,7 @@ server.listen(PORT, async () => {
         });
 
         console.log('Navigating to benchmark page...');
-        await page.goto(`http://localhost:${PORT}/benchmarks/rockets_baseline.html`, { waitUntil: 'networkidle' });
+        await page.goto(`http://localhost:${PORT}/benchmarks/rockets_baseline.html?benchmark=true`, { waitUntil: 'networkidle' });
 
         console.log('Waiting for window.__BENCHMARK_RESULTS__ (timeout 60s)...');
         await page.waitForFunction(() => window.__BENCHMARK_RESULTS__, { timeout: 60000 });

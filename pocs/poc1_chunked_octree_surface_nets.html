@@ -2,53 +2,22 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>PoC 1: Chunked Octree Surface Nets with Async Web Workers</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Option 1: Chunked Octree Surface Nets with Async Web Workers</title>
     <style>
-        body { margin: 0; overflow: hidden; background: #050508; font-family: monospace; color: #00ffcc; }
-        #hud {
-            position: absolute; top: 10px; left: 10px; background: rgba(10, 10, 20, 0.90);
-            border: 1px solid #00ffcc; padding: 15px; border-radius: 6px; pointer-events: none;
-            min-width: 340px; box-shadow: 0 0 15px rgba(0, 255, 204, 0.25);
-        }
-        h2 { margin: 0 0 10px 0; font-size: 16px; color: #fff; letter-spacing: 1px; }
-        .stat-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; }
-        .val { color: #ffff00; font-weight: bold; }
-        #progress-bar-container { width: 100%; background: #222; height: 8px; margin-top: 10px; border-radius: 4px; overflow: hidden; }
-        #progress-bar { width: 0%; height: 100%; background: #00ffcc; transition: width 0.05s linear; }
+        body { margin: 0; overflow: hidden; background: #04060c; }
     </style>
-    <script type="importmap">
-    {
-        "imports": {
-            "three": "../node_modules/three/build/three.module.js",
-            "three/addons/": "../node_modules/three/examples/jsm/"
-        }
-    }
-    </script>
 </head>
 <body>
-    <div id="hud">
-        <h2>PoC 1: Chunked Octree Surface Nets</h2>
-        <div class="stat-row"><span>Status:</span><span id="st-status" class="val">Initializing Workers</span></div>
-        <div class="stat-row"><span>Frame:</span><span id="st-frame" class="val">0 / 450</span></div>
-        <div class="stat-row"><span>FPS / Avg:</span><span id="st-fps" class="val">0 / 0</span></div>
-        <div class="stat-row"><span>Frame Time (ms):</span><span id="st-ft" class="val">0.00</span></div>
-        <div class="stat-row"><span>Triangles:</span><span id="st-tris" class="val">0</span></div>
-        <div class="stat-row"><span>Chunks Active:</span><span id="st-chunks" class="val">0</span></div>
-        <div class="stat-row"><span>Carve Count:</span><span id="st-carves" class="val">0 / 6</span></div>
-        <div class="stat-row"><span>Last Carve Dur:</span><span id="st-carve-dur" class="val">0.00 ms</span></div>
-        <div class="stat-row"><span>Heap RAM:</span><span id="st-heap" class="val">N/A</span></div>
-        <div id="progress-bar-container"><div id="progress-bar"></div></div>
-    </div>
-
     <script type="module">
-        import * as THREE from 'three';
-        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import * as THREE from './vendor/three.module.js';
+        import { PlanetaryBaseSandbox } from './shared/planetary_base_sandbox.js';
 
-        // --- Fast PRNG & Noise ---
+        // --- Fast 3D Simplex-Style Noise for Procedural Asteroid Form ---
         class FastNoise3D {
             constructor(seed = 1337) { this.seed = seed; }
             hash(x, y, z) {
-                let s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + this.seed) * 43758.5453123;
+                const s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + this.seed) * 43758.5453123;
                 return s - Math.floor(s);
             }
             noise(x, y, z) {
@@ -76,310 +45,307 @@
             }
         }
 
-        const R = 2800;
-        const DOMAIN_SIZE = 7600;
-        const CHUNK_RES = 16; // 16x16x16 per chunk
-        const NUM_CHUNKS_PER_AXIS = 4; // 4x4x4 = 64 chunks covering domain
-        const CHUNK_SIZE = DOMAIN_SIZE / NUM_CHUNKS_PER_AXIS;
+        const noise = new FastNoise3D(2026);
 
-        // Scene Setup
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x020205);
-        scene.fog = new THREE.FogExp2(0x020205, 0.00012);
+        // --- Option 1 Constants ---
+        let currentRadius = 2800;
+        const CHUNK_RES = 16; // 16x16x16 cells
+        let CHUNK_SIZE = 900;  // Dynamically scaled
+        let CELL_SIZE = CHUNK_SIZE / CHUNK_RES;
 
-        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 10, 50000);
-        camera.position.set(0, 1800, 4800);
+        // Sparse Chunks Map
+        const chunkMap = new Map(); // key 'cx,cy,cz' => Chunk object
+        const activeChunkMeshes = [];
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        renderer.shadowMap.enabled = true;
-        document.body.appendChild(renderer.domElement);
+        // Worker Pool
+        const WORKER_COUNT = 3;
+        const workerPool = [];
+        let workerIndex = 0;
 
-        const controls = new OrbitControls(camera, renderer.domElement);
-        controls.enableDamping = true;
-        controls.dampingFactor = 0.05;
+        for (let i = 0; i < WORKER_COUNT; i++) {
+            const worker = new Worker(new URL('workers/surface_nets_worker.js', window.location.href).href);
+            worker.busy = false;
+            workerPool.push(worker);
+        }
 
-        // Lighting
-        scene.add(new THREE.AmbientLight(0x222233, 1.8));
-        const sunLight = new THREE.DirectionalLight(0xfff5e6, 3.2);
-        sunLight.position.set(5000, 8000, 4000);
-        scene.add(sunLight);
-        const fillLight = new THREE.DirectionalLight(0x336699, 1.2);
-        fillLight.position.set(-5000, -3000, -4000);
-        scene.add(fillLight);
+        function getNextWorker() {
+            const available = workerPool.find(w => !w.busy);
+            if (available) return available;
+            workerIndex = (workerIndex + 1) % workerPool.length;
+            return workerPool[workerIndex];
+        }
 
-        // Triplanar Rock Shader
-        function createRockMaterial(seedOffset = 0) {
-            const mat = new THREE.MeshStandardMaterial({
-                roughness: 0.85,
-                metalness: 0.15,
-                vertexColors: true
+        // Shared Standard Material with Vertex Colors
+        const chunkMaterial = new THREE.MeshStandardMaterial({
+            vertexColors: true,
+            roughness: 0.65,
+            metalness: 0.25,
+            flatShading: false,
+            side: THREE.FrontSide
+        });
+
+        class VoxelChunk {
+            constructor(cx, cy, cz) {
+                this.cx = cx;
+                this.cy = cy;
+                this.cz = cz;
+                this.key = `${cx},${cy},${cz}`;
+                this.minBounds = new THREE.Vector3(cx * CHUNK_SIZE, cy * CHUNK_SIZE, cz * CHUNK_SIZE);
+                this.maxBounds = this.minBounds.clone().addScalar(CHUNK_SIZE);
+                this.center = this.minBounds.clone().addScalar(CHUNK_SIZE * 0.5);
+
+                const pRes = CHUNK_RES + 3;
+                const totalVoxels = pRes * pRes * pRes;
+                this.voxelData = new Float32Array(totalVoxels);
+                this.materialData = new Uint8Array(totalVoxels);
+
+                this.mesh = null;
+                this.isDirty = true;
+                this.isGenerating = false;
+
+                this.initVoxels();
+            }
+
+            initVoxels() {
+                const pRes = CHUNK_RES + 3;
+                let idx = 0;
+                for (let pz = 0; pz < pRes; pz++) {
+                    const wz = this.minBounds.z + (pz - 1) * CELL_SIZE;
+                    for (let py = 0; py < pRes; py++) {
+                        const wy = this.minBounds.y + (py - 1) * CELL_SIZE;
+                        for (let px = 0; px < pRes; px++) {
+                            const wx = this.minBounds.x + (px - 1) * CELL_SIZE;
+                            const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
+                            // Procedural asteroid with craters & noise
+                            const n = noise.fbm(wx * 0.0015, wy * 0.0015, wz * 0.0015, 3) * (currentRadius * 0.18);
+                            // Signed distance: negative = solid inside, positive = empty space outside
+                            const d = dist - (currentRadius + n);
+                            this.voxelData[idx] = d;
+
+                            // Material: 1 = Rock, 2 = Ore Vein
+                            if (d < 0 && Math.sin(wx * 0.006) * Math.cos(wz * 0.006) > 0.65) {
+                                this.materialData[idx] = 2; // Ore vein
+                            } else {
+                                this.materialData[idx] = 1; // Native rock
+                            }
+                            idx++;
+                        }
+                    }
+                }
+            }
+
+            rebuildMesh(scene) {
+                if (this.isGenerating) return;
+                this.isGenerating = true;
+
+                const worker = getNextWorker();
+                worker.busy = true;
+
+                // Clone buffers for worker transfer
+                const voxelCopy = new Float32Array(this.voxelData);
+                const matCopy = new Uint8Array(this.materialData);
+
+                const handleMessage = (e) => {
+                    worker.removeEventListener('message', handleMessage);
+                    worker.busy = false;
+                    this.isGenerating = false;
+
+                    const { positions, normals, colors, materials, indices } = e.data;
+
+                    if (positions.length === 0 || indices.length === 0) {
+                        if (this.mesh) {
+                            scene.remove(this.mesh);
+                            const mIdx = activeChunkMeshes.indexOf(this.mesh);
+                            if (mIdx !== -1) activeChunkMeshes.splice(mIdx, 1);
+                            this.mesh.geometry.dispose();
+                            this.mesh = null;
+                        }
+                        return;
+                    }
+
+                    if (!this.mesh) {
+                        const geo = new THREE.BufferGeometry();
+                        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                        geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+                        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                        geo.setIndex(new THREE.BufferAttribute(indices, 1));
+
+                        this.mesh = new THREE.Mesh(geo, chunkMaterial);
+                        this.mesh.userData = { chunk: this };
+                        scene.add(this.mesh);
+                        activeChunkMeshes.push(this.mesh);
+                    } else {
+                        const geo = this.mesh.geometry;
+                        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                        geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+                        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                        geo.setIndex(new THREE.BufferAttribute(indices, 1));
+                        geo.attributes.position.needsUpdate = true;
+                        geo.attributes.normal.needsUpdate = true;
+                        geo.attributes.color.needsUpdate = true;
+                        geo.computeBoundingSphere();
+                        geo.computeBoundingBox();
+                    }
+                };
+
+                worker.addEventListener('message', handleMessage);
+                worker.postMessage({
+                    chunkId: this.key,
+                    res: CHUNK_RES,
+                    voxelData: voxelCopy,
+                    materialData: matCopy,
+                    minBounds: [this.minBounds.x, this.minBounds.y, this.minBounds.z],
+                    cellSize: CELL_SIZE
+                }, [voxelCopy.buffer, matCopy.buffer]);
+            }
+        }
+
+        // Initialize Chunks around asteroid surface
+        function initAsteroidChunks(scene) {
+            // Clean up existing
+            activeChunkMeshes.forEach(m => {
+                scene.remove(m);
+                m.geometry.dispose();
             });
-            mat.userData = { seedOffset };
-            mat.customProgramCacheKey = () => `poc1_triplanar_${seedOffset}`;
-            mat.onBeforeCompile = (shader) => {
-                shader.vertexShader = `
-                    varying vec3 vLocalPos;
-                ` + shader.vertexShader;
-                shader.vertexShader = shader.vertexShader.replace(
-                    '#include <begin_vertex>',
-                    `#include <begin_vertex>
-                     vLocalPos = position;`
-                );
-            };
-            return mat;
+            activeChunkMeshes.length = 0;
+            chunkMap.clear();
+
+            CHUNK_SIZE = currentRadius * 0.65;
+            CELL_SIZE = CHUNK_SIZE / CHUNK_RES;
+
+            const boundChunks = Math.ceil((currentRadius * 1.3) / CHUNK_SIZE);
+
+            for (let cz = -boundChunks; cz <= boundChunks; cz++) {
+                for (let cy = -boundChunks; cy <= boundChunks; cy++) {
+                    for (let cx = -boundChunks; cx <= boundChunks; cx++) {
+                        const chunkCenter = new THREE.Vector3((cx + 0.5) * CHUNK_SIZE, (cy + 0.5) * CHUNK_SIZE, (cz + 0.5) * CHUNK_SIZE);
+                        const distToOrigin = chunkCenter.length();
+                        // Allocate chunks intersecting asteroid surface shell
+                        if (distToOrigin < currentRadius + CHUNK_SIZE * 0.9 && distToOrigin > currentRadius - CHUNK_SIZE * 0.9) {
+                            const chunk = new VoxelChunk(cx, cy, cz);
+                            chunkMap.set(chunk.key, chunk);
+                            chunk.rebuildMesh(scene);
+                        }
+                    }
+                }
+            }
         }
 
-        const rockMaterial = createRockMaterial(42);
+        // Initialize Shared Sandbox
+        const sandbox = new PlanetaryBaseSandbox({
+            pocId: 'poc1',
+            pocTitle: 'Option 1: Chunked Surface Nets + Workers',
+            defaultRadius: currentRadius,
+            getCollisionMesh: () => activeChunkMeshes,
+            getVisualMesh: () => activeChunkMeshes,
 
-        // Chunk Manager & Web Worker Pool
-        const worker = new Worker('workers/surface_nets_worker.js');
-        const noiseGen = new FastNoise3D(1337);
+            // Continuous Spherical Laser Carve Invariant
+            onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
+                const pRes = CHUNK_RES + 3;
+                const affectedChunks = new Set();
 
-        // Generate global voxel volume or chunk volumes with 1-voxel padding
-        const chunksMap = new Map(); // chunkId -> { mesh, bounds, voxelData }
+                // Find all chunks intersecting brush sphere
+                chunkMap.forEach(chunk => {
+                    const chunkBox = new THREE.Box3(chunk.minBounds, chunk.maxBounds);
+                    const sphere = new THREE.Sphere(hitPoint, brushRadius + CELL_SIZE * 2);
+                    if (chunkBox.intersectsSphere(sphere)) {
+                        affectedChunks.add(chunk);
+                    }
+                });
 
-        function getDensityAt(x, y, z) {
-            const dist = Math.sqrt(x*x + y*y + z*z);
-            const noiseVal = noiseGen.fbm(x * 0.0012, y * 0.0012, z * 0.0012, 3) * 450.0;
-            return dist - (R + noiseVal);
-        }
+                affectedChunks.forEach(chunk => {
+                    let idx = 0;
+                    let modified = false;
+                    for (let pz = 0; pz < pRes; pz++) {
+                        const wz = chunk.minBounds.z + (pz - 1) * CELL_SIZE;
+                        for (let py = 0; py < pRes; py++) {
+                            const wy = chunk.minBounds.y + (py - 1) * CELL_SIZE;
+                            for (let px = 0; px < pRes; px++) {
+                                const wx = chunk.minBounds.x + (px - 1) * CELL_SIZE;
+                                const distToCenter = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
 
-        function initChunks() {
-            const halfDomain = DOMAIN_SIZE / 2;
-            for (let cz = 0; cz < NUM_CHUNKS_PER_AXIS; cz++) {
-                for (let cy = 0; cy < NUM_CHUNKS_PER_AXIS; cy++) {
-                    for (let cx = 0; cx < NUM_CHUNKS_PER_AXIS; cx++) {
-                        const chunkId = `${cx},${cy},${cz}`;
-                        const minX = -halfDomain + cx * CHUNK_SIZE;
-                        const minY = -halfDomain + cy * CHUNK_SIZE;
-                        const minZ = -halfDomain + cz * CHUNK_SIZE;
-                        const maxX = minX + CHUNK_SIZE;
-                        const maxY = minY + CHUNK_SIZE;
-                        const maxZ = minZ + CHUNK_SIZE;
+                                if (distToCenter <= brushRadius) {
+                                    // Exact continuous carve equation:
+                                    // d_new(x) = max(d(x), R_brush - ||x - p_hit||)
+                                    const carveD = brushRadius - distToCenter;
+                                    if (carveD > chunk.voxelData[idx]) {
+                                        chunk.voxelData[idx] = carveD;
+                                        modified = true;
+                                    }
+                                }
+                                idx++;
+                            }
+                        }
+                    }
+                    if (modified) {
+                        chunk.rebuildMesh(sandbox.scene);
+                    }
+                });
+            },
 
-                        // Padded resolution: CHUNK_RES + 2
-                        const paddedRes = CHUNK_RES + 2;
-                        const cellSize = CHUNK_SIZE / CHUNK_RES;
-                        const voxelData = new Float32Array(paddedRes * paddedRes * paddedRes);
-
-                        let index = 0;
-                        for (let z = 0; z < paddedRes; z++) {
-                            for (let y = 0; y < paddedRes; y++) {
-                                for (let x = 0; x < paddedRes; x++) {
-                                    const vx = minX + (x - 1) * cellSize;
-                                    const vy = minY + (y - 1) * cellSize;
-                                    const vz = minZ + (z - 1) * cellSize;
-                                    voxelData[index++] = getDensityAt(vx, vy, vz);
+            // Nanite Titanium Armor Beam Reinforcement
+            onReinforce: async (hitPoint, hitNormal, brushRadius) => {
+                const pRes = CHUNK_RES + 3;
+                chunkMap.forEach(chunk => {
+                    const chunkBox = new THREE.Box3(chunk.minBounds, chunk.maxBounds);
+                    const sphere = new THREE.Sphere(hitPoint, brushRadius + CELL_SIZE * 2);
+                    if (chunkBox.intersectsSphere(sphere)) {
+                        let idx = 0;
+                        let modified = false;
+                        for (let pz = 0; pz < pRes; pz++) {
+                            const wz = chunk.minBounds.z + (pz - 1) * CELL_SIZE;
+                            for (let py = 0; py < pRes; py++) {
+                                const wy = chunk.minBounds.y + (py - 1) * CELL_SIZE;
+                                for (let px = 0; px < pRes; px++) {
+                                    const wx = chunk.minBounds.x + (px - 1) * CELL_SIZE;
+                                    const dist = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
+                                    if (dist <= brushRadius && chunk.voxelData[idx] < 0) {
+                                        chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
+                                        modified = true;
+                                    }
+                                    idx++;
                                 }
                             }
                         }
-
-                        chunksMap.set(chunkId, {
-                            chunkId,
-                            minBounds: [minX, minY, minZ],
-                            maxBounds: [maxX, maxY, maxZ],
-                            cellSize,
-                            voxelData,
-                            mesh: null
-                        });
-
-                        // Request extraction from Web Worker
-                        worker.postMessage({
-                            chunkId,
-                            res: CHUNK_RES,
-                            voxelData,
-                            minBounds: [minX, minY, minZ],
-                            maxBounds: [maxX, maxY, maxZ],
-                            cellSize
-                        }, [voxelData.buffer]);
+                        if (modified) {
+                            chunk.rebuildMesh(sandbox.scene);
+                        }
                     }
-                }
-            }
-        }
+                });
+            },
 
-        let pendingExtractions = 0;
-        worker.onmessage = function(e) {
-            const { chunkId, success, positions, normals, colors, indices } = e.data;
-            if (!success) return;
-
-            const chunk = chunksMap.get(chunkId);
-            if (!chunk) return;
-
-            if (chunk.mesh) {
-                scene.remove(chunk.mesh);
-                chunk.mesh.geometry.dispose();
-            }
-
-            if (indices.length > 0) {
-                const geom = new THREE.BufferGeometry();
-                geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                geom.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-                geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-                geom.setIndex(new THREE.BufferAttribute(indices, 1));
-
-                const mesh = new THREE.Mesh(geom, rockMaterial);
-                mesh.castShadow = true;
-                mesh.receiveShadow = true;
-                scene.add(mesh);
-                chunk.mesh = mesh;
-            }
-        };
-
-        initChunks();
-
-        // Carve operation affecting intersecting chunks
-        function carveAt(pos, radius) {
-            const startTime = performance.now();
-            let affected = 0;
-
-            for (let [chunkId, chunk] of chunksMap.entries()) {
-                // AABB overlap check
-                if (pos.x + radius < chunk.minBounds[0] || pos.x - radius > chunk.maxBounds[0] ||
-                    pos.y + radius < chunk.minBounds[1] || pos.y - radius > chunk.maxBounds[1] ||
-                    pos.z + radius < chunk.minBounds[2] || pos.z - radius > chunk.maxBounds[2]) {
-                    continue;
-                }
-
-                affected++;
-                const paddedRes = CHUNK_RES + 2;
-                const voxelData = new Float32Array(paddedRes * paddedRes * paddedRes);
-                let index = 0;
-                for (let z = 0; z < paddedRes; z++) {
-                    for (let y = 0; y < paddedRes; y++) {
-                        for (let x = 0; x < paddedRes; x++) {
-                            const vx = chunk.minBounds[0] + (x - 1) * chunk.cellSize;
-                            const vy = chunk.minBounds[1] + (y - 1) * chunk.cellSize;
-                            const vz = chunk.minBounds[2] + (z - 1) * chunk.cellSize;
-                            
-                            let density = getDensityAt(vx, vy, vz);
-                            const dx = vx - pos.x, dy = vy - pos.y, dz = vz - pos.z;
-                            const distFromCarve = Math.sqrt(dx*dx + dy*dy + dz*dz);
-                            if (distFromCarve < radius) {
-                                // Carve out (positive density)
-                                density = Math.max(density, (radius - distFromCarve) * 2.5);
-                            }
-                            voxelData[index++] = density;
+            checkMaterialAtHit: (point, hit) => {
+                // If hitting a mesh with titanium vertex color
+                if (hit && hit.face) {
+                    const colAttr = hit.object.geometry.attributes.color;
+                    if (colAttr) {
+                        const a = hit.face.a;
+                        // Titanium has high blue/cyan: colAttr.getY(a) > 0.8 && colAttr.getZ(a) > 0.9
+                        if (colAttr.getY(a) > 0.8 && colAttr.getZ(a) > 0.9) {
+                            return true;
                         }
                     }
                 }
+                return false;
+            },
 
-                chunk.voxelData = voxelData;
-                worker.postMessage({
-                    chunkId,
-                    res: CHUNK_RES,
-                    voxelData,
-                    minBounds: chunk.minBounds,
-                    maxBounds: chunk.maxBounds,
-                    cellSize: chunk.cellSize
-                }, [voxelData.buffer]);
+            onScaleChange: (scaleKey, radius) => {
+                currentRadius = radius;
+                initAsteroidChunks(sandbox.scene);
+            },
+
+            onToggleWireframe: (enabled) => {
+                chunkMaterial.wireframe = enabled;
+            },
+
+            onToggleXRay: (enabled, plane) => {
+                chunkMaterial.clippingPlanes = enabled ? [plane] : [];
+                chunkMaterial.needsUpdate = true;
             }
+        });
 
-            const dur = performance.now() - startTime;
-            return dur;
-        }
-
-        // Benchmark & Animation Loop
-        let frameCount = 0;
-        let carveCount = 0;
-        const totalFrames = 450;
-        const frameTimes = [];
-        const carveDurations = [];
-        let benchmarkStarted = false;
-        let lastTime = performance.now();
-
-        window.startBenchmark = function() {
-            benchmarkStarted = true;
-            document.getElementById('st-status').innerText = 'Running Benchmark';
-        };
-
-        // Auto-start benchmark after 1s
-        setTimeout(() => window.startBenchmark(), 1000);
-
-        function animate() {
-            requestAnimationFrame(animate);
-
-            const now = performance.now();
-            const ft = now - lastTime;
-            lastTime = now;
-
-            if (benchmarkStarted && frameCount < totalFrames) {
-                frameTimes.push(ft);
-                frameCount++;
-
-                // Trigger 6 carving passes at specific frames
-                const carveTriggers = [60, 120, 180, 240, 300, 360];
-                if (carveTriggers.includes(frameCount) && carveCount < 6) {
-                    const angle = carveCount * Math.PI / 3;
-                    const carvePos = new THREE.Vector3(
-                        Math.cos(angle) * 1800,
-                        (carveCount % 2 === 0 ? 400 : -400),
-                        Math.sin(angle) * 1800
-                    );
-                    const dur = carveAt(carvePos, 900);
-                    carveDurations.push(dur);
-                    carveCount++;
-                    document.getElementById('st-carve-dur').innerText = dur.toFixed(2) + ' ms';
-                    document.getElementById('st-carves').innerText = `${carveCount} / 6`;
-                }
-
-                // Update HUD
-                const avgFt = frameTimes.reduce((a,b)=>a+b,0) / frameTimes.length;
-                const fps = 1000 / (ft || 1);
-                const avgFps = 1000 / avgFt;
-                document.getElementById('st-frame').innerText = `${frameCount} / ${totalFrames}`;
-                document.getElementById('st-fps').innerText = `${fps.toFixed(1)} / ${avgFps.toFixed(1)}`;
-                document.getElementById('st-ft').innerText = ft.toFixed(2);
-                document.getElementById('progress-bar').style.width = `${(frameCount / totalFrames) * 100}%`;
-
-                let totalTris = 0;
-                let activeChunks = 0;
-                for (let chunk of chunksMap.values()) {
-                    if (chunk.mesh) {
-                        activeChunks++;
-                        if (chunk.mesh.geometry.index) {
-                            totalTris += chunk.mesh.geometry.index.count / 3;
-                        }
-                    }
-                }
-                document.getElementById('st-tris').innerText = totalTris.toLocaleString();
-                document.getElementById('st-chunks').innerText = `${activeChunks} / ${chunksMap.size}`;
-
-                if (performance.memory) {
-                    document.getElementById('st-heap').innerText = (performance.memory.usedJSHeapSize / 1048576).toFixed(2) + ' MB';
-                }
-
-                if (frameCount === totalFrames) {
-                    document.getElementById('st-status').innerText = 'Benchmark Complete';
-                    const sortedFt = [...frameTimes].sort((a,b)=>a-b);
-                    const p99 = sortedFt[Math.floor(sortedFt.length * 0.99)];
-                    const avgCarve = carveDurations.reduce((a,b)=>a+b,0) / carveDurations.length;
-
-                    window.__BENCHMARK_RESULTS__ = {
-                        summary: {
-                            totalFrames,
-                            avgFrameTimeMs: Number(avgFt.toFixed(2)),
-                            p99FrameTimeMs: Number(p99.toFixed(2)),
-                            avgFps: Number(avgFps.toFixed(1)),
-                            minFps: Number((1000 / Math.max(...frameTimes)).toFixed(1)),
-                            trianglesCount: totalTris,
-                            carveCount,
-                            avgCarveDurationMs: Number(avgCarve.toFixed(2)),
-                            heapMemoryMb: performance.memory ? Number((performance.memory.usedJSHeapSize / 1048576).toFixed(2)) : 0
-                        },
-                        frameTimes,
-                        carveDurations
-                    };
-                    console.log("BENCHMARK_COMPLETE", JSON.stringify(window.__BENCHMARK_RESULTS__));
-                }
-            }
-
-            controls.update();
-            renderer.render(scene, camera);
-        }
-
-        animate();
+        // Initial Build
+        initAsteroidChunks(sandbox.scene);
     </script>
 </body>
 </html>
