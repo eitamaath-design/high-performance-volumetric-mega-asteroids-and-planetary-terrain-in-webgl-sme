@@ -21,6 +21,244 @@
 import * as THREE from '../vendor/three.module.js';
 import { OrbitControls } from '../vendor/OrbitControls.js';
 
+/**
+ * Shared Procedural 3D Triplanar Asteroid, Mineral Vein & Hex-Armor Bulkhead Material
+ */
+export function createTriplanarAsteroidMaterial(options = {}) {
+    const vertexColors = options.vertexColors !== undefined ? options.vertexColors : true;
+    const hasPortals = Boolean(options.hasPortals);
+    const defaultRadius = options.radius || 2800.0;
+
+    const uniforms = {
+        uAsteroidRadius: { value: defaultRadius },
+        uPortals: { value: Array.from({ length: 48 }, () => new THREE.Vector4(0, 0, 0, -1)) },
+        uPortalCount: { value: 0 }
+    };
+
+    const mat = new THREE.MeshStandardMaterial({
+        color: vertexColors ? 0xffffff : 0x7c8490,
+        vertexColors,
+        roughness: 0.78,
+        metalness: 0.18,
+        flatShading: false,
+        side: THREE.DoubleSide
+    });
+
+    mat.userData.shaderUniforms = uniforms;
+    mat.customProgramCacheKey = () => `triplanar-asteroid-${vertexColors ? 'vc' : 'nc'}-${hasPortals ? 'portals' : 'solid'}`;
+
+    mat.onBeforeCompile = (shader) => {
+        shader.uniforms.uAsteroidRadius = uniforms.uAsteroidRadius;
+        if (hasPortals) {
+            shader.uniforms.uPortals = uniforms.uPortals;
+            shader.uniforms.uPortalCount = uniforms.uPortalCount;
+        }
+
+        shader.vertexShader = shader.vertexShader
+            .replace(
+                '#include <common>',
+                `#include <common>
+                varying vec3 vTriWorldPos;
+                varying vec3 vTriWorldNorm;`
+            )
+            .replace(
+                '#include <worldpos_vertex>',
+                `#include <worldpos_vertex>
+                vec4 triWp = modelMatrix * vec4( transformed, 1.0 );
+                vTriWorldPos = triWp.xyz;
+                vTriWorldNorm = normalize( mat3( modelMatrix ) * objectNormal );`
+            );
+
+        let fragHeader = `
+            #include <common>
+            varying vec3 vTriWorldPos;
+            varying vec3 vTriWorldNorm;
+            uniform float uAsteroidRadius;
+        `;
+
+        if (hasPortals) {
+            fragHeader += `
+            uniform vec4 uPortals[48];
+            uniform int uPortalCount;
+            `;
+        }
+
+        fragHeader += `
+            float triHash3(vec3 p) {
+                p = fract(p * 0.3183099 + 0.1);
+                p *= 17.0;
+                return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+            }
+            float triNoise3(vec3 x) {
+                vec3 i = floor(x);
+                vec3 f = fract(x);
+                f = f * f * (3.0 - 2.0 * f);
+                return mix(
+                    mix(mix(triHash3(i + vec3(0,0,0)), triHash3(i + vec3(1,0,0)), f.x),
+                        mix(triHash3(i + vec3(0,1,0)), triHash3(i + vec3(1,1,0)), f.x), f.y),
+                    mix(mix(triHash3(i + vec3(0,0,1)), triHash3(i + vec3(1,0,1)), f.x),
+                        mix(triHash3(i + vec3(0,1,1)), triHash3(i + vec3(1,1,1)), f.x), f.y),
+                    f.z
+                );
+            }
+            float triFbm(vec3 p) {
+                float v = 0.0;
+                float a = 0.5;
+                for (int i = 0; i < 3; i++) {
+                    v += a * triNoise3(p);
+                    p *= 2.03;
+                    a *= 0.5;
+                }
+                return v;
+            }
+            float hexDist2D(vec2 p) {
+                p = abs(p);
+                return max(dot(p, normalize(vec2(1.0, 1.7320508))), p.x);
+            }
+            float triplanarHexGrid(vec3 pos, vec3 n, float scale) {
+                vec3 w = pow(abs(n), vec3(4.0));
+                w /= max(w.x + w.y + w.z, 0.0001);
+                float h = 0.0;
+                vec2 uvList[3];
+                uvList[0] = pos.yz * scale;
+                uvList[1] = pos.xz * scale;
+                uvList[2] = pos.xy * scale;
+                float weights[3];
+                weights[0] = w.x; weights[1] = w.y; weights[2] = w.z;
+                for (int i = 0; i < 3; i++) {
+                    vec2 uv = uvList[i];
+                    vec2 r = vec2(1.0, 1.7320508);
+                    vec2 h2 = r * 0.5;
+                    vec2 a = mod(uv, r) - h2;
+                    vec2 b = mod(uv - h2, r) - h2;
+                    vec2 gv = dot(a, a) < dot(b, b) ? a : b;
+                    float edge = 0.5 - hexDist2D(gv);
+                    h += smoothstep(0.0, 0.09, edge) * weights[i];
+                }
+                return h;
+            }
+        `;
+
+        let clipReplace = `#include <clipping_planes_fragment>`;
+        if (hasPortals) {
+            clipReplace += `
+            for (int i = 0; i < 48; i++) {
+                if (i >= uPortalCount) break;
+                if (uPortals[i].w > 0.0 && distance(vTriWorldPos, uPortals[i].xyz) < uPortals[i].w * 0.90) {
+                    discard;
+                }
+            }
+            `;
+        }
+
+        const colorReplace = `
+            vec3 triPos = vTriWorldPos;
+            vec3 triNorm = normalize(vTriWorldNorm);
+            float fbmMacro = triFbm(triPos * 0.006);
+            float fbmMicro = triFbm(triPos * 0.028);
+            float rDist = length(triPos);
+            float strata = 0.5 + 0.5 * sin(rDist * 0.045 + fbmMacro * 6.0);
+            float depthShade = smoothstep(uAsteroidRadius * 0.25, uAsteroidRadius * 1.05, rDist);
+
+            vec3 exteriorRock = mix(vec3(0.32, 0.34, 0.38), vec3(0.56, 0.54, 0.50), fbmMacro * 0.7 + fbmMicro * 0.45);
+            vec3 interiorRock = mix(vec3(0.24, 0.26, 0.33), vec3(0.42, 0.39, 0.36), strata * 0.65 + fbmMicro * 0.45);
+            vec3 procRock = mix(interiorRock, exteriorRock, depthShade);
+
+            float triIsArmor = 0.0;
+            float triIsOre = 0.0;
+            float triHexEdge = 1.0;
+
+            #if defined( USE_COLOR )
+                triIsArmor = smoothstep(0.60, 0.85, vColor.b) * smoothstep(0.55, 0.78, vColor.g) * (1.0 - smoothstep(0.25, 0.55, vColor.r));
+                triIsOre = smoothstep(0.75, 0.92, vColor.r) * (1.0 - smoothstep(0.25, 0.50, vColor.b));
+            #endif
+
+            vec3 surfaceAlbedo = procRock;
+            float oreMask = triIsOre * smoothstep(0.45, 0.75, fbmMicro + 0.25 * triFbm(triPos * 0.015));
+            if (oreMask > 0.05) {
+                vec3 oreCol = mix(vec3(0.75, 0.48, 0.12), vec3(1.0, 0.82, 0.28), fbmMicro);
+                surfaceAlbedo = mix(surfaceAlbedo, oreCol, oreMask * (0.35 + 0.65 * (1.0 - depthShade)));
+            }
+            if (triIsArmor > 0.05) {
+                triHexEdge = triplanarHexGrid(triPos, triNorm, 0.032);
+                vec3 armorPlate = mix(vec3(0.14, 0.22, 0.30), vec3(0.25, 0.36, 0.46), fbmMicro * 0.5);
+                vec3 armorSeam = vec3(0.0, 0.92, 1.0);
+                vec3 armorCol = mix(armorSeam, armorPlate, triHexEdge);
+                surfaceAlbedo = mix(surfaceAlbedo, armorCol, triIsArmor);
+            }
+
+            diffuseColor.rgb = surfaceAlbedo * (0.85 + 0.3 * fbmMicro);
+        `;
+
+        const normalReplace = `
+            #include <normal_fragment_maps>
+            float bumpWeight = (1.0 - triIsArmor) * 0.55;
+            vec3 dPdx = dFdx(triPos);
+            vec3 dPdy = dFdy(triPos);
+            float bumpH = fbmMicro + 0.35 * fbmMacro;
+            float dBdx = dFdx(bumpH);
+            float dBdy = dFdy(bumpH);
+            vec3 surfGrad = cross(normal, cross(dPdx, dPdy));
+            vec3 r1 = cross(dPdy, normal);
+            vec3 r2 = cross(normal, dPdx);
+            float det = dot(dPdx, r1);
+            if (abs(det) > 1e-8) {
+                vec3 bumpN = sign(det) * (dBdx * r1 + dBdy * r2);
+                normal = normalize(abs(det) * normal - bumpWeight * 24.0 * bumpN);
+            }
+        `;
+
+        const roughnessReplace = `
+            #include <roughnessmap_fragment>
+            roughnessFactor = mix(roughnessFactor, 0.22, triIsArmor);
+            roughnessFactor = mix(roughnessFactor, 0.35, oreMask * 0.8);
+        `;
+
+        const metalnessReplace = `
+            #include <metalnessmap_fragment>
+            metalnessFactor = mix(metalnessFactor, 0.88, triIsArmor);
+            metalnessFactor = mix(metalnessFactor, 0.72, oreMask * 0.8);
+        `;
+
+        const emissiveReplace = `
+            #include <emissivemap_fragment>
+            if (triIsArmor > 0.05) {
+                totalEmissiveRadiance += vec3(0.0, 0.75, 0.95) * (1.0 - triHexEdge) * triIsArmor * 1.4;
+                totalEmissiveRadiance += vec3(0.02, 0.12, 0.18) * triIsArmor;
+            }
+            if (oreMask > 0.05) {
+                totalEmissiveRadiance += vec3(0.24, 0.12, 0.02) * fbmMicro * oreMask * (0.35 + 0.65 * (1.0 - depthShade));
+            }
+        `;
+
+        shader.fragmentShader = shader.fragmentShader
+            .replace('#include <common>', fragHeader)
+            .replace('#include <clipping_planes_fragment>', clipReplace)
+            .replace('#include <color_fragment>', colorReplace)
+            .replace('#include <normal_fragment_maps>', normalReplace)
+            .replace('#include <roughnessmap_fragment>', roughnessReplace)
+            .replace('#include <metalnessmap_fragment>', metalnessReplace)
+            .replace('#include <emissivemap_fragment>', emissiveReplace);
+    };
+
+    return mat;
+}
+
+export function findSurfacePoint(evalDensityFn, dir, minR, maxR) {
+    const u = dir.clone().normalize();
+    let lo = minR;
+    let hi = maxR;
+    for (let i = 0; i < 24; i++) {
+        const mid = 0.5 * (lo + hi);
+        if (evalDensityFn(u.x * mid, u.y * mid, u.z * mid) < 0) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return u.multiplyScalar(0.5 * (lo + hi));
+}
+
 export class PlanetaryBaseSandbox {
     constructor(config = {}) {
         this.config = Object.assign({
@@ -43,7 +281,7 @@ export class PlanetaryBaseSandbox {
 
         this.currentScaleKey = '10p'; // '10p'=2800u, '30p'=4800u, '50p'=8000u
         this.currentRadius = this.config.defaultRadius;
-        this.brushRadius = 24.0; // Scalable carving radius
+        this.brushRadius = 140.0; // Scalable carving radius
 
         this.activeTool = 'carve'; // 'carve', 'reinforce', 'raider', 'breach', 'machinery'
         this.selectedMachinery = 'shield'; // 'weapons', 'shield', 'foundry', 'refinery'
@@ -164,12 +402,17 @@ export class PlanetaryBaseSandbox {
         this.sunLight.position.set(12000, 9000, 10000);
         this.scene.add(this.sunLight);
 
-        this.ambientLight = new THREE.AmbientLight(0x1a2436, 0.7);
+        this.ambientLight = new THREE.AmbientLight(0x384862, 1.15);
         this.scene.add(this.ambientLight);
 
-        const fillLight = new THREE.DirectionalLight(0x204060, 0.9);
+        const fillLight = new THREE.DirectionalLight(0x4a76a8, 1.05);
         fillLight.position.set(-10000, -8000, -8000);
         this.scene.add(fillLight);
+
+        // Camera/Ship Headlamp for crisp interior cave lighting
+        this.headlamp = new THREE.PointLight(0xdff4ff, 1.8, 9000, 0.5);
+        this.headlamp.position.copy(this.camera.position);
+        this.scene.add(this.headlamp);
     }
 
     initFX() {
@@ -210,6 +453,20 @@ export class PlanetaryBaseSandbox {
         this.normalLine = new THREE.Line(normalGeo, new THREE.LineBasicMaterial({ color: 0xffff00 }));
         this.normalLine.visible = false;
         this.scene.add(this.normalLine);
+
+        // Holographic Spherical Laser Preview Cursor (matches exact brushRadius)
+        const cursorGeo = new THREE.SphereGeometry(1, 20, 14);
+        this.brushCursorMat = new THREE.MeshBasicMaterial({
+            color: 0x00ffff,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.35,
+            depthWrite: false
+        });
+        this.brushCursorMesh = new THREE.Mesh(cursorGeo, this.brushCursorMat);
+        this.brushCursorMesh.visible = false;
+        this.brushCursorMesh.raycast = () => {}; // Never intercept tool raycasts
+        this.scene.add(this.brushCursorMesh);
     }
 
     initShip() {
@@ -374,8 +631,8 @@ export class PlanetaryBaseSandbox {
 
             <!-- Sliders & Modifiers -->
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                <span>Laser Radius: <b id="lbl-radius" style="color:#00ffff;">24u</b></span>
-                <input id="slider-radius" type="range" min="8" max="48" value="24" style="width:140px; accent-color:#00ffff; cursor:pointer;">
+                <span>Laser Radius: <b id="lbl-radius" style="color:#00ffff;">140u</b></span>
+                <input id="slider-radius" type="range" min="40" max="360" value="140" style="width:140px; accent-color:#00ffff; cursor:pointer;">
             </div>
 
             <!-- Planetary Scale Selector -->
@@ -540,6 +797,9 @@ export class PlanetaryBaseSandbox {
             (tool === 'reinforce') ? this.laserMatReinforce :
                 (tool === 'raider') ? this.laserMatRaider : this.laserMatBreach;
         this.sparkMat.color.setHex(activeColor);
+        if (this.brushCursorMat) {
+            this.brushCursorMat.color.setHex(activeColor);
+        }
     }
 
     setScale(scaleKey) {
@@ -653,12 +913,19 @@ export class PlanetaryBaseSandbox {
 
         dom.addEventListener('pointermove', (e) => {
             this.updateMousePos(e);
+            if (!this.isFlightMode && !this.isBenchmarkMode) {
+                this.updateBrushPreview();
+            }
             if (this.isMouseDown && !this.isFlightMode) {
                 const now = performance.now();
                 if (now - this.lastCarveTick >= this.carveTickInterval) {
                     this.executeActiveTool();
                 }
             }
+        });
+
+        dom.addEventListener('pointerleave', () => {
+            if (this.brushCursorMesh) this.brushCursorMesh.visible = false;
         });
 
         dom.addEventListener('pointerup', (e) => {
@@ -677,6 +944,18 @@ export class PlanetaryBaseSandbox {
                 this.sparkPoints.visible = false;
             }
         });
+    }
+
+    updateBrushPreview() {
+        if (!this.brushCursorMesh) return;
+        const hit = this.performRaycast();
+        if (hit && hit.point) {
+            this.brushCursorMesh.position.copy(hit.point);
+            this.brushCursorMesh.scale.setScalar(this.brushRadius);
+            this.brushCursorMesh.visible = true;
+        } else {
+            this.brushCursorMesh.visible = false;
+        }
     }
 
     updateMousePos(e) {
@@ -948,14 +1227,21 @@ export class PlanetaryBaseSandbox {
     }
 
     simulateRandomCarve() {
-        // Fire a carve at the asteroid center-facing front
-        const hitPoint = new THREE.Vector3(
-            (Math.random() - 0.5) * (this.currentRadius * 0.4),
-            (Math.random() - 0.5) * (this.currentRadius * 0.4),
-            this.currentRadius * 0.88
-        );
-        const hitNormal = hitPoint.clone().normalize();
-        this.executeActiveTool({ point: hitPoint, normal: hitNormal });
+        // Raycast slightly jittered near viewport center so carve always hits actual asteroid geometry
+        const savedMouse = this.mousePos.clone();
+        this.mousePos.set((Math.random() - 0.5) * 0.16, (Math.random() - 0.5) * 0.16);
+        let hit = this.performRaycast();
+        this.mousePos.copy(savedMouse);
+
+        if (!hit) {
+            const hitPoint = new THREE.Vector3(
+                (Math.random() - 0.5) * (this.currentRadius * 0.25),
+                (Math.random() - 0.5) * (this.currentRadius * 0.25),
+                this.currentRadius * 0.94
+            );
+            hit = { point: hitPoint, normal: hitPoint.clone().normalize() };
+        }
+        this.executeActiveTool(hit);
     }
 
     initAutomatedBenchmark() {
@@ -1061,6 +1347,10 @@ export class PlanetaryBaseSandbox {
 
         if (!this.isFlightMode) {
             this.controls.update();
+        }
+
+        if (this.headlamp) {
+            this.headlamp.position.copy(this.isFlightMode ? this.shipGroup.position : this.camera.position);
         }
 
         this.renderer.render(this.scene, this.camera);

@@ -102,18 +102,18 @@ Subterranean caves support structural reinforcement and tactical defense:
 ### 2.5 Detailed Architectural Alternatives Evaluated
 
 #### Option 1 (`poc1_chunked_octree_surface_nets.html`): Sparse Chunked Dual-Grid Surface Nets + Exact Triangle BVH Collider + Async Web Workers
-- **Voxel Representation:** Sparse chunk map indexed by spatial hash `cx,cy,cz`. Each chunk represents $16^3$ voxels with a 1-voxel overlap halo ($res+3$) ensuring zero inter-chunk seams or cracks.
+- **Voxel Representation:** Sparse chunk map indexed by spatial hash `cx,cy,cz`. Each chunk represents $16^3$ voxels with a 2-voxel overlap halo ($res+5$) ensuring zero inter-chunk seams, identical finite-difference boundary gradients, and zero cracks.
 - **Meshing Algorithm:** True Dual-Grid Surface Nets. Identifies sign changes along edges, generates one relaxed dual vertex per sign-changing cell, and emits watertight quads across sign-changing interior edges.
 - **Threading Model:** Dedicated worker pool (2–4 Web Workers) receives dirty chunk voxel buffers via zero-copy `Transferable` `ArrayBuffer` objects, returning generated position, normal, color, and index buffers without stalling the main UI thread.
 - **Collision:** Main thread builds a local `THREE.Raycaster` and triangle BVH collider directly from the chunk geometry. Visual-collision parity is absolute (`0.00u`).
 
 #### Option 2 (`poc2_sparse_voxel_octree_mesh_patching.html`): Adaptive QEF Dual Contouring Sparse Voxel Octree (SVO) + Dirty AABB Mesh Patching
-- **Voxel Representation:** Sparse Voxel Octree where internal nodes collapse empty or solid space, refining exclusively at isosurface boundaries. Leaves maintain $12^3$ density and material arrays.
+- **Voxel Representation:** Sparse Voxel Octree where internal nodes collapse empty or solid space, refining exclusively at isosurface boundaries. Leaves maintain $12^3$ density and material arrays with a 2-voxel overlap halo ($res+5$) for seam-free cross-leaf QEF gradients.
 - **Meshing Algorithm:** Dual Contouring minimizing the Quadratic Error Function (QEF):
   $$E(\mathbf{x}) = \sum_i \left(\mathbf{n}_i \cdot (\mathbf{x} - \mathbf{p}_i)\right)^2 + \lambda \|\mathbf{x} - \mathbf{p}_{\text{mass}}\|^2$$
   Solves via iterative Gauss-Seidel regularized gradient descent clamped within cell bounds.
 - **Key Advantage:** Produces smooth spherical laser tunnels while preserving razor-sharp $90^\circ$ architectural chamfers and edges when players erect reinforced titanium bulkheads.
-- **Patching:** Carving updates mark an AABB dirty box; only intersecting leaf nodes re-contour and splice into active Three.js geometry buffers ($0.18\text{ ms}$).
+- **Patching:** Carving updates mark an AABB dirty box; only intersecting leaf nodes re-contour and splice into active Three.js geometry buffers ($\sim 3.13\text{ ms}$ per carve pass).
 
 #### Option 3 (`poc3_hierarchical_lod_clipmaps.html`): Hybrid Planetary Clipmap Crust + Dynamic Entrance Portals + High-Res Subterranean Voxel Base Manifolds
 - **Planetary Macro Crust:** Multi-ring geodetic spherical clipmap shell spanning massive scale ($R = 2800\text{u}\text{--}8000\text{u}+$) rendered with triplanar crater rock shaders and dynamic distance rings.
@@ -201,14 +201,14 @@ node benchmarks/run_all_benchmarks.cjs
 | Metric | Rockets Baseline (Monolithic 64³) | Option 1: Chunked Surface Nets (PoC 1) | Option 2: Adaptive QEF SVO (PoC 2) | Option 3: Clipmap Shell & Portals (PoC 3) | Option 4: 3D GPU SDF Raymarching (PoC 4) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Status** | Verified Legacy | Verified / Next-Gen | Verified / Next-Gen | Verified / Next-Gen | Verified / Next-Gen |
-| **Average FPS** | $58.7\text{ FPS}$ | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
-| **Average Frame Time** | $17.04\text{ ms}$ | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** |
+| **Average FPS** | $58.8\text{ FPS}$ | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
+| **Average Frame Time** | $17.00\text{ ms}$ | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** |
 | **P99 Frame Time** | $16.80\text{ ms}$ | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** |
-| **Carve Latency** | $1.72\text{ ms}$ | **$0.45\text{ ms}$** | **$0.18\text{ ms}$** | $22.52\text{ ms}$ | **$1.65\text{ ms}$** |
+| **Carve Latency** | $1.73\text{ ms}$ | **$3.60\text{ ms}$** | **$3.13\text{ ms}$** | $7.65\text{ ms}$ | **$0.08\text{ ms}$** |
 | **Visual-Collision Error** | $> 30.00\text{u}$ | **$0.00\text{u}$** | **$0.00\text{u}$** | **$0.00\text{u}$** | **$0.00\text{u}$** |
-| **Active Triangles** | 6,936 | 13,516 | 13,132 | 5,518 | 1,244 (Proxy) |
-| **Draw Calls** | 1 | 70 | 63 | 20 | 15 |
-| **JS Heap Memory** | $28.04\text{ MB}$ | **$10.11\text{ MB}$** | **$9.54\text{ MB}$** | **$9.54\text{ MB}$** | **$11.35\text{ MB}$** |
+| **Active Triangles** | 6,936 | 69,544 | 36,700 | 29,536 | 1,244 (Proxy) |
+| **Draw Calls** | 1 | 139 | 95 | 27 | 15 |
+| **JS Heap Memory** | $28.04\text{ MB}$ | $28.04\text{ MB}$ | **$16.31\text{ MB}$** | **$14.50\text{ MB}$** | **$14.50\text{ MB}$** |
 
 ---
 

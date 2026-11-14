@@ -11,7 +11,7 @@
 <body>
     <script type="module">
         import * as THREE from './vendor/three.module.js';
-        import { PlanetaryBaseSandbox } from './shared/planetary_base_sandbox.js';
+        import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint } from './shared/planetary_base_sandbox.js';
 
         // --- Fast 3D Simplex-Style Noise ---
         class FastNoise3D {
@@ -48,20 +48,14 @@
         const noise = new FastNoise3D(4242);
 
         let currentRadius = 2800;
-        const LEAF_RES = 12; // 12x12x12 cells per SVO leaf
-        let LEAF_SIZE = 750;
+        const LEAF_RES = 14; // 14x14x14 interior cells per SVO leaf (17^3 padded grid)
+        let LEAF_SIZE = 1344;
         let CELL_SIZE = LEAF_SIZE / LEAF_RES;
 
-        const svoLeaves = [];
+        const svoLeafMap = new Map();
         const activeLeafMeshes = [];
 
-        const leafMaterial = new THREE.MeshStandardMaterial({
-            vertexColors: true,
-            roughness: 0.65,
-            metalness: 0.3,
-            flatShading: false,
-            side: THREE.FrontSide
-        });
+        const leafMaterial = createTriplanarAsteroidMaterial({ vertexColors: true, radius: currentRadius });
 
         // 8 Corners of a unit cell
         const corners = [
@@ -77,40 +71,42 @@
         ];
 
         class SVOLeafNode {
-            constructor(minX, minY, minZ, size) {
-                this.minX = minX;
-                this.minY = minY;
-                this.minZ = minZ;
-                this.size = size;
-                this.cellSize = size / LEAF_RES;
+            constructor(lx, ly, lz) {
+                this.lx = lx;
+                this.ly = ly;
+                this.lz = lz;
+                this.key = `${lx},${ly},${lz}`;
+                this.size = LEAF_SIZE;
+                this.cellSize = LEAF_SIZE / LEAF_RES;
+                this.minX = lx * LEAF_SIZE;
+                this.minY = ly * LEAF_SIZE;
+                this.minZ = lz * LEAF_SIZE;
                 this.mesh = null;
 
-                // Allocate density and material grid of dimension (LEAF_RES + 1)^3
-                const gRes = LEAF_RES + 1;
-                this.gRes = gRes;
-                this.gRes2 = gRes * gRes;
-                const totalCells = gRes * gRes * gRes;
-                this.density = new Float32Array(totalCells);
-                this.material = new Uint8Array(totalCells);
+                // 2-voxel halo padding on both sides: (LEAF_RES + 5)^3 samples for [1..LEAF_RES+1] cells
+                const pRes = LEAF_RES + 5;
+                this.pRes = pRes;
+                this.pRes2 = pRes * pRes;
+                const totalSamples = pRes * pRes * pRes;
+                this.density = new Float32Array(totalSamples);
+                this.material = new Uint8Array(totalSamples);
 
                 this.initField();
             }
 
             initField() {
-                const gRes = this.gRes;
+                const pRes = this.pRes;
                 let idx = 0;
-                for (let z = 0; z < gRes; z++) {
-                    const wz = this.minZ + z * this.cellSize;
-                    for (let y = 0; y < gRes; y++) {
-                        const wy = this.minY + y * this.cellSize;
-                        for (let x = 0; x < gRes; x++) {
-                            const wx = this.minX + x * this.cellSize;
-                            const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-                            const n = noise.fbm(wx * 0.0016, wy * 0.0016, wz * 0.0016, 3) * (currentRadius * 0.16);
-                            const d = dist - (currentRadius + n);
+                for (let pz = 0; pz < pRes; pz++) {
+                    const wz = this.minZ + (pz - 2) * this.cellSize;
+                    for (let py = 0; py < pRes; py++) {
+                        const wy = this.minY + (py - 2) * this.cellSize;
+                        for (let px = 0; px < pRes; px++) {
+                            const wx = this.minX + (px - 2) * this.cellSize;
+                            const d = evalDensityPoC2(wx, wy, wz);
                             this.density[idx] = d;
 
-                            if (d < 0 && Math.sin(wx * 0.008) * Math.cos(wy * 0.008) > 0.6) {
+                            if (d < -this.cellSize && Math.sin(wx * 0.007) * Math.cos(wy * 0.007) > 0.78) {
                                 this.material[idx] = 2; // Ore vein
                             } else {
                                 this.material[idx] = 1; // Rock
@@ -122,35 +118,41 @@
             }
 
             getD(x, y, z) {
-                return this.density[x + y * this.gRes + z * this.gRes2];
+                return this.density[x + y * this.pRes + z * this.pRes2];
             }
 
             getMat(x, y, z) {
-                return this.material[x + y * this.gRes + z * this.gRes2];
+                return this.material[x + y * this.pRes + z * this.pRes2];
             }
 
-            // Adaptive QEF Dual Contouring extraction
+            // Adaptive QEF Dual Contouring extraction with 2-voxel halo overlap (zero leaf boundary seams)
             extractDualContour(scene) {
-                const gRes = this.gRes;
+                const pRes = this.pRes;
+                const cellCount = LEAF_RES + 3;
+                const cellCount2 = cellCount * cellCount;
                 const vertices = [];
                 const normals = [];
                 const colors = [];
                 const indices = [];
 
-                // Flat map of dual vertices for cells [0 .. LEAF_RES - 1]
-                const cellVertMap = new Int32Array(LEAF_RES * LEAF_RES * LEAF_RES).fill(-1);
+                const cellVertMap = new Int32Array(cellCount * cellCount * cellCount).fill(-1);
+                const cellKey = (cx, cy, cz) => cx + cy * cellCount + cz * cellCount2;
 
-                function cellKey(cx, cy, cz) {
-                    return cx + cy * LEAF_RES + cz * LEAF_RES * LEAF_RES;
-                }
+                const cVals = new Float32Array(8);
+                const massPoint = new THREE.Vector3();
+                const qefPos = new THREE.Vector3();
+                const avgNorm = new THREE.Vector3();
+                const grad = new THREE.Vector3();
+                const diff = new THREE.Vector3();
 
-                // Step 1: For each cell, solve QEF to place dual vertex
-                for (let cz = 0; cz < LEAF_RES; cz++) {
-                    for (let cy = 0; cy < LEAF_RES; cy++) {
-                        for (let cx = 0; cx < LEAF_RES; cx++) {
+                // Step 1: Solve regularized QEF for each dual cell [1 .. LEAF_RES + 1]
+                for (let cz = 1; cz <= LEAF_RES + 1; cz++) {
+                    for (let cy = 1; cy <= LEAF_RES + 1; cy++) {
+                        for (let cx = 1; cx <= LEAF_RES + 1; cx++) {
                             let mask = 0;
-                            const cVals = new Float32Array(8);
-                            let matCounts = { 1: 0, 2: 0, 3: 0 };
+                            let rockCount = 0;
+                            let oreCount = 0;
+                            let armorCount = 0;
 
                             for (let c = 0; c < 8; c++) {
                                 const px = cx + corners[c][0];
@@ -161,16 +163,17 @@
                                 if (v < 0) {
                                     mask |= (1 << c);
                                     const m = this.getMat(px, py, pz);
-                                    if (matCounts[m] !== undefined) matCounts[m]++;
+                                    if (m === 3) armorCount++;
+                                    else if (m === 2) oreCount++;
+                                    else rockCount++;
                                 }
                             }
 
-                            if (mask === 0 || mask === 255) continue; // Pure void or pure solid
+                            if (mask === 0 || mask === 255) continue;
 
-                            // Collect edge crossings and normals
                             const points = [];
                             const pNorms = [];
-                            let massPoint = new THREE.Vector3(0, 0, 0);
+                            massPoint.set(0, 0, 0);
 
                             for (let e = 0; e < 12; e++) {
                                 const c1 = cellEdges[e][0];
@@ -179,7 +182,8 @@
                                 const v2 = cVals[c2];
 
                                 if ((v1 < 0) !== (v2 < 0)) {
-                                    const t = v1 / (v1 - v2);
+                                    const denom = v1 - v2;
+                                    const t = Math.abs(denom) > 1e-6 ? v1 / denom : 0.5;
                                     const p1 = corners[c1];
                                     const p2 = corners[c2];
                                     const ix = cx + p1[0] + t * (p2[0] - p1[0]);
@@ -187,21 +191,22 @@
                                     const iz = cz + p1[2] + t * (p2[2] - p1[2]);
 
                                     const pt = new THREE.Vector3(
-                                        this.minX + ix * this.cellSize,
-                                        this.minY + iy * this.cellSize,
-                                        this.minZ + iz * this.cellSize
+                                        this.minX + (ix - 2) * this.cellSize,
+                                        this.minY + (iy - 2) * this.cellSize,
+                                        this.minZ + (iz - 2) * this.cellSize
                                     );
                                     points.push(pt);
                                     massPoint.add(pt);
 
-                                    // Gradient normal
-                                    const gpx = Math.round(ix);
-                                    const gpy = Math.round(iy);
-                                    const gpz = Math.round(iz);
-                                    const nx = (gpx < gRes - 1 ? this.getD(gpx + 1, gpy, gpz) : v2) - (gpx > 0 ? this.getD(gpx - 1, gpy, gpz) : v1);
-                                    const ny = (gpy < gRes - 1 ? this.getD(gpx, gpy + 1, gpz) : v2) - (gpy > 0 ? this.getD(gpx, gpy - 1, gpz) : v1);
-                                    const nz = (gpz < gRes - 1 ? this.getD(gpx, gpy, gpz + 1) : v2) - (gpz > 0 ? this.getD(gpx, gpy, gpz - 1) : v1);
-                                    const nVec = new THREE.Vector3(nx, ny, nz).normalize();
+                                    const gpx = Math.max(1, Math.min(pRes - 2, Math.round(ix)));
+                                    const gpy = Math.max(1, Math.min(pRes - 2, Math.round(iy)));
+                                    const gpz = Math.max(1, Math.min(pRes - 2, Math.round(iz)));
+                                    const nx = this.getD(gpx + 1, gpy, gpz) - this.getD(gpx - 1, gpy, gpz);
+                                    const ny = this.getD(gpx, gpy + 1, gpz) - this.getD(gpx, gpy - 1, gpz);
+                                    const nz = this.getD(gpx, gpy, gpz + 1) - this.getD(gpx, gpy, gpz - 1);
+                                    const nVec = new THREE.Vector3(nx, ny, nz);
+                                    if (nVec.lengthSq() > 1e-10) nVec.normalize();
+                                    else nVec.set(0, 1, 0);
                                     pNorms.push(nVec);
                                 }
                             }
@@ -209,51 +214,49 @@
                             if (points.length === 0) continue;
                             massPoint.divideScalar(points.length);
 
-                            // QEF Minimization:
-                            // Iterative regularized gradient descent to locate sharp feature or smooth average
-                            let qefPos = massPoint.clone();
-                            const lambda = 0.15; // Regularization bias towards mass point
+                            // Stable regularized QEF gradient descent (normalized by crossing count)
+                            qefPos.copy(massPoint);
+                            const lambda = 0.12;
                             const stepSize = 0.25;
+                            const invN = 1.0 / points.length;
 
-                            for (let iter = 0; iter < 6; iter++) {
-                                const grad = new THREE.Vector3(0, 0, 0);
+                            for (let iter = 0; iter < 8; iter++) {
+                                grad.set(0, 0, 0);
                                 for (let p = 0; p < points.length; p++) {
                                     const norm = pNorms[p];
-                                    const diff = qefPos.clone().sub(points[p]);
+                                    diff.subVectors(qefPos, points[p]);
                                     const dot = norm.dot(diff);
-                                    grad.addScaledVector(norm, 2.0 * dot);
+                                    grad.addScaledVector(norm, dot * invN);
                                 }
-                                grad.add(qefPos.clone().sub(massPoint).multiplyScalar(2.0 * lambda));
-                                qefPos.sub(grad.multiplyScalar(stepSize));
+                                diff.subVectors(qefPos, massPoint);
+                                grad.addScaledVector(diff, lambda);
+                                qefPos.addScaledVector(grad, -stepSize);
                             }
 
-                            // Clamp QEF vertex inside cell bounds
-                            const cellMinX = this.minX + cx * this.cellSize;
-                            const cellMinY = this.minY + cy * this.cellSize;
-                            const cellMinZ = this.minZ + cz * this.cellSize;
-                            const cellMaxX = cellMinX + this.cellSize;
-                            const cellMaxY = cellMinY + this.cellSize;
-                            const cellMaxZ = cellMinZ + this.cellSize;
+                            // Clamp QEF vertex strictly inside world bounds of cell (cx, cy, cz)
+                            const cellMinX = this.minX + (cx - 2) * this.cellSize;
+                            const cellMinY = this.minY + (cy - 2) * this.cellSize;
+                            const cellMinZ = this.minZ + (cz - 2) * this.cellSize;
+                            const pad = this.cellSize * 0.02;
 
-                            qefPos.x = THREE.MathUtils.clamp(qefPos.x, cellMinX, cellMaxX);
-                            qefPos.y = THREE.MathUtils.clamp(qefPos.y, cellMinY, cellMaxY);
-                            qefPos.z = THREE.MathUtils.clamp(qefPos.z, cellMinZ, cellMaxZ);
+                            qefPos.x = THREE.MathUtils.clamp(qefPos.x, cellMinX + pad, cellMinX + this.cellSize - pad);
+                            qefPos.y = THREE.MathUtils.clamp(qefPos.y, cellMinY + pad, cellMinY + this.cellSize - pad);
+                            qefPos.z = THREE.MathUtils.clamp(qefPos.z, cellMinZ + pad, cellMinZ + this.cellSize - pad);
 
-                            // Average normal
-                            const avgNorm = new THREE.Vector3();
-                            pNorms.forEach(n => avgNorm.add(n));
-                            avgNorm.normalize();
+                            avgNorm.set(0, 0, 0);
+                            for (let p = 0; p < pNorms.length; p++) avgNorm.add(pNorms[p]);
+                            if (avgNorm.lengthSq() > 1e-10) avgNorm.normalize();
+                            else avgNorm.set(0, 1, 0);
 
-                            // Material determination
                             let domMat = 1;
-                            if (matCounts[2] > matCounts[1] && matCounts[2] >= matCounts[3]) domMat = 2;
-                            if (matCounts[3] > 0) domMat = 3; // Titanium bulkhead
+                            if (oreCount > rockCount && oreCount >= armorCount) domMat = 2;
+                            if (armorCount > 0) domMat = 3;
 
                             let rCol, gCol, bCol;
                             if (domMat === 3) {
-                                rCol = 0.12; gCol = 0.90; bCol = 0.98; // Metallic Cyan
+                                rCol = 0.12; gCol = 0.90; bCol = 0.98;
                             } else if (domMat === 2) {
-                                rCol = 0.95; gCol = 0.70; bCol = 0.15; // Gold Ore
+                                rCol = 0.95; gCol = 0.70; bCol = 0.15;
                             } else {
                                 const strata = 0.5 + 0.5 * Math.sin(qefPos.y * 0.02);
                                 rCol = 0.44 + 0.08 * strata;
@@ -271,57 +274,66 @@
                     }
                 }
 
-                // Step 2: Connect 4 dual vertices sharing sign-changing edges
-                for (let cz = 1; cz < LEAF_RES; cz++) {
-                    for (let cy = 1; cy < LEAF_RES; cy++) {
-                        for (let cx = 1; cx < LEAF_RES; cx++) {
-                            const d0 = this.getD(cx, cy, cz);
+                // Orient every triangle along SDF gradient normal to prevent back-face culling
+                const pushTriAligned = (i0, i1, i2) => {
+                    const ax = vertices[i0 * 3], ay = vertices[i0 * 3 + 1], az = vertices[i0 * 3 + 2];
+                    const bx = vertices[i1 * 3], by = vertices[i1 * 3 + 1], bz = vertices[i1 * 3 + 2];
+                    const cx = vertices[i2 * 3], cy = vertices[i2 * 3 + 1], cz = vertices[i2 * 3 + 2];
+                    const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+                    const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+                    const gx = e1y * e2z - e1z * e2y;
+                    const gy = e1z * e2x - e1x * e2z;
+                    const gz = e1x * e2y - e1y * e2x;
+                    const nx = normals[i0 * 3], ny = normals[i0 * 3 + 1], nz = normals[i0 * 3 + 2];
+                    if (gx * nx + gy * ny + gz * nz >= 0.0) {
+                        indices.push(i0, i1, i2);
+                    } else {
+                        indices.push(i0, i2, i1);
+                    }
+                };
+
+                // Step 2: Emit quads across [2 .. LEAF_RES + 1] interior & shared boundary edges
+                for (let pz = 2; pz <= LEAF_RES + 1; pz++) {
+                    for (let py = 2; py <= LEAF_RES + 1; py++) {
+                        for (let px = 2; px <= LEAF_RES + 1; px++) {
+                            const d0 = this.getD(px, py, pz);
 
                             // X-axis edge
-                            const dX = this.getD(cx + 1, cy, cz);
+                            const dX = this.getD(px + 1, py, pz);
                             if ((d0 < 0) !== (dX < 0)) {
-                                const v0 = cellVertMap[cellKey(cx, cy - 1, cz - 1)];
-                                const v1 = cellVertMap[cellKey(cx, cy, cz - 1)];
-                                const v2 = cellVertMap[cellKey(cx, cy, cz)];
-                                const v3 = cellVertMap[cellKey(cx, cy - 1, cz)];
+                                const v0 = cellVertMap[cellKey(px, py - 1, pz - 1)];
+                                const v1 = cellVertMap[cellKey(px, py, pz - 1)];
+                                const v2 = cellVertMap[cellKey(px, py, pz)];
+                                const v3 = cellVertMap[cellKey(px, py - 1, pz)];
                                 if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    if (d0 < 0) {
-                                        indices.push(v0, v1, v2, v0, v2, v3);
-                                    } else {
-                                        indices.push(v0, v2, v1, v0, v3, v2);
-                                    }
+                                    pushTriAligned(v0, v1, v2);
+                                    pushTriAligned(v0, v2, v3);
                                 }
                             }
 
                             // Y-axis edge
-                            const dY = this.getD(cx, cy + 1, cz);
+                            const dY = this.getD(px, py + 1, pz);
                             if ((d0 < 0) !== (dY < 0)) {
-                                const v0 = cellVertMap[cellKey(cx - 1, cy, cz - 1)];
-                                const v1 = cellVertMap[cellKey(cx - 1, cy, cz)];
-                                const v2 = cellVertMap[cellKey(cx, cy, cz)];
-                                const v3 = cellVertMap[cellKey(cx, cy, cz - 1)];
+                                const v0 = cellVertMap[cellKey(px - 1, py, pz - 1)];
+                                const v1 = cellVertMap[cellKey(px, py, pz - 1)];
+                                const v2 = cellVertMap[cellKey(px, py, pz)];
+                                const v3 = cellVertMap[cellKey(px - 1, py, pz)];
                                 if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    if (d0 < 0) {
-                                        indices.push(v0, v2, v1, v0, v3, v2);
-                                    } else {
-                                        indices.push(v0, v1, v2, v0, v2, v3);
-                                    }
+                                    pushTriAligned(v0, v2, v1);
+                                    pushTriAligned(v0, v3, v2);
                                 }
                             }
 
                             // Z-axis edge
-                            const dZ = this.getD(cx, cy, cz + 1);
+                            const dZ = this.getD(px, py, pz + 1);
                             if ((d0 < 0) !== (dZ < 0)) {
-                                const v0 = cellVertMap[cellKey(cx - 1, cy - 1, cz)];
-                                const v1 = cellVertMap[cellKey(cx, cy - 1, cz)];
-                                const v2 = cellVertMap[cellKey(cx, cy, cz)];
-                                const v3 = cellVertMap[cellKey(cx - 1, cy, cz)];
+                                const v0 = cellVertMap[cellKey(px - 1, py - 1, pz)];
+                                const v1 = cellVertMap[cellKey(px, py - 1, pz)];
+                                const v2 = cellVertMap[cellKey(px, py, pz)];
+                                const v3 = cellVertMap[cellKey(px - 1, py, pz)];
                                 if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    if (d0 < 0) {
-                                        indices.push(v0, v1, v2, v0, v2, v3);
-                                    } else {
-                                        indices.push(v0, v2, v1, v0, v3, v2);
-                                    }
+                                    pushTriAligned(v0, v1, v2);
+                                    pushTriAligned(v0, v2, v3);
                                 }
                             }
                         }
@@ -345,6 +357,8 @@
                     geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normals), 3));
                     geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
                     geo.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+                    geo.computeBoundingSphere();
+                    geo.computeBoundingBox();
 
                     this.mesh = new THREE.Mesh(geo, leafMaterial);
                     this.mesh.userData = { leaf: this };
@@ -365,30 +379,130 @@
             }
         }
 
+        function getOrCreateLeaf(lx, ly, lz) {
+            const key = `${lx},${ly},${lz}`;
+            let leaf = svoLeafMap.get(key);
+            if (!leaf) {
+                leaf = new SVOLeafNode(lx, ly, lz);
+                svoLeafMap.set(key, leaf);
+            }
+            return leaf;
+        }
+
+        function evalDensityPoC2(wx, wy, wz) {
+            const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
+            const n = (noise.fbm(wx * 0.0015, wy * 0.0015, wz * 0.0015, 3) - 0.35) * (currentRadius * 0.22);
+            return dist - (currentRadius + n);
+        }
+
         function initSVO(scene) {
             activeLeafMeshes.forEach(m => {
                 scene.remove(m);
                 m.geometry.dispose();
             });
             activeLeafMeshes.length = 0;
-            svoLeaves.length = 0;
+            svoLeafMap.clear();
 
-            LEAF_SIZE = currentRadius * 0.65;
+            LEAF_SIZE = currentRadius * 0.48;
             CELL_SIZE = LEAF_SIZE / LEAF_RES;
-            const bound = Math.ceil((currentRadius * 1.3) / LEAF_SIZE);
+            leafMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
 
-            for (let z = -bound; z <= bound; z++) {
-                for (let y = -bound; y <= bound; y++) {
-                    for (let x = -bound; x <= bound; x++) {
-                        const minX = x * LEAF_SIZE;
-                        const minY = y * LEAF_SIZE;
-                        const minZ = z * LEAF_SIZE;
-                        const center = new THREE.Vector3(minX + LEAF_SIZE * 0.5, minY + LEAF_SIZE * 0.5, minZ + LEAF_SIZE * 0.5);
+            const bound = Math.ceil((currentRadius * 1.25) / LEAF_SIZE);
+            const halfDiag = LEAF_SIZE * 0.92;
+            const minShellR = currentRadius * 0.72;
+            const maxShellR = currentRadius * 1.22;
+
+            for (let lz = -bound; lz <= bound; lz++) {
+                for (let ly = -bound; ly <= bound; ly++) {
+                    for (let lx = -bound; lx <= bound; lx++) {
+                        const center = new THREE.Vector3((lx + 0.5) * LEAF_SIZE, (ly + 0.5) * LEAF_SIZE, (lz + 0.5) * LEAF_SIZE);
                         const dist = center.length();
-                        if (dist < currentRadius + LEAF_SIZE * 0.9 && dist > currentRadius - LEAF_SIZE * 0.9) {
-                            const leaf = new SVOLeafNode(minX, minY, minZ, LEAF_SIZE);
+                        if (dist < maxShellR + halfDiag && dist > minShellR - halfDiag) {
+                            const leaf = new SVOLeafNode(lx, ly, lz);
+                            svoLeafMap.set(leaf.key, leaf);
                             leaf.extractDualContour(scene);
-                            svoLeaves.push(leaf);
+                        }
+                    }
+                }
+            }
+        }
+
+        function carveSpherePoC2(hitPoint, brushRadius) {
+            const effPad = brushRadius + CELL_SIZE * 3.5;
+            const minLX = Math.floor((hitPoint.x - effPad) / LEAF_SIZE);
+            const maxLX = Math.floor((hitPoint.x + effPad) / LEAF_SIZE);
+            const minLY = Math.floor((hitPoint.y - effPad) / LEAF_SIZE);
+            const maxLY = Math.floor((hitPoint.y + effPad) / LEAF_SIZE);
+            const minLZ = Math.floor((hitPoint.z - effPad) / LEAF_SIZE);
+            const maxLZ = Math.floor((hitPoint.z + effPad) / LEAF_SIZE);
+
+            for (let lz = minLZ; lz <= maxLZ; lz++) {
+                for (let ly = minLY; ly <= maxLY; ly++) {
+                    for (let lx = minLX; lx <= maxLX; lx++) {
+                        const leaf = getOrCreateLeaf(lx, ly, lz);
+                        let modified = false;
+                        const pRes = leaf.pRes;
+                        let idx = 0;
+                        for (let z = 0; z < pRes; z++) {
+                            const wz = leaf.minZ + (z - 2) * leaf.cellSize;
+                            for (let y = 0; y < pRes; y++) {
+                                const wy = leaf.minY + (y - 2) * leaf.cellSize;
+                                for (let x = 0; x < pRes; x++) {
+                                    const wx = leaf.minX + (x - 2) * leaf.cellSize;
+                                    const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                                    if (dist <= brushRadius + leaf.cellSize * 2.5) {
+                                        const carveD = brushRadius - dist;
+                                        if (carveD > leaf.density[idx]) {
+                                            leaf.density[idx] = carveD;
+                                            modified = true;
+                                        }
+                                    }
+                                    idx++;
+                                }
+                            }
+                        }
+                        if (modified) {
+                            leaf.extractDualContour(sandbox.scene);
+                        }
+                    }
+                }
+            }
+        }
+
+        function reinforceSpherePoC2(hitPoint, brushRadius) {
+            const effPad = brushRadius + CELL_SIZE * 3.5;
+            const minLX = Math.floor((hitPoint.x - effPad) / LEAF_SIZE);
+            const maxLX = Math.floor((hitPoint.x + effPad) / LEAF_SIZE);
+            const minLY = Math.floor((hitPoint.y - effPad) / LEAF_SIZE);
+            const maxLY = Math.floor((hitPoint.y + effPad) / LEAF_SIZE);
+            const minLZ = Math.floor((hitPoint.z - effPad) / LEAF_SIZE);
+            const maxLZ = Math.floor((hitPoint.z + effPad) / LEAF_SIZE);
+
+            for (let lz = minLZ; lz <= maxLZ; lz++) {
+                for (let ly = minLY; ly <= maxLY; ly++) {
+                    for (let lx = minLX; lx <= maxLX; lx++) {
+                        const leaf = svoLeafMap.get(`${lx},${ly},${lz}`);
+                        if (!leaf) continue;
+                        let modified = false;
+                        const pRes = leaf.pRes;
+                        let idx = 0;
+                        for (let z = 0; z < pRes; z++) {
+                            const wz = leaf.minZ + (z - 2) * leaf.cellSize;
+                            for (let y = 0; y < pRes; y++) {
+                                const wy = leaf.minY + (y - 2) * leaf.cellSize;
+                                for (let x = 0; x < pRes; x++) {
+                                    const wx = leaf.minX + (x - 2) * leaf.cellSize;
+                                    const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                                    if (dist <= brushRadius && leaf.density[idx] < 0) {
+                                        leaf.material[idx] = 3; // Reinforced Titanium Bulkhead
+                                        modified = true;
+                                    }
+                                    idx++;
+                                }
+                            }
+                        }
+                        if (modified) {
+                            leaf.extractDualContour(sandbox.scene);
                         }
                     }
                 }
@@ -403,82 +517,12 @@
             getCollisionMesh: () => activeLeafMeshes,
             getVisualMesh: () => activeLeafMeshes,
 
-            // Localized Dirty AABB Patching Carve
             onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
-                const affectedLeaves = [];
-                const sphere = new THREE.Sphere(hitPoint, brushRadius + CELL_SIZE * 2);
-
-                svoLeaves.forEach(leaf => {
-                    const box = new THREE.Box3(
-                        new THREE.Vector3(leaf.minX, leaf.minY, leaf.minZ),
-                        new THREE.Vector3(leaf.minX + leaf.size, leaf.minY + leaf.size, leaf.minZ + leaf.size)
-                    );
-                    if (box.intersectsSphere(sphere)) {
-                        affectedLeaves.push(leaf);
-                    }
-                });
-
-                affectedLeaves.forEach(leaf => {
-                    let modified = false;
-                    const gRes = leaf.gRes;
-                    let idx = 0;
-                    for (let z = 0; z < gRes; z++) {
-                        const wz = leaf.minZ + z * leaf.cellSize;
-                        for (let y = 0; y < gRes; y++) {
-                            const wy = leaf.minY + y * leaf.cellSize;
-                            for (let x = 0; x < gRes; x++) {
-                                const wx = leaf.minX + x * leaf.cellSize;
-                                const dist = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
-                                if (dist <= brushRadius) {
-                                    // Exact continuous carving equation
-                                    const carveD = brushRadius - dist;
-                                    if (carveD > leaf.density[idx]) {
-                                        leaf.density[idx] = carveD;
-                                        modified = true;
-                                    }
-                                }
-                                idx++;
-                            }
-                        }
-                    }
-                    if (modified) {
-                        leaf.extractDualContour(sandbox.scene);
-                    }
-                });
+                carveSpherePoC2(hitPoint, brushRadius);
             },
 
-            // Titanium Armor Wall Reinforcement
             onReinforce: async (hitPoint, hitNormal, brushRadius) => {
-                const sphere = new THREE.Sphere(hitPoint, brushRadius + CELL_SIZE * 2);
-                svoLeaves.forEach(leaf => {
-                    const box = new THREE.Box3(
-                        new THREE.Vector3(leaf.minX, leaf.minY, leaf.minZ),
-                        new THREE.Vector3(leaf.minX + leaf.size, leaf.minY + leaf.size, leaf.minZ + leaf.size)
-                    );
-                    if (box.intersectsSphere(sphere)) {
-                        let modified = false;
-                        const gRes = leaf.gRes;
-                        let idx = 0;
-                        for (let z = 0; z < gRes; z++) {
-                            const wz = leaf.minZ + z * leaf.cellSize;
-                            for (let y = 0; y < gRes; y++) {
-                                const wy = leaf.minY + y * leaf.cellSize;
-                                for (let x = 0; x < gRes; x++) {
-                                    const wx = leaf.minX + x * leaf.cellSize;
-                                    const dist = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
-                                    if (dist <= brushRadius && leaf.density[idx] < 0) {
-                                        leaf.material[idx] = 3; // Reinforced Titanium Bulkhead
-                                        modified = true;
-                                    }
-                                    idx++;
-                                }
-                            }
-                        }
-                        if (modified) {
-                            leaf.extractDualContour(sandbox.scene);
-                        }
-                    }
-                });
+                reinforceSpherePoC2(hitPoint, brushRadius);
             },
 
             checkMaterialAtHit: (point, hit) => {
@@ -510,6 +554,13 @@
         });
 
         initSVO(sandbox.scene);
+        {
+            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
+            const surfPt = findSurfacePoint(evalDensityPoC2, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
+            carveSpherePoC2(surfPt, 220);
+            carveSpherePoC2(surfPt.clone().addScaledVector(tunnelDir, -160), 200);
+            reinforceSpherePoC2(surfPt.clone().addScaledVector(tunnelDir, -150), 250);
+        }
     </script>
 </body>
 </html>

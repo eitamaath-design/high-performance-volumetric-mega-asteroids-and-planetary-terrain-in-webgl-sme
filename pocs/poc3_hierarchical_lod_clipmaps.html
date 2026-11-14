@@ -11,7 +11,7 @@
 <body>
     <script type="module">
         import * as THREE from './vendor/three.module.js';
-        import { PlanetaryBaseSandbox } from './shared/planetary_base_sandbox.js';
+        import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint } from './shared/planetary_base_sandbox.js';
 
         // --- Fast 3D Simplex-Style Noise ---
         class FastNoise3D {
@@ -49,33 +49,80 @@
 
         let currentRadius = 2800;
         let planetaryMacroShell = null;
+        const MAX_SHADER_PORTALS = 48;
         const portalHoles = []; // Array of { point: Vector3, radius: number }
 
-        // Subterranean high-density voxel chunks (spawned on-demand when entering caves)
+        // Subterranean high-density voxel chunks (spawned on-demand around portal openings & caverns)
         const SUBTERRANEAN_CHUNK_RES = 16;
-        let SUBTERRANEAN_CHUNK_SIZE = 350; // High resolution local chunks!
-        let SUBTERRANEAN_CELL_SIZE = SUBTERRANEAN_CHUNK_SIZE / SUBTERRANEAN_CHUNK_RES; // ~21u down to 4u
+        let SUBTERRANEAN_CHUNK_SIZE = 448;
+        let SUBTERRANEAN_CELL_SIZE = SUBTERRANEAN_CHUNK_SIZE / SUBTERRANEAN_CHUNK_RES;
 
-        const subterraneanChunks = new Map(); // key 'cx,cy,cz' => chunk
+        const subterraneanChunks = new Map();
         const activeSubterraneanMeshes = [];
 
-        // Materials
-        const macroCrustMaterial = new THREE.MeshStandardMaterial({
-            color: 0x5a6578,
-            roughness: 0.8,
-            metalness: 0.2,
-            flatShading: true
+        // High-res Triplanar Materials (Macro crust supports shader portal cutouts; Cavern supports vertex-color armor)
+        const macroCrustMaterial = createTriplanarAsteroidMaterial({
+            vertexColors: false,
+            hasPortals: true,
+            radius: currentRadius
         });
-
-        const cavernMaterial = new THREE.MeshStandardMaterial({
+        const cavernMaterial = createTriplanarAsteroidMaterial({
             vertexColors: true,
-            roughness: 0.65,
-            metalness: 0.35,
-            flatShading: false,
-            side: THREE.FrontSide
+            hasPortals: false,
+            radius: currentRadius
         });
 
-        // Procedural Macro Planetary Shell
+        function evalMacroRadiusAt(wx, wy, wz) {
+            const len = Math.sqrt(wx * wx + wy * wy + wz * wz) || 1.0;
+            const sx = (wx / len) * currentRadius;
+            const sy = (wy / len) * currentRadius;
+            const sz = (wz / len) * currentRadius;
+            const n = (noise.fbm(sx * 0.0014, sy * 0.0014, sz * 0.0014, 3) - 0.35) * (currentRadius * 0.18);
+            return currentRadius + n;
+        }
+
+        function syncPortalUniforms() {
+            const uniforms = macroCrustMaterial.userData.shaderUniforms;
+            const arr = uniforms.uPortals.value;
+            const count = Math.min(MAX_SHADER_PORTALS, portalHoles.length);
+            uniforms.uPortalCount.value = count;
+            for (let i = 0; i < count; i++) {
+                const p = portalHoles[i];
+                arr[i].set(p.point.x, p.point.y, p.point.z, p.radius);
+            }
+            for (let i = count; i < MAX_SHADER_PORTALS; i++) {
+                arr[i].set(0, 0, 0, -1);
+            }
+        }
+
+        function registerPortalHole(point, brushRadius) {
+            const portalR = brushRadius * 1.02;
+            const distFromSurface = Math.abs(point.length() - evalMacroRadiusAt(point.x, point.y, point.z));
+            // Only cut a surface portal in the macro crust if the carve sphere intersects the surface crust
+            if (distFromSurface > portalR * 1.25) return;
+
+            for (let i = 0; i < portalHoles.length; i++) {
+                if (portalHoles[i].point.distanceTo(point) < portalR * 0.45 && portalHoles[i].radius >= portalR * 0.9) {
+                    return; // Already covered by an existing portal cutout
+                }
+            }
+
+            if (portalHoles.length >= MAX_SHADER_PORTALS) {
+                // Merge into closest existing portal to keep slots bounded
+                let bestIdx = 0;
+                let bestDist = Infinity;
+                for (let i = 0; i < portalHoles.length; i++) {
+                    const d = portalHoles[i].point.distanceTo(point);
+                    if (d < bestDist) { bestDist = d; bestIdx = i; }
+                }
+                portalHoles[bestIdx].radius = Math.max(portalHoles[bestIdx].radius, bestDist + portalR * 0.5);
+            } else {
+                portalHoles.push({ point: point.clone(), radius: portalR });
+            }
+            syncPortalUniforms();
+        }
+
+        // High-Resolution Smooth Macro Planetary Shell
         function buildMacroCrust(scene) {
             if (planetaryMacroShell) {
                 scene.remove(planetaryMacroShell);
@@ -83,7 +130,7 @@
                 planetaryMacroShell = null;
             }
 
-            const segments = Math.min(64, Math.floor(currentRadius / 60));
+            const segments = 112;
             const geo = new THREE.SphereGeometry(currentRadius, segments, segments);
             const pos = geo.attributes.position;
 
@@ -91,9 +138,8 @@
                 const vx = pos.getX(i);
                 const vy = pos.getY(i);
                 const vz = pos.getZ(i);
-                const len = Math.sqrt(vx * vx + vy * vy + vz * vz);
-                const n = noise.fbm(vx * 0.0012, vy * 0.0012, vz * 0.0012, 3) * (currentRadius * 0.14);
-                const scale = (currentRadius + n) / len;
+                const len = Math.sqrt(vx * vx + vy * vy + vz * vz) || 1.0;
+                const scale = evalMacroRadiusAt(vx, vy, vz) / len;
                 pos.setXYZ(i, vx * scale, vy * scale, vz * scale);
             }
             geo.computeVertexNormals();
@@ -101,9 +147,10 @@
             planetaryMacroShell = new THREE.Mesh(geo, macroCrustMaterial);
             planetaryMacroShell.userData = { isMacroShell: true };
             scene.add(planetaryMacroShell);
+            syncPortalUniforms();
         }
 
-        // Subterranean Voxel Chunk (Dual-Grid Surface Nets mesher)
+        // Subterranean Voxel Chunk (Dual-Grid Surface Nets mesher restricted to carved cavern manifolds)
         class SubterraneanChunk {
             constructor(cx, cy, cz) {
                 this.cx = cx;
@@ -117,6 +164,7 @@
                 const pRes = SUBTERRANEAN_CHUNK_RES + 3;
                 const total = pRes * pRes * pRes;
                 this.voxelData = new Float32Array(total);
+                this.carveField = new Float32Array(total);
                 this.materialData = new Uint8Array(total);
 
                 this.initField();
@@ -132,23 +180,11 @@
                         for (let px = 0; px < pRes; px++) {
                             const wx = this.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
                             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-                            const n = noise.fbm(wx * 0.0012, wy * 0.0012, wz * 0.0012, 3) * (currentRadius * 0.14);
-                            const surfaceD = dist - (currentRadius + n);
+                            const surfaceD = dist - (evalMacroRadiusAt(wx, wy, wz) - 20.0);
 
-                            // Untouched subterranean rock is solid (d < 0)
-                            let d = surfaceD;
-
-                            // Apply any existing portal holes or carved tunnels
-                            portalHoles.forEach(h => {
-                                const hDist = Math.sqrt((wx - h.point.x)**2 + (wy - h.point.y)**2 + (wz - h.point.z)**2);
-                                if (hDist <= h.radius) {
-                                    const carveD = h.radius - hDist;
-                                    if (carveD > d) d = carveD;
-                                }
-                            });
-
-                            this.voxelData[idx] = d;
-                            this.materialData[idx] = 1; // Native rock
+                            this.voxelData[idx] = surfaceD;
+                            this.carveField[idx] = -SUBTERRANEAN_CELL_SIZE * 4.0;
+                            this.materialData[idx] = (surfaceD < -SUBTERRANEAN_CELL_SIZE && Math.sin(wx * 0.008) * Math.cos(wy * 0.008) > 0.78) ? 2 : 1;
                             idx++;
                         }
                     }
@@ -161,55 +197,63 @@
                 const res = SUBTERRANEAN_CHUNK_RES;
 
                 const getD = (px, py, pz) => this.voxelData[px + py * pRes + pz * pRes2];
+                const getC = (px, py, pz) => this.carveField[px + py * pRes + pz * pRes2];
                 const getM = (px, py, pz) => this.materialData[px + py * pRes + pz * pRes2];
 
                 const corners = [
                     [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
                     [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]
                 ];
+                const edges = [
+                    [0,1], [2,3], [4,5], [6,7],
+                    [0,2], [1,3], [4,6], [5,7],
+                    [0,4], [1,5], [2,6], [3,7]
+                ];
                 const cellCount = res + 2;
                 const cellCount2 = cellCount * cellCount;
                 const cellVertMap = new Int32Array(cellCount * cellCount * cellCount).fill(-1);
+                const vertIsExteriorCrust = [];
 
                 const vertices = [];
                 const normals = [];
                 const colors = [];
                 const indices = [];
+                const cVals = new Float32Array(8);
 
                 for (let cz = 0; cz < cellCount; cz++) {
                     for (let cy = 0; cy < cellCount; cy++) {
                         for (let cx = 0; cx < cellCount; cx++) {
                             let mask = 0;
-                            let matCounts = { 1: 0, 2: 0, 3: 0 };
-                            let vx = 0, vy = 0, vz = 0, edgeCount = 0;
+                            let rockCount = 0;
+                            let oreCount = 0;
+                            let armorCount = 0;
+                            let maxCarveVal = -1e6;
 
-                            const cVals = new Float32Array(8);
                             for (let c = 0; c < 8; c++) {
                                 const px = cx + corners[c][0];
                                 const py = cy + corners[c][1];
                                 const pz = cz + corners[c][2];
                                 const val = getD(px, py, pz);
                                 cVals[c] = val;
+                                maxCarveVal = Math.max(maxCarveVal, getC(px, py, pz));
                                 if (val < 0) {
                                     mask |= (1 << c);
                                     const m = getM(px, py, pz);
-                                    if (matCounts[m] !== undefined) matCounts[m]++;
+                                    if (m === 3) armorCount++;
+                                    else if (m === 2) oreCount++;
+                                    else rockCount++;
                                 }
                             }
 
                             if (mask === 0 || mask === 255) continue;
 
-                            // Standard 12 cube edges
-                            const edges = [
-                                [0,1], [2,3], [4,5], [6,7],
-                                [0,2], [1,3], [4,6], [5,7],
-                                [0,4], [1,5], [2,6], [3,7]
-                            ];
+                            let vx = 0, vy = 0, vz = 0, edgeCount = 0;
                             for (let e = 0; e < 12; e++) {
                                 const c1 = edges[e][0], c2 = edges[e][1];
                                 const v1 = cVals[c1], v2 = cVals[c2];
                                 if ((v1 < 0) !== (v2 < 0)) {
-                                    const t = v1 / (v1 - v2);
+                                    const denom = v1 - v2;
+                                    const t = Math.abs(denom) > 1e-6 ? v1 / denom : 0.5;
                                     const p1 = corners[c1], p2 = corners[c2];
                                     vx += cx + p1[0] + t * (p2[0] - p1[0]);
                                     vy += cy + p1[1] + t * (p2[1] - p1[1]);
@@ -225,34 +269,63 @@
                             const wy = this.minBounds.y + (vy - 1) * SUBTERRANEAN_CELL_SIZE;
                             const wz = this.minBounds.z + (vz - 1) * SUBTERRANEAN_CELL_SIZE;
 
-                            const ipx = Math.round(vx), ipy = Math.round(vy), ipz = Math.round(vz);
+                            const ipx = Math.max(1, Math.min(pRes - 2, Math.round(vx)));
+                            const ipy = Math.max(1, Math.min(pRes - 2, Math.round(vy)));
+                            const ipz = Math.max(1, Math.min(pRes - 2, Math.round(vz)));
                             const nx = getD(ipx + 1, ipy, ipz) - getD(ipx - 1, ipy, ipz);
                             const ny = getD(ipx, ipy + 1, ipz) - getD(ipx, ipy - 1, ipz);
                             const nz = getD(ipx, ipy, ipz + 1) - getD(ipx, ipy, ipz - 1);
-                            const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1.0;
+                            const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                            let unx = 0, uny = 1, unz = 0;
+                            if (len > 1e-6) {
+                                unx = nx / len; uny = ny / len; unz = nz / len;
+                            }
 
                             let domMat = 1;
-                            if (matCounts[2] > matCounts[1] && matCounts[2] >= matCounts[3]) domMat = 2;
-                            if (matCounts[3] > 0) domMat = 3; // Titanium bulkhead
+                            if (oreCount > rockCount && oreCount >= armorCount) domMat = 2;
+                            if (armorCount > 0) domMat = 3;
 
                             let rCol, gCol, bCol;
                             if (domMat === 3) {
-                                rCol = 0.12; gCol = 0.90; bCol = 0.98; // Metallic Cyan
+                                rCol = 0.12; gCol = 0.90; bCol = 0.98;
                             } else if (domMat === 2) {
-                                rCol = 0.95; gCol = 0.70; bCol = 0.15; // Ore
+                                rCol = 0.95; gCol = 0.70; bCol = 0.15;
                             } else {
-                                rCol = 0.40; gCol = 0.44; bCol = 0.48; // Cavern rock
+                                rCol = 0.40; gCol = 0.44; bCol = 0.48;
                             }
 
                             const vIdx = vertices.length / 3;
                             cellVertMap[cx + cy * cellCount + cz * cellCount2] = vIdx;
+                            // Flag untouched exterior crust cells so we don't z-fight with smooth macro shell
+                            vertIsExteriorCrust.push(maxCarveVal < -SUBTERRANEAN_CELL_SIZE * 0.4);
 
                             vertices.push(wx, wy, wz);
-                            normals.push(nx / len, ny / len, nz / len);
+                            normals.push(unx, uny, unz);
                             colors.push(rCol, gCol, bCol);
                         }
                     }
                 }
+
+                const pushTriAligned = (i0, i1, i2) => {
+                    // Omit triangles strictly on untouched exterior crust (rendered smoothly by planetaryMacroShell)
+                    if (vertIsExteriorCrust[i0] && vertIsExteriorCrust[i1] && vertIsExteriorCrust[i2]) {
+                        return;
+                    }
+                    const ax = vertices[i0 * 3], ay = vertices[i0 * 3 + 1], az = vertices[i0 * 3 + 2];
+                    const bx = vertices[i1 * 3], by = vertices[i1 * 3 + 1], bz = vertices[i1 * 3 + 2];
+                    const cx = vertices[i2 * 3], cy = vertices[i2 * 3 + 1], cz = vertices[i2 * 3 + 2];
+                    const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+                    const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+                    const gx = e1y * e2z - e1z * e2y;
+                    const gy = e1z * e2x - e1x * e2z;
+                    const gz = e1x * e2y - e1y * e2x;
+                    const nx = normals[i0 * 3], ny = normals[i0 * 3 + 1], nz = normals[i0 * 3 + 2];
+                    if (gx * nx + gy * ny + gz * nz >= 0.0) {
+                        indices.push(i0, i1, i2);
+                    } else {
+                        indices.push(i0, i2, i1);
+                    }
+                };
 
                 // Grid edges quad stitching
                 for (let pz = 1; pz <= res; pz++) {
@@ -268,8 +341,8 @@
                                 const v2 = cellVertMap[px + py * cellCount + pz * cellCount2];
                                 const v3 = cellVertMap[px + (py - 1) * cellCount + pz * cellCount2];
                                 if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    if (d0 < 0) indices.push(v0, v1, v2, v0, v2, v3);
-                                    else indices.push(v0, v2, v1, v0, v3, v2);
+                                    pushTriAligned(v0, v1, v2);
+                                    pushTriAligned(v0, v2, v3);
                                 }
                             }
 
@@ -281,8 +354,8 @@
                                 const v2 = cellVertMap[px + py * cellCount + pz * cellCount2];
                                 const v3 = cellVertMap[px + py * cellCount + (pz - 1) * cellCount2];
                                 if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    if (d0 < 0) indices.push(v0, v2, v1, v0, v3, v2);
-                                    else indices.push(v0, v1, v2, v0, v2, v3);
+                                    pushTriAligned(v0, v2, v1);
+                                    pushTriAligned(v0, v3, v2);
                                 }
                             }
 
@@ -294,8 +367,8 @@
                                 const v2 = cellVertMap[px + py * cellCount + pz * cellCount2];
                                 const v3 = cellVertMap[(px - 1) + py * cellCount + pz * cellCount2];
                                 if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    if (d0 < 0) indices.push(v0, v1, v2, v0, v2, v3);
-                                    else indices.push(v0, v2, v1, v0, v3, v2);
+                                    pushTriAligned(v0, v1, v2);
+                                    pushTriAligned(v0, v2, v3);
                                 }
                             }
                         }
@@ -319,6 +392,8 @@
                     geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normals), 3));
                     geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
                     geo.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+                    geo.computeBoundingSphere();
+                    geo.computeBoundingBox();
 
                     this.mesh = new THREE.Mesh(geo, cavernMaterial);
                     this.mesh.userData = { chunk: this };
@@ -339,16 +414,14 @@
             }
         }
 
-        function ensureSubterraneanChunksAround(point, radius, scene) {
-            const minC = point.clone().subScalar(radius + SUBTERRANEAN_CHUNK_SIZE * 0.5);
-            const maxC = point.clone().addScalar(radius + SUBTERRANEAN_CHUNK_SIZE * 0.5);
-
-            const minCX = Math.floor(minC.x / SUBTERRANEAN_CHUNK_SIZE);
-            const maxCX = Math.floor(maxC.x / SUBTERRANEAN_CHUNK_SIZE);
-            const minCY = Math.floor(minC.y / SUBTERRANEAN_CHUNK_SIZE);
-            const maxCY = Math.floor(maxC.y / SUBTERRANEAN_CHUNK_SIZE);
-            const minCZ = Math.floor(minC.z / SUBTERRANEAN_CHUNK_SIZE);
-            const maxCZ = Math.floor(maxC.z / SUBTERRANEAN_CHUNK_SIZE);
+        function ensureSubterraneanChunksAround(point, radius) {
+            const pad = radius + SUBTERRANEAN_CELL_SIZE * 3.0;
+            const minCX = Math.floor((point.x - pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const maxCX = Math.floor((point.x + pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const minCY = Math.floor((point.y - pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const maxCY = Math.floor((point.y + pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const minCZ = Math.floor((point.z - pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const maxCZ = Math.floor((point.z + pad) / SUBTERRANEAN_CHUNK_SIZE);
 
             const touched = [];
             for (let cz = minCZ; cz <= maxCZ; cz++) {
@@ -365,6 +438,70 @@
                 }
             }
             return touched;
+        }
+
+        function carveSpherePoC3(hitPoint, brushRadius) {
+            registerPortalHole(hitPoint, brushRadius);
+
+            const affected = ensureSubterraneanChunksAround(hitPoint, brushRadius);
+            const pRes = SUBTERRANEAN_CHUNK_RES + 3;
+
+            affected.forEach(chunk => {
+                let modified = false;
+                let idx = 0;
+                for (let pz = 0; pz < pRes; pz++) {
+                    const wz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE;
+                    for (let py = 0; py < pRes; py++) {
+                        const wy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE;
+                        for (let px = 0; px < pRes; px++) {
+                            const wx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
+                            const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                            const carveD = brushRadius - dist;
+                            if (carveD > chunk.carveField[idx]) {
+                                chunk.carveField[idx] = carveD;
+                            }
+                            if (dist <= brushRadius + SUBTERRANEAN_CELL_SIZE) {
+                                if (carveD > chunk.voxelData[idx]) {
+                                    chunk.voxelData[idx] = carveD;
+                                    modified = true;
+                                }
+                            }
+                            idx++;
+                        }
+                    }
+                }
+                if (modified) {
+                    chunk.rebuild(sandbox.scene);
+                }
+            });
+        }
+
+        function reinforceSpherePoC3(hitPoint, brushRadius) {
+            const affected = ensureSubterraneanChunksAround(hitPoint, brushRadius);
+            const pRes = SUBTERRANEAN_CHUNK_RES + 3;
+
+            affected.forEach(chunk => {
+                let modified = false;
+                let idx = 0;
+                for (let pz = 0; pz < pRes; pz++) {
+                    const wz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE;
+                    for (let py = 0; py < pRes; py++) {
+                        const wy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE;
+                        for (let px = 0; px < pRes; px++) {
+                            const wx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
+                            const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                            if (dist <= brushRadius && chunk.voxelData[idx] < 0) {
+                                chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
+                                modified = true;
+                            }
+                            idx++;
+                        }
+                    }
+                }
+                if (modified) {
+                    chunk.rebuild(sandbox.scene);
+                }
+            });
         }
 
         // Shared Sandbox Setup
@@ -385,95 +522,34 @@
                 return list;
             },
 
-            // Carve Laser: Stamps Portal hole on macro crust and carves deep inside cavern chunks
-            onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
-                // Register portal hole
-                portalHoles.push({ point: hitPoint.clone(), radius: brushRadius * 1.5 });
+            // Portal-aware raycast so mining beam passes straight through shader-clipped portal openings
+            customRaycast: (raycaster, camera, mousePos) => {
+                raycaster.setFromCamera(mousePos, camera);
+                const targets = [...activeSubterraneanMeshes];
+                if (planetaryMacroShell) targets.push(planetaryMacroShell);
+                const hits = raycaster.intersectObjects(targets, false);
 
-                // Deform macro crust vertices near hit point to create an open portal collar
-                if (planetaryMacroShell) {
-                    const pos = planetaryMacroShell.geometry.attributes.position;
-                    const r2 = (brushRadius * 1.6)**2;
-                    let deformCount = 0;
-                    for (let i = 0; i < pos.count; i++) {
-                        const px = pos.getX(i), py = pos.getY(i), pz = pos.getZ(i);
-                        const d2 = (px - hitPoint.x)**2 + (py - hitPoint.y)**2 + (pz - hitPoint.z)**2;
-                        if (d2 <= r2) {
-                            // Push vertex inward into the planet to open the portal collar
-                            const factor = 1.0 - Math.sqrt(d2) / (brushRadius * 1.6);
-                            const inward = hitNormal.clone().multiplyScalar(-brushRadius * 1.8 * factor);
-                            pos.setXYZ(i, px + inward.x, py + inward.y, pz + inward.z);
-                            deformCount++;
-                        }
+                for (let i = 0; i < hits.length; i++) {
+                    const h = hits[i];
+                    if (h.object === planetaryMacroShell) {
+                        const insideCutout = portalHoles.some(p => h.point.distanceTo(p.point) < p.radius * 0.90);
+                        if (insideCutout) continue; // Ignore discarded portal pixels
                     }
-                    if (deformCount > 0) {
-                        pos.needsUpdate = true;
-                        planetaryMacroShell.geometry.computeVertexNormals();
-                    }
+                    return h;
                 }
-
-                // Spawn and carve high-density subterranean chunks along the tunnel path
-                const affected = ensureSubterraneanChunksAround(hitPoint, brushRadius * 1.5, sandbox.scene);
-                const pRes = SUBTERRANEAN_CHUNK_RES + 3;
-
-                affected.forEach(chunk => {
-                    let modified = false;
-                    let idx = 0;
-                    for (let pz = 0; pz < pRes; pz++) {
-                        const wz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE;
-                        for (let py = 0; py < pRes; py++) {
-                            const wy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE;
-                            for (let px = 0; px < pRes; px++) {
-                                const wx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
-                                const dist = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
-                                if (dist <= brushRadius) {
-                                    const carveD = brushRadius - dist;
-                                    if (carveD > chunk.voxelData[idx]) {
-                                        chunk.voxelData[idx] = carveD;
-                                        modified = true;
-                                    }
-                                }
-                                idx++;
-                            }
-                        }
-                    }
-                    if (modified) {
-                        chunk.rebuild(sandbox.scene);
-                    }
-                });
+                return null;
             },
 
-            // Titanium Armor Reinforcement on Cavern Walls
-            onReinforce: async (hitPoint, hitNormal, brushRadius) => {
-                const affected = ensureSubterraneanChunksAround(hitPoint, brushRadius * 1.5, sandbox.scene);
-                const pRes = SUBTERRANEAN_CHUNK_RES + 3;
+            onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
+                carveSpherePoC3(hitPoint, brushRadius);
+            },
 
-                affected.forEach(chunk => {
-                    let modified = false;
-                    let idx = 0;
-                    for (let pz = 0; pz < pRes; pz++) {
-                        const wz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE;
-                        for (let py = 0; py < pRes; py++) {
-                            const wy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE;
-                            for (let px = 0; px < pRes; px++) {
-                                const wx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
-                                const dist = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
-                                if (dist <= brushRadius && chunk.voxelData[idx] < 0) {
-                                    chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
-                                    modified = true;
-                                }
-                                idx++;
-                            }
-                        }
-                    }
-                    if (modified) {
-                        chunk.rebuild(sandbox.scene);
-                    }
-                });
+            onReinforce: async (hitPoint, hitNormal, brushRadius) => {
+                reinforceSpherePoC3(hitPoint, brushRadius);
             },
 
             checkMaterialAtHit: (point, hit) => {
-                if (hit && hit.face) {
+                if (hit && hit.face && hit.object !== planetaryMacroShell) {
                     const colAttr = hit.object.geometry.attributes.color;
                     if (colAttr) {
                         const a = hit.face.a;
@@ -495,8 +571,10 @@
                 activeSubterraneanMeshes.length = 0;
                 subterraneanChunks.clear();
 
-                SUBTERRANEAN_CHUNK_SIZE = currentRadius * 0.12; // Scaled local chunks
+                SUBTERRANEAN_CHUNK_SIZE = currentRadius * 0.16;
                 SUBTERRANEAN_CELL_SIZE = SUBTERRANEAN_CHUNK_SIZE / SUBTERRANEAN_CHUNK_RES;
+                macroCrustMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
+                cavernMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
 
                 buildMacroCrust(sandbox.scene);
             },
@@ -515,6 +593,19 @@
         });
 
         buildMacroCrust(sandbox.scene);
+        // Starter Portal Entrance & Deep Cavern + Reinforced Bulkhead Wall
+        {
+            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
+            const surfPt = findSurfacePoint(
+                (wx, wy, wz) => Math.hypot(wx, wy, wz) - evalMacroRadiusAt(wx, wy, wz),
+                tunnelDir,
+                currentRadius * 0.6,
+                currentRadius * 1.4
+            );
+            carveSpherePoC3(surfPt, 230);
+            carveSpherePoC3(surfPt.clone().addScaledVector(tunnelDir, -160), 210);
+            reinforceSpherePoC3(surfPt.clone().addScaledVector(tunnelDir, -150), 250);
+        }
     </script>
 </body>
 </html>

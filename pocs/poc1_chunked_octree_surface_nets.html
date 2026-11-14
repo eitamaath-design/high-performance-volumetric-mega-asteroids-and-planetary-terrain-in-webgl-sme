@@ -11,7 +11,7 @@
 <body>
     <script type="module">
         import * as THREE from './vendor/three.module.js';
-        import { PlanetaryBaseSandbox } from './shared/planetary_base_sandbox.js';
+        import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint } from './shared/planetary_base_sandbox.js';
 
         // --- Fast 3D Simplex-Style Noise for Procedural Asteroid Form ---
         class FastNoise3D {
@@ -49,81 +49,93 @@
 
         // --- Option 1 Constants ---
         let currentRadius = 2800;
-        const CHUNK_RES = 16; // 16x16x16 cells
-        let CHUNK_SIZE = 900;  // Dynamically scaled
+        const CHUNK_RES = 18; // 18x18x18 cells per chunk
+        let CHUNK_SIZE = 1260;
         let CELL_SIZE = CHUNK_SIZE / CHUNK_RES;
+        let worldEpoch = 0;
 
         // Sparse Chunks Map
-        const chunkMap = new Map(); // key 'cx,cy,cz' => Chunk object
+        const chunkMap = new Map(); // key 'cx,cy,cz' => VoxelChunk
         const activeChunkMeshes = [];
 
-        // Worker Pool
+        // Request-ID Keyed Worker Pool
         const WORKER_COUNT = 3;
         const workerPool = [];
-        let workerIndex = 0;
+        const pendingCallbacks = new Map();
+        let nextRequestId = 1;
 
         for (let i = 0; i < WORKER_COUNT; i++) {
             const worker = new Worker(new URL('workers/surface_nets_worker.js', window.location.href).href);
-            worker.busy = false;
+            worker.activeJobs = 0;
+            worker.onmessage = (e) => {
+                worker.activeJobs = Math.max(0, worker.activeJobs - 1);
+                const cb = pendingCallbacks.get(e.data.requestId);
+                if (cb) {
+                    pendingCallbacks.delete(e.data.requestId);
+                    cb(e.data);
+                }
+            };
+            worker.onerror = (err) => {
+                console.error('[PoC1 Worker Error]', err);
+            };
             workerPool.push(worker);
         }
 
-        function getNextWorker() {
-            const available = workerPool.find(w => !w.busy);
-            if (available) return available;
-            workerIndex = (workerIndex + 1) % workerPool.length;
-            return workerPool[workerIndex];
+        function dispatchWorkerJob(payload, transferables) {
+            // Pick least loaded worker
+            let chosen = workerPool[0];
+            for (let i = 1; i < workerPool.length; i++) {
+                if (workerPool[i].activeJobs < chosen.activeJobs) {
+                    chosen = workerPool[i];
+                }
+            }
+            const requestId = nextRequestId++;
+            chosen.activeJobs++;
+            payload.requestId = requestId;
+            return new Promise((resolve) => {
+                pendingCallbacks.set(requestId, resolve);
+                chosen.postMessage(payload, transferables);
+            });
         }
 
-        // Shared Standard Material with Vertex Colors
-        const chunkMaterial = new THREE.MeshStandardMaterial({
-            vertexColors: true,
-            roughness: 0.65,
-            metalness: 0.25,
-            flatShading: false,
-            side: THREE.FrontSide
-        });
+        // Procedural 3D Triplanar Rock + Ore + Hex Titanium Bulkhead Material
+        const chunkMaterial = createTriplanarAsteroidMaterial({ vertexColors: true, radius: currentRadius });
 
         class VoxelChunk {
-            constructor(cx, cy, cz) {
+            constructor(cx, cy, cz, epoch) {
                 this.cx = cx;
                 this.cy = cy;
                 this.cz = cz;
+                this.epoch = epoch;
                 this.key = `${cx},${cy},${cz}`;
                 this.minBounds = new THREE.Vector3(cx * CHUNK_SIZE, cy * CHUNK_SIZE, cz * CHUNK_SIZE);
                 this.maxBounds = this.minBounds.clone().addScalar(CHUNK_SIZE);
-                this.center = this.minBounds.clone().addScalar(CHUNK_SIZE * 0.5);
 
-                const pRes = CHUNK_RES + 3;
+                const pRes = CHUNK_RES + 5;
                 const totalVoxels = pRes * pRes * pRes;
                 this.voxelData = new Float32Array(totalVoxels);
                 this.materialData = new Uint8Array(totalVoxels);
 
                 this.mesh = null;
-                this.isDirty = true;
                 this.isGenerating = false;
+                this.needsRebuild = false;
 
                 this.initVoxels();
             }
 
             initVoxels() {
-                const pRes = CHUNK_RES + 3;
+                const pRes = CHUNK_RES + 5;
                 let idx = 0;
                 for (let pz = 0; pz < pRes; pz++) {
-                    const wz = this.minBounds.z + (pz - 1) * CELL_SIZE;
+                    const wz = this.minBounds.z + (pz - 2) * CELL_SIZE;
                     for (let py = 0; py < pRes; py++) {
-                        const wy = this.minBounds.y + (py - 1) * CELL_SIZE;
+                        const wy = this.minBounds.y + (py - 2) * CELL_SIZE;
                         for (let px = 0; px < pRes; px++) {
-                            const wx = this.minBounds.x + (px - 1) * CELL_SIZE;
-                            const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-                            // Procedural asteroid with craters & noise
-                            const n = noise.fbm(wx * 0.0015, wy * 0.0015, wz * 0.0015, 3) * (currentRadius * 0.18);
-                            // Signed distance: negative = solid inside, positive = empty space outside
-                            const d = dist - (currentRadius + n);
+                            const wx = this.minBounds.x + (px - 2) * CELL_SIZE;
+                            const d = evalDensityPoC1(wx, wy, wz);
                             this.voxelData[idx] = d;
 
-                            // Material: 1 = Rock, 2 = Ore Vein
-                            if (d < 0 && Math.sin(wx * 0.006) * Math.cos(wz * 0.006) > 0.65) {
+                            if (d < -CELL_SIZE && Math.sin(wx * 0.0055 + wy * 0.002) * Math.cos(wz * 0.0055) > 0.78) {
                                 this.materialData[idx] = 2; // Ore vein
                             } else {
                                 this.materialData[idx] = 1; // Native rock
@@ -134,62 +146,18 @@
                 }
             }
 
-            rebuildMesh(scene) {
-                if (this.isGenerating) return;
+            async rebuildMesh(scene) {
+                if (this.isGenerating) {
+                    this.needsRebuild = true;
+                    return;
+                }
                 this.isGenerating = true;
+                this.needsRebuild = false;
 
-                const worker = getNextWorker();
-                worker.busy = true;
-
-                // Clone buffers for worker transfer
                 const voxelCopy = new Float32Array(this.voxelData);
                 const matCopy = new Uint8Array(this.materialData);
 
-                const handleMessage = (e) => {
-                    worker.removeEventListener('message', handleMessage);
-                    worker.busy = false;
-                    this.isGenerating = false;
-
-                    const { positions, normals, colors, materials, indices } = e.data;
-
-                    if (positions.length === 0 || indices.length === 0) {
-                        if (this.mesh) {
-                            scene.remove(this.mesh);
-                            const mIdx = activeChunkMeshes.indexOf(this.mesh);
-                            if (mIdx !== -1) activeChunkMeshes.splice(mIdx, 1);
-                            this.mesh.geometry.dispose();
-                            this.mesh = null;
-                        }
-                        return;
-                    }
-
-                    if (!this.mesh) {
-                        const geo = new THREE.BufferGeometry();
-                        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                        geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-                        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-                        geo.setIndex(new THREE.BufferAttribute(indices, 1));
-
-                        this.mesh = new THREE.Mesh(geo, chunkMaterial);
-                        this.mesh.userData = { chunk: this };
-                        scene.add(this.mesh);
-                        activeChunkMeshes.push(this.mesh);
-                    } else {
-                        const geo = this.mesh.geometry;
-                        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                        geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-                        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-                        geo.setIndex(new THREE.BufferAttribute(indices, 1));
-                        geo.attributes.position.needsUpdate = true;
-                        geo.attributes.normal.needsUpdate = true;
-                        geo.attributes.color.needsUpdate = true;
-                        geo.computeBoundingSphere();
-                        geo.computeBoundingBox();
-                    }
-                };
-
-                worker.addEventListener('message', handleMessage);
-                worker.postMessage({
+                const result = await dispatchWorkerJob({
                     chunkId: this.key,
                     res: CHUNK_RES,
                     voxelData: voxelCopy,
@@ -197,12 +165,67 @@
                     minBounds: [this.minBounds.x, this.minBounds.y, this.minBounds.z],
                     cellSize: CELL_SIZE
                 }, [voxelCopy.buffer, matCopy.buffer]);
+
+                this.isGenerating = false;
+
+                // Discard stale results from previous planetary scale
+                if (this.epoch !== worldEpoch) return;
+
+                const { positions, normals, colors, indices } = result;
+
+                if (positions.length === 0 || indices.length === 0) {
+                    if (this.mesh) {
+                        scene.remove(this.mesh);
+                        const mIdx = activeChunkMeshes.indexOf(this.mesh);
+                        if (mIdx !== -1) activeChunkMeshes.splice(mIdx, 1);
+                        this.mesh.geometry.dispose();
+                        this.mesh = null;
+                    }
+                } else if (!this.mesh) {
+                    const geo = new THREE.BufferGeometry();
+                    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+                    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                    geo.setIndex(new THREE.BufferAttribute(indices, 1));
+                    geo.computeBoundingSphere();
+                    geo.computeBoundingBox();
+
+                    this.mesh = new THREE.Mesh(geo, chunkMaterial);
+                    this.mesh.userData = { chunk: this };
+                    scene.add(this.mesh);
+                    activeChunkMeshes.push(this.mesh);
+                } else {
+                    const geo = this.mesh.geometry;
+                    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+                    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                    geo.setIndex(new THREE.BufferAttribute(indices, 1));
+                    geo.attributes.position.needsUpdate = true;
+                    geo.attributes.normal.needsUpdate = true;
+                    geo.attributes.color.needsUpdate = true;
+                    geo.computeBoundingSphere();
+                    geo.computeBoundingBox();
+                }
+
+                if (this.needsRebuild && this.epoch === worldEpoch) {
+                    this.rebuildMesh(scene);
+                }
             }
         }
 
-        // Initialize Chunks around asteroid surface
-        function initAsteroidChunks(scene) {
-            // Clean up existing
+        function getOrCreateChunk(cx, cy, cz) {
+            const key = `${cx},${cy},${cz}`;
+            let chunk = chunkMap.get(key);
+            if (!chunk) {
+                chunk = new VoxelChunk(cx, cy, cz, worldEpoch);
+                chunkMap.set(key, chunk);
+            }
+            return chunk;
+        }
+
+        // Initialize Chunks intersecting asteroid surface shell
+        async function initAsteroidChunks(scene) {
+            worldEpoch++;
             activeChunkMeshes.forEach(m => {
                 scene.remove(m);
                 m.geometry.dispose();
@@ -210,25 +233,118 @@
             activeChunkMeshes.length = 0;
             chunkMap.clear();
 
-            CHUNK_SIZE = currentRadius * 0.65;
+            CHUNK_SIZE = currentRadius * 0.45;
             CELL_SIZE = CHUNK_SIZE / CHUNK_RES;
+            chunkMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
 
-            const boundChunks = Math.ceil((currentRadius * 1.3) / CHUNK_SIZE);
+            const boundChunks = Math.ceil((currentRadius * 1.25) / CHUNK_SIZE);
+            const halfDiag = CHUNK_SIZE * 0.92;
+            const minShellR = currentRadius * 0.72;
+            const maxShellR = currentRadius * 1.22;
 
+            const initialRebuilds = [];
             for (let cz = -boundChunks; cz <= boundChunks; cz++) {
                 for (let cy = -boundChunks; cy <= boundChunks; cy++) {
                     for (let cx = -boundChunks; cx <= boundChunks; cx++) {
-                        const chunkCenter = new THREE.Vector3((cx + 0.5) * CHUNK_SIZE, (cy + 0.5) * CHUNK_SIZE, (cz + 0.5) * CHUNK_SIZE);
-                        const distToOrigin = chunkCenter.length();
-                        // Allocate chunks intersecting asteroid surface shell
-                        if (distToOrigin < currentRadius + CHUNK_SIZE * 0.9 && distToOrigin > currentRadius - CHUNK_SIZE * 0.9) {
-                            const chunk = new VoxelChunk(cx, cy, cz);
+                        const center = new THREE.Vector3((cx + 0.5) * CHUNK_SIZE, (cy + 0.5) * CHUNK_SIZE, (cz + 0.5) * CHUNK_SIZE);
+                        const d = center.length();
+                        if (d < maxShellR + halfDiag && d > minShellR - halfDiag) {
+                            const chunk = new VoxelChunk(cx, cy, cz, worldEpoch);
                             chunkMap.set(chunk.key, chunk);
-                            chunk.rebuildMesh(scene);
+                            initialRebuilds.push(chunk.rebuildMesh(scene));
                         }
                     }
                 }
             }
+            await Promise.all(initialRebuilds);
+        }
+
+        async function carveSpherePoC1(hitPoint, brushRadius) {
+            const pRes = CHUNK_RES + 5;
+            const effPad = brushRadius + CELL_SIZE * 3.5;
+            const minCX = Math.floor((hitPoint.x - effPad) / CHUNK_SIZE);
+            const maxCX = Math.floor((hitPoint.x + effPad) / CHUNK_SIZE);
+            const minCY = Math.floor((hitPoint.y - effPad) / CHUNK_SIZE);
+            const maxCY = Math.floor((hitPoint.y + effPad) / CHUNK_SIZE);
+            const minCZ = Math.floor((hitPoint.z - effPad) / CHUNK_SIZE);
+            const maxCZ = Math.floor((hitPoint.z + effPad) / CHUNK_SIZE);
+
+            const rebuilds = [];
+            for (let cz = minCZ; cz <= maxCZ; cz++) {
+                for (let cy = minCY; cy <= maxCY; cy++) {
+                    for (let cx = minCX; cx <= maxCX; cx++) {
+                        const chunk = getOrCreateChunk(cx, cy, cz);
+                        let idx = 0;
+                        let modified = false;
+                        for (let pz = 0; pz < pRes; pz++) {
+                            const wz = chunk.minBounds.z + (pz - 2) * CELL_SIZE;
+                            for (let py = 0; py < pRes; py++) {
+                                const wy = chunk.minBounds.y + (py - 2) * CELL_SIZE;
+                                for (let px = 0; px < pRes; px++) {
+                                    const wx = chunk.minBounds.x + (px - 2) * CELL_SIZE;
+                                    const distToCenter = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                                    if (distToCenter <= brushRadius + CELL_SIZE * 2.5) {
+                                        const carveD = brushRadius - distToCenter;
+                                        if (carveD > chunk.voxelData[idx]) {
+                                            chunk.voxelData[idx] = carveD;
+                                            modified = true;
+                                        }
+                                    }
+                                    idx++;
+                                }
+                            }
+                        }
+                        if (modified) {
+                            rebuilds.push(chunk.rebuildMesh(sandbox.scene));
+                        }
+                    }
+                }
+            }
+            await Promise.all(rebuilds);
+        }
+
+        async function reinforceSpherePoC1(hitPoint, brushRadius) {
+            const pRes = CHUNK_RES + 5;
+            const effPad = brushRadius + CELL_SIZE * 3.5;
+            const minCX = Math.floor((hitPoint.x - effPad) / CHUNK_SIZE);
+            const maxCX = Math.floor((hitPoint.x + effPad) / CHUNK_SIZE);
+            const minCY = Math.floor((hitPoint.y - effPad) / CHUNK_SIZE);
+            const maxCY = Math.floor((hitPoint.y + effPad) / CHUNK_SIZE);
+            const minCZ = Math.floor((hitPoint.z - effPad) / CHUNK_SIZE);
+            const maxCZ = Math.floor((hitPoint.z + effPad) / CHUNK_SIZE);
+
+            const rebuilds = [];
+            for (let cz = minCZ; cz <= maxCZ; cz++) {
+                for (let cy = minCY; cy <= maxCY; cy++) {
+                    for (let cx = minCX; cx <= maxCX; cx++) {
+                        const key = `${cx},${cy},${cz}`;
+                        const chunk = chunkMap.get(key);
+                        if (!chunk) continue;
+
+                        let idx = 0;
+                        let modified = false;
+                        for (let pz = 0; pz < pRes; pz++) {
+                            const wz = chunk.minBounds.z + (pz - 2) * CELL_SIZE;
+                            for (let py = 0; py < pRes; py++) {
+                                const wy = chunk.minBounds.y + (py - 2) * CELL_SIZE;
+                                for (let px = 0; px < pRes; px++) {
+                                    const wx = chunk.minBounds.x + (px - 2) * CELL_SIZE;
+                                    const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                                    if (dist <= brushRadius && chunk.voxelData[idx] < 0) {
+                                        chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
+                                        modified = true;
+                                    }
+                                    idx++;
+                                }
+                            }
+                        }
+                        if (modified) {
+                            rebuilds.push(chunk.rebuildMesh(sandbox.scene));
+                        }
+                    }
+                }
+            }
+            await Promise.all(rebuilds);
         }
 
         // Initialize Shared Sandbox
@@ -239,88 +355,19 @@
             getCollisionMesh: () => activeChunkMeshes,
             getVisualMesh: () => activeChunkMeshes,
 
-            // Continuous Spherical Laser Carve Invariant
             onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
-                const pRes = CHUNK_RES + 3;
-                const affectedChunks = new Set();
-
-                // Find all chunks intersecting brush sphere
-                chunkMap.forEach(chunk => {
-                    const chunkBox = new THREE.Box3(chunk.minBounds, chunk.maxBounds);
-                    const sphere = new THREE.Sphere(hitPoint, brushRadius + CELL_SIZE * 2);
-                    if (chunkBox.intersectsSphere(sphere)) {
-                        affectedChunks.add(chunk);
-                    }
-                });
-
-                affectedChunks.forEach(chunk => {
-                    let idx = 0;
-                    let modified = false;
-                    for (let pz = 0; pz < pRes; pz++) {
-                        const wz = chunk.minBounds.z + (pz - 1) * CELL_SIZE;
-                        for (let py = 0; py < pRes; py++) {
-                            const wy = chunk.minBounds.y + (py - 1) * CELL_SIZE;
-                            for (let px = 0; px < pRes; px++) {
-                                const wx = chunk.minBounds.x + (px - 1) * CELL_SIZE;
-                                const distToCenter = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
-
-                                if (distToCenter <= brushRadius) {
-                                    // Exact continuous carve equation:
-                                    // d_new(x) = max(d(x), R_brush - ||x - p_hit||)
-                                    const carveD = brushRadius - distToCenter;
-                                    if (carveD > chunk.voxelData[idx]) {
-                                        chunk.voxelData[idx] = carveD;
-                                        modified = true;
-                                    }
-                                }
-                                idx++;
-                            }
-                        }
-                    }
-                    if (modified) {
-                        chunk.rebuildMesh(sandbox.scene);
-                    }
-                });
+                await carveSpherePoC1(hitPoint, brushRadius);
             },
 
-            // Nanite Titanium Armor Beam Reinforcement
             onReinforce: async (hitPoint, hitNormal, brushRadius) => {
-                const pRes = CHUNK_RES + 3;
-                chunkMap.forEach(chunk => {
-                    const chunkBox = new THREE.Box3(chunk.minBounds, chunk.maxBounds);
-                    const sphere = new THREE.Sphere(hitPoint, brushRadius + CELL_SIZE * 2);
-                    if (chunkBox.intersectsSphere(sphere)) {
-                        let idx = 0;
-                        let modified = false;
-                        for (let pz = 0; pz < pRes; pz++) {
-                            const wz = chunk.minBounds.z + (pz - 1) * CELL_SIZE;
-                            for (let py = 0; py < pRes; py++) {
-                                const wy = chunk.minBounds.y + (py - 1) * CELL_SIZE;
-                                for (let px = 0; px < pRes; px++) {
-                                    const wx = chunk.minBounds.x + (px - 1) * CELL_SIZE;
-                                    const dist = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
-                                    if (dist <= brushRadius && chunk.voxelData[idx] < 0) {
-                                        chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
-                                        modified = true;
-                                    }
-                                    idx++;
-                                }
-                            }
-                        }
-                        if (modified) {
-                            chunk.rebuildMesh(sandbox.scene);
-                        }
-                    }
-                });
+                await reinforceSpherePoC1(hitPoint, brushRadius);
             },
 
             checkMaterialAtHit: (point, hit) => {
-                // If hitting a mesh with titanium vertex color
                 if (hit && hit.face) {
                     const colAttr = hit.object.geometry.attributes.color;
                     if (colAttr) {
                         const a = hit.face.a;
-                        // Titanium has high blue/cyan: colAttr.getY(a) > 0.8 && colAttr.getZ(a) > 0.9
                         if (colAttr.getY(a) > 0.8 && colAttr.getZ(a) > 0.9) {
                             return true;
                         }
@@ -329,9 +376,9 @@
                 return false;
             },
 
-            onScaleChange: (scaleKey, radius) => {
+            onScaleChange: async (scaleKey, radius) => {
                 currentRadius = radius;
-                initAsteroidChunks(sandbox.scene);
+                await initAsteroidChunks(sandbox.scene);
             },
 
             onToggleWireframe: (enabled) => {
@@ -344,8 +391,21 @@
             }
         });
 
-        // Initial Build
-        initAsteroidChunks(sandbox.scene);
+        function evalDensityPoC1(wx, wy, wz) {
+            const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
+            const n = (noise.fbm(wx * 0.0014, wy * 0.0014, wz * 0.0014, 3) - 0.35) * (currentRadius * 0.24);
+            return dist - (currentRadius + n);
+        }
+
+        // Initial Build + Starter Demonstration Tunnel & Reinforced Alcove
+        (async () => {
+            await initAsteroidChunks(sandbox.scene);
+            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
+            const surfPt = findSurfacePoint(evalDensityPoC1, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
+            await carveSpherePoC1(surfPt, 220);
+            await carveSpherePoC1(surfPt.clone().addScaledVector(tunnelDir, -160), 200);
+            await reinforceSpherePoC1(surfPt.clone().addScaledVector(tunnelDir, -150), 250);
+        })();
     </script>
 </body>
 </html>

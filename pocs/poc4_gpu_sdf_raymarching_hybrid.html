@@ -11,7 +11,7 @@
 <body>
     <script type="module">
         import * as THREE from './vendor/three.module.js';
-        import { PlanetaryBaseSandbox } from './shared/planetary_base_sandbox.js';
+        import { PlanetaryBaseSandbox, findSurfacePoint } from './shared/planetary_base_sandbox.js';
 
         // --- Fast 3D Simplex-Style Noise ---
         class FastNoise3D {
@@ -48,28 +48,26 @@
         const noise = new FastNoise3D(999);
 
         let currentRadius = 2800;
-        const VOL_RES = 64; // 64^3 Volume Texture (262,144 voxels)
-        let DOMAIN_HALF = currentRadius * 1.35;
+        const VOL_RES = 80; // 80^3 Volume Texture (512,000 voxels)
+        let DOMAIN_HALF = currentRadius * 1.32;
         let VOXEL_SPACING = (DOMAIN_HALF * 2.0) / VOL_RES;
 
-        // RGBA Volume Buffer (R = Distance, G = Material: 1=Rock, 2=Ore, 3=Titanium, B = 0, A = 1)
+        // RGBA Volume Buffer (R = Signed Distance, G = Material: 1=Rock, 2=Ore, 3=Titanium)
         const volumeData = new Float32Array(VOL_RES * VOL_RES * VOL_RES * 4);
         let volumeTexture = null;
         let volumeBoxMesh = null;
         let raymarchMaterial = null;
+        const viewProjMatrix = new THREE.Matrix4();
 
-        // Local Surface Nets collision proxy mesh
-        let localProxyMesh = null;
-        const localProxyMaterial = new THREE.MeshBasicMaterial({
-            color: 0x00ffcc,
-            wireframe: true,
-            transparent: true,
-            opacity: 0.75
-        });
+        function evalDensityPoC4(wx, wy, wz) {
+            const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
+            const n = (noise.fbm(wx * 0.0015, wy * 0.0015, wz * 0.0015, 3) - 0.35) * (currentRadius * 0.22);
+            return dist - (currentRadius + n);
+        }
 
         // Initialize 3D Volume Field
         function initVolumeField() {
-            DOMAIN_HALF = currentRadius * 1.35;
+            DOMAIN_HALF = currentRadius * 1.32;
             VOXEL_SPACING = (DOMAIN_HALF * 2.0) / VOL_RES;
 
             let idx = 0;
@@ -79,12 +77,10 @@
                     const wy = -DOMAIN_HALF + (y + 0.5) * VOXEL_SPACING;
                     for (let x = 0; x < VOL_RES; x++) {
                         const wx = -DOMAIN_HALF + (x + 0.5) * VOXEL_SPACING;
-                        const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-                        const n = noise.fbm(wx * 0.0015, wy * 0.0015, wz * 0.0015, 3) * (currentRadius * 0.16);
-                        const d = dist - (currentRadius + n);
+                        const d = evalDensityPoC4(wx, wy, wz);
 
-                        volumeData[idx * 4] = d / DOMAIN_HALF; // Normalized signed distance [-1..1]
-                        volumeData[idx * 4 + 1] = (d < 0 && Math.sin(wx * 0.006) * Math.cos(wy * 0.006) > 0.6) ? 2.0 : 1.0; // Material
+                        volumeData[idx * 4] = d / DOMAIN_HALF;
+                        volumeData[idx * 4 + 1] = (d < -VOXEL_SPACING * 0.8 && Math.sin(wx * 0.006) * Math.cos(wy * 0.006) > 0.78) ? 2.0 : 1.0;
                         volumeData[idx * 4 + 2] = 0.0;
                         volumeData[idx * 4 + 3] = 1.0;
                         idx++;
@@ -96,19 +92,20 @@
                 volumeTexture.dispose();
             }
 
-            // Create Data3DTexture
             volumeTexture = new THREE.Data3DTexture(volumeData, VOL_RES, VOL_RES, VOL_RES);
             volumeTexture.format = THREE.RGBAFormat;
             volumeTexture.type = THREE.FloatType;
             volumeTexture.minFilter = THREE.LinearFilter;
             volumeTexture.magFilter = THREE.LinearFilter;
+            volumeTexture.wrapS = THREE.ClampToEdgeWrapping;
+            volumeTexture.wrapT = THREE.ClampToEdgeWrapping;
+            volumeTexture.wrapR = THREE.ClampToEdgeWrapping;
             volumeTexture.unpackAlignment = 1;
             volumeTexture.needsUpdate = true;
         }
 
-        // CPU Trilinear Interpolation Sampling (Exact match with GPU shader)
+        // CPU Trilinear Interpolation Sampling (Exact match with GPU sampler3D texel centers)
         function cpuSampleSDF(wx, wy, wz) {
-            // Map world space to [0..1]
             const u = (wx + DOMAIN_HALF) / (DOMAIN_HALF * 2.0);
             const v = (wy + DOMAIN_HALF) / (DOMAIN_HALF * 2.0);
             const w = (wz + DOMAIN_HALF) / (DOMAIN_HALF * 2.0);
@@ -117,9 +114,9 @@
                 return { d: 1000.0, mat: 0 };
             }
 
-            const gx = u * (VOL_RES - 1);
-            const gy = v * (VOL_RES - 1);
-            const gz = w * (VOL_RES - 1);
+            const gx = Math.max(0, Math.min(VOL_RES - 1, u * VOL_RES - 0.5));
+            const gy = Math.max(0, Math.min(VOL_RES - 1, v * VOL_RES - 0.5));
+            const gz = Math.max(0, Math.min(VOL_RES - 1, w * VOL_RES - 0.5));
 
             const x0 = Math.floor(gx), x1 = Math.min(x0 + 1, VOL_RES - 1);
             const y0 = Math.floor(gy), y1 = Math.min(y0 + 1, VOL_RES - 1);
@@ -129,10 +126,10 @@
             const fy = gy - y0;
             const fz = gz - z0;
 
-            function sample(x, y, z) {
+            const sample = (x, y, z) => {
                 const i = (x + y * VOL_RES + z * VOL_RES * VOL_RES) * 4;
                 return { d: volumeData[i] * DOMAIN_HALF, mat: volumeData[i + 1] };
-            }
+            };
 
             const c000 = sample(x0, y0, z0);
             const c100 = sample(x1, y0, z0);
@@ -151,9 +148,12 @@
             const d0 = d00 * (1 - fy) + d10 * fy;
             const d1 = d01 * (1 - fy) + d11 * fy;
 
+            const m00 = Math.max(c000.mat, c100.mat, c010.mat, c110.mat);
+            const m11 = Math.max(c001.mat, c101.mat, c011.mat, c111.mat);
+
             return {
                 d: d0 * (1 - fz) + d1 * fz,
-                mat: c000.mat // Dominant material at cell origin
+                mat: Math.max(m00, m11)
             };
         }
 
@@ -168,15 +168,17 @@
                 uniforms: {
                     uVolume: { value: volumeTexture },
                     uDomainHalf: { value: DOMAIN_HALF },
-                    uSunDir: { value: new THREE.Vector3(0.5, 0.8, 0.6).normalize() },
+                    uAsteroidRadius: { value: currentRadius },
+                    uSunDir: { value: new THREE.Vector3(0.65, 0.55, 0.52).normalize() },
                     uCameraPos: { value: new THREE.Vector3() },
-                    uWireframe: { value: 0.0 }
+                    uViewProjMatrix: { value: new THREE.Matrix4() },
+                    uWireframe: { value: 0.0 },
+                    uXRayEnabled: { value: 0.0 },
+                    uXRayOffset: { value: 0.0 }
                 },
                 vertexShader: `
                     out vec3 vWorldPos;
-                    out vec3 vLocalPos;
                     void main() {
-                        vLocalPos = position;
                         vec4 wp = modelMatrix * vec4(position, 1.0);
                         vWorldPos = wp.xyz;
                         gl_Position = projectionMatrix * viewMatrix * wp;
@@ -187,94 +189,309 @@
                     precision highp sampler3D;
 
                     in vec3 vWorldPos;
-                    in vec3 vLocalPos;
                     out vec4 fragColor;
 
                     uniform sampler3D uVolume;
                     uniform float uDomainHalf;
+                    uniform float uAsteroidRadius;
                     uniform vec3 uSunDir;
                     uniform vec3 uCameraPos;
+                    uniform mat4 uViewProjMatrix;
                     uniform float uWireframe;
+                    uniform float uXRayEnabled;
+                    uniform float uXRayOffset;
+
+                    float rmHash3(vec3 p) {
+                        p = fract(p * 0.3183099 + 0.1);
+                        p *= 17.0;
+                        return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+                    }
+
+                    float rmNoise3(vec3 x) {
+                        vec3 i = floor(x);
+                        vec3 f = fract(x);
+                        f = f * f * (3.0 - 2.0 * f);
+                        return mix(
+                            mix(mix(rmHash3(i + vec3(0,0,0)), rmHash3(i + vec3(1,0,0)), f.x),
+                                mix(rmHash3(i + vec3(0,1,0)), rmHash3(i + vec3(1,1,0)), f.x), f.y),
+                            mix(mix(rmHash3(i + vec3(0,0,1)), rmHash3(i + vec3(1,0,1)), f.x),
+                                mix(rmHash3(i + vec3(0,1,1)), rmHash3(i + vec3(1,1,1)), f.x), f.y),
+                            f.z
+                        );
+                    }
+
+                    float rmFbm(vec3 p) {
+                        float v = 0.0;
+                        float a = 0.5;
+                        for (int i = 0; i < 3; i++) {
+                            v += a * rmNoise3(p);
+                            p *= 2.04;
+                            a *= 0.5;
+                        }
+                        return v;
+                    }
+
+                    float rmHexDist2D(vec2 p) {
+                        p = abs(p);
+                        return max(dot(p, normalize(vec2(1.0, 1.7320508))), p.x);
+                    }
+
+                    float rmTriplanarHex(vec3 pos, vec3 n, float scale) {
+                        vec3 w = pow(abs(n), vec3(4.0));
+                        w /= max(w.x + w.y + w.z, 0.0001);
+                        float h = 0.0;
+                        vec2 uv0 = pos.yz * scale;
+                        vec2 uv1 = pos.xz * scale;
+                        vec2 uv2 = pos.xy * scale;
+                        for (int i = 0; i < 3; i++) {
+                            vec2 uv = (i == 0) ? uv0 : ((i == 1) ? uv1 : uv2);
+                            float wi = (i == 0) ? w.x : ((i == 1) ? w.y : w.z);
+                            vec2 r = vec2(1.0, 1.7320508);
+                            vec2 h2 = r * 0.5;
+                            vec2 a = mod(uv, r) - h2;
+                            vec2 b = mod(uv - h2, r) - h2;
+                            vec2 gv = dot(a, a) < dot(b, b) ? a : b;
+                            float edge = 0.5 - rmHexDist2D(gv);
+                            h += smoothstep(0.0, 0.09, edge) * wi;
+                        }
+                        return h;
+                    }
+
+                    vec2 intersectBox(vec3 orig, vec3 dir, vec3 bmin, vec3 bmax) {
+                        vec3 safeDir = vec3(
+                            abs(dir.x) < 1e-6 ? 1e-6 : dir.x,
+                            abs(dir.y) < 1e-6 ? 1e-6 : dir.y,
+                            abs(dir.z) < 1e-6 ? 1e-6 : dir.z
+                        );
+                        vec3 invDir = 1.0 / safeDir;
+                        vec3 t0s = (bmin - orig) * invDir;
+                        vec3 t1s = (bmax - orig) * invDir;
+                        vec3 tsmaller = min(t0s, t1s);
+                        vec3 tbigger = max(t0s, t1s);
+                        return vec2(
+                            max(max(tsmaller.x, tsmaller.y), tsmaller.z),
+                            min(min(tbigger.x, tbigger.y), tbigger.z)
+                        );
+                    }
 
                     vec2 sampleSDF(vec3 localPos) {
                         vec3 uv = (localPos + uDomainHalf) / (uDomainHalf * 2.0);
-                        if (any(lessThan(uv, vec3(0.0))) || any(greaterThan(uv, vec3(1.0)))) {
-                            return vec2(1000.0, 0.0);
-                        }
-                        vec4 samp = texture(uVolume, uv);
+                        vec4 samp = texture(uVolume, clamp(uv, vec3(0.0), vec3(1.0)));
                         return vec2(samp.r * uDomainHalf, samp.g);
                     }
 
                     vec3 calcNormal(vec3 p) {
-                        float eps = 12.0;
-                        float d = sampleSDF(p).x;
-                        return normalize(vec3(
-                            sampleSDF(p + vec3(eps, 0.0, 0.0)).x - d,
-                            sampleSDF(p + vec3(0.0, eps, 0.0)).x - d,
-                            sampleSDF(p + vec3(0.0, 0.0, eps)).x - d
-                        ));
+                        float eps = uDomainHalf * 0.015;
+                        vec2 e = vec2(eps, -eps);
+                        return normalize(
+                            e.xyy * sampleSDF(p + e.xyy).x +
+                            e.yyx * sampleSDF(p + e.yyx).x +
+                            e.yxy * sampleSDF(p + e.yxy).x +
+                            e.xxx * sampleSDF(p + e.xxx).x
+                        );
                     }
 
                     void main() {
                         vec3 ro = uCameraPos;
                         vec3 rd = normalize(vWorldPos - ro);
 
-                        // Raymarch through local bounding volume
-                        float t = length(vWorldPos - ro);
-                        vec3 p = vWorldPos;
+                        vec2 tBox = intersectBox(ro, rd, vec3(-uDomainHalf), vec3(uDomainHalf));
+                        if (tBox.y < max(tBox.x, 0.0)) discard;
+
+                        float t = max(tBox.x, 0.0) + 1.0;
+                        float tEnd = tBox.y;
+                        bool hitSliceCap = false;
+
+                        if (uXRayEnabled > 0.5) {
+                            float sliceY = -uXRayOffset;
+                            if ((ro + rd * t).y > sliceY) {
+                                if (rd.y >= -1e-5) discard;
+                                float tPlane = (sliceY - ro.y) / rd.y;
+                                if (tPlane > tEnd) discard;
+                                t = max(t, tPlane);
+                                hitSliceCap = true;
+                            }
+                        }
+
+                        vec3 p = ro + rd * t;
                         bool hit = false;
                         float matId = 1.0;
+                        float prevT = t;
 
-                        // Raymarch up to 64 steps
-                        for (int i = 0; i < 64; i++) {
+                        for (int i = 0; i < 128; i++) {
+                            if (t > tEnd) break;
+                            p = ro + rd * t;
                             vec2 res = sampleSDF(p);
                             float dist = res.x;
-                            if (dist < 4.0) {
+                            if (dist <= 2.0) {
                                 hit = true;
                                 matId = res.y;
+                                if (i == 0 && hitSliceCap) {
+                                    // Ray hit solid interior right on the X-Ray slice plane
+                                    break;
+                                }
+                                // Binary bisection refinement between prevT and t for smooth curves
+                                float a = prevT;
+                                float b = t;
+                                for (int k = 0; k < 5; k++) {
+                                    float m = 0.5 * (a + b);
+                                    float dm = sampleSDF(ro + rd * m).x;
+                                    if (dm <= 0.0) b = m;
+                                    else a = m;
+                                }
+                                t = 0.5 * (a + b);
+                                p = ro + rd * t;
+                                matId = sampleSDF(p).y;
+                                hitSliceCap = false;
                                 break;
                             }
-                            if (length(p) > uDomainHalf * 1.7) break;
-                            p += rd * max(dist * 0.7, 8.0);
+                            prevT = t;
+                            t += max(dist * 0.85, 8.0);
                         }
 
                         if (!hit) {
                             discard;
                         }
 
-                        vec3 norm = calcNormal(p);
-                        float diff = max(dot(norm, uSunDir), 0.15);
-
-                        vec3 baseCol;
-                        if (matId > 2.5) {
-                            // Reinforced Titanium Bulkhead: Glowing metallic cyan armor
-                            baseCol = vec3(0.12, 0.90, 0.98);
-                        } else if (matId > 1.5) {
-                            // Ore Vein: Gold
-                            baseCol = vec3(0.95, 0.70, 0.15);
-                        } else {
-                            // Rock: Grey basalt
-                            baseCol = vec3(0.42, 0.45, 0.50);
+                        vec3 norm = hitSliceCap ? vec3(0.0, 1.0, 0.0) : calcNormal(p);
+                        float fbmMacro = rmFbm(p * 0.006);
+                        float fbmMicro = rmFbm(p * 0.028);
+                        if (!hitSliceCap && matId < 2.35) {
+                            float epsB = 6.0;
+                            float bx = rmFbm((p + vec3(epsB, 0.0, 0.0)) * 0.028) - fbmMicro;
+                            float by = rmFbm((p + vec3(0.0, epsB, 0.0)) * 0.028) - fbmMicro;
+                            float bz = rmFbm((p + vec3(0.0, 0.0, epsB)) * 0.028) - fbmMicro;
+                            vec3 bumpGrad = vec3(bx, by, bz) / epsB;
+                            bumpGrad -= norm * dot(bumpGrad, norm);
+                            norm = normalize(norm - bumpGrad * 18.0);
                         }
 
-                        vec3 finalColor = baseCol * diff;
-                        if (matId > 2.5) {
-                            finalColor += vec3(0.05, 0.35, 0.45); // Emissive nanite glow
+                        float sunDiff = max(dot(norm, uSunDir), 0.0);
+                        float fillDiff = max(dot(norm, normalize(vec3(-0.6, -0.4, -0.5))), 0.0);
+                        float camLight = max(dot(norm, -rd), 0.0) * 0.45;
+                        float lighting = 0.22 + sunDiff * 1.15 + fillDiff * 0.35 + camLight;
+
+                        float rDist = length(p);
+                        float strata = 0.5 + 0.5 * sin(rDist * 0.045 + fbmMacro * 6.0);
+                        float depthShade = smoothstep(uAsteroidRadius * 0.25, uAsteroidRadius * 1.05, rDist);
+
+                        vec3 exteriorRock = mix(vec3(0.34, 0.36, 0.40), vec3(0.58, 0.56, 0.52), fbmMacro * 0.7 + fbmMicro * 0.45);
+                        vec3 interiorRock = mix(vec3(0.24, 0.27, 0.34), vec3(0.42, 0.39, 0.36), strata * 0.65 + fbmMicro * 0.45);
+                        vec3 baseCol = mix(interiorRock, exteriorRock, depthShade) * (0.85 + 0.3 * fbmMicro);
+                        vec3 emissiveCol = vec3(0.0);
+
+                        if (matId >= 2.4) {
+                            // Reinforced Titanium Bulkhead with glowing cyan hex seam grid
+                            float hexMask = rmTriplanarHex(p, norm, 0.032);
+                            vec3 plate = mix(vec3(0.16, 0.25, 0.34), vec3(0.28, 0.40, 0.52), fbmMicro * 0.6);
+                            vec3 seam = vec3(0.0, 0.95, 1.0);
+                            baseCol = mix(seam, plate, hexMask);
+                            vec3 halfVec = normalize(uSunDir - rd);
+                            float spec = pow(max(dot(norm, halfVec), 0.0), 32.0) * 0.65;
+                            lighting += spec;
+                            emissiveCol = vec3(0.0, 0.75, 0.95) * (1.0 - hexMask) * 1.2 + vec3(0.02, 0.12, 0.18);
+                        } else if (matId > 1.30) {
+                            // Subtle Gold Mineral Ore Vein matching Surface Nets triplanar shader
+                            float oreMask = smoothstep(1.30, 1.85, matId) * smoothstep(0.30, 0.72, fbmMicro);
+                            vec3 oreCol = mix(vec3(0.68, 0.42, 0.08), vec3(0.98, 0.78, 0.22), fbmMicro);
+                            baseCol = mix(baseCol, oreCol, oreMask * 0.85);
+                            emissiveCol = vec3(0.18, 0.09, 0.01) * oreMask;
                         }
+
+                        vec3 finalColor = baseCol * lighting + emissiveCol;
 
                         if (uWireframe > 0.5) {
-                            finalColor += vec3(0.2, 0.8, 0.6);
+                            vec3 grid = abs(fract(p / (uDomainHalf * 2.0 / 80.0) - 0.5) - 0.5) / 0.08;
+                            float line = 1.0 - min(min(grid.x, min(grid.y, grid.z)), 1.0);
+                            finalColor = mix(finalColor, vec3(0.1, 0.95, 0.8), line * 0.75);
                         }
 
+                        vec4 clipPos = uViewProjMatrix * vec4(p, 1.0);
+                        gl_FragDepth = (clipPos.z / clipPos.w) * 0.5 + 0.5;
                         fragColor = vec4(finalColor, 1.0);
                     }
                 `,
-                side: THREE.BackSide, // Render inside box so camera can fly inside
-                transparent: false
+                side: THREE.BackSide,
+                transparent: false,
+                depthWrite: true
             });
 
             volumeBoxMesh = new THREE.Mesh(boxGeo, raymarchMaterial);
+            volumeBoxMesh.frustumCulled = false;
             scene.add(volumeBoxMesh);
+        }
+
+        function carveSpherePoC4(hitPoint, brushRadius) {
+            let modified = false;
+            const pad = brushRadius + VOXEL_SPACING * 1.5;
+            const minX = Math.max(0, Math.floor(((hitPoint.x - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxX = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.x + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const minY = Math.max(0, Math.floor(((hitPoint.y - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxY = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.y + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const minZ = Math.max(0, Math.floor(((hitPoint.z - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxZ = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.z + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+
+            const volRes2 = VOL_RES * VOL_RES;
+            for (let z = minZ; z <= maxZ; z++) {
+                const wz = -DOMAIN_HALF + (z + 0.5) * VOXEL_SPACING;
+                const zOff = z * volRes2;
+                for (let y = minY; y <= maxY; y++) {
+                    const wy = -DOMAIN_HALF + (y + 0.5) * VOXEL_SPACING;
+                    const yzOff = zOff + y * VOL_RES;
+                    for (let x = minX; x <= maxX; x++) {
+                        const wx = -DOMAIN_HALF + (x + 0.5) * VOXEL_SPACING;
+                        const distToHit = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                        if (distToHit <= brushRadius + VOXEL_SPACING * 0.5) {
+                            const idx4 = (x + yzOff) * 4;
+                            const curD = volumeData[idx4] * DOMAIN_HALF;
+                            const carveD = brushRadius - distToHit;
+                            if (carveD > curD) {
+                                volumeData[idx4] = carveD / DOMAIN_HALF;
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (modified && volumeTexture) {
+                volumeTexture.needsUpdate = true;
+            }
+        }
+
+        function reinforceSpherePoC4(hitPoint, brushRadius) {
+            let modified = false;
+            const pad = brushRadius + VOXEL_SPACING * 1.5;
+            const minX = Math.max(0, Math.floor(((hitPoint.x - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxX = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.x + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const minY = Math.max(0, Math.floor(((hitPoint.y - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxY = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.y + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const minZ = Math.max(0, Math.floor(((hitPoint.z - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxZ = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.z + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+
+            const volRes2 = VOL_RES * VOL_RES;
+            for (let z = minZ; z <= maxZ; z++) {
+                const wz = -DOMAIN_HALF + (z + 0.5) * VOXEL_SPACING;
+                const zOff = z * volRes2;
+                for (let y = minY; y <= maxY; y++) {
+                    const wy = -DOMAIN_HALF + (y + 0.5) * VOXEL_SPACING;
+                    const yzOff = zOff + y * VOL_RES;
+                    for (let x = minX; x <= maxX; x++) {
+                        const wx = -DOMAIN_HALF + (x + 0.5) * VOXEL_SPACING;
+                        const distToHit = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                        if (distToHit <= brushRadius) {
+                            const idx4 = (x + yzOff) * 4;
+                            const curD = volumeData[idx4] * DOMAIN_HALF;
+                            if (curD < 0) {
+                                volumeData[idx4 + 1] = 3.0;
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (modified && volumeTexture) {
+                volumeTexture.needsUpdate = true;
+            }
         }
 
         // Shared Sandbox Setup
@@ -291,108 +508,74 @@
                 const ro = raycaster.ray.origin;
                 const rd = raycaster.ray.direction;
 
-                let t = 0;
-                // Sphere-march from camera
-                for (let step = 0; step < 72; step++) {
-                    const p = ro.clone().addScaledVector(rd, t);
+                // Intersect ray with volume AABB before sphere-marching
+                const box = new THREE.Box3(
+                    new THREE.Vector3(-DOMAIN_HALF, -DOMAIN_HALF, -DOMAIN_HALF),
+                    new THREE.Vector3(DOMAIN_HALF, DOMAIN_HALF, DOMAIN_HALF)
+                );
+                const entryPt = new THREE.Vector3();
+                if (!box.containsPoint(ro) && !raycaster.ray.intersectBox(box, entryPt)) {
+                    return null;
+                }
+                let t = box.containsPoint(ro) ? 0 : ro.distanceTo(entryPt) + 1.0;
+                const maxT = t + DOMAIN_HALF * 4.0;
+                const p = new THREE.Vector3();
+
+                for (let step = 0; step < 128 && t <= maxT; step++) {
+                    p.copy(ro).addScaledVector(rd, t);
+                    if (sandbox.isXRay && p.y > -sandbox.xRayOffset) {
+                        if (rd.y >= -1e-5) return null;
+                        const tPlane = (-sandbox.xRayOffset - ro.y) / rd.y;
+                        t = Math.max(t + 1.0, tPlane);
+                        continue;
+                    }
                     const res = cpuSampleSDF(p.x, p.y, p.z);
-                    if (res.d <= 6.0) {
+                    if (res.d <= 4.0) {
+                        const eps = 10.0;
                         const norm = new THREE.Vector3(
-                            cpuSampleSDF(p.x + 8, p.y, p.z).d - res.d,
-                            cpuSampleSDF(p.x, p.y + 8, p.z).d - res.d,
-                            cpuSampleSDF(p.x, p.y, p.z + 8).d - res.d
-                        ).normalize();
+                            cpuSampleSDF(p.x + eps, p.y, p.z).d - cpuSampleSDF(p.x - eps, p.y, p.z).d,
+                            cpuSampleSDF(p.x, p.y + eps, p.z).d - cpuSampleSDF(p.x, p.y - eps, p.z).d,
+                            cpuSampleSDF(p.x, p.y, p.z + eps).d - cpuSampleSDF(p.x, p.y, p.z - eps).d
+                        );
+                        if (norm.lengthSq() > 1e-8) norm.normalize();
+                        else norm.copy(p).normalize();
 
                         return {
-                            point: p,
+                            point: p.clone(),
                             normal: norm,
                             distance: t,
                             materialId: Math.round(res.mat),
                             object: volumeBoxMesh
                         };
                     }
-                    if (t > DOMAIN_HALF * 3.5) break;
-                    t += Math.max(res.d * 0.75, 8.0);
+                    t += Math.max(res.d * 0.85, 8.0);
                 }
                 return null;
             },
 
-            // Continuous Spherical Laser Carve directly into 3D SDF Volume
             onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
-                let modified = false;
-                let idx = 0;
-
-                for (let z = 0; z < VOL_RES; z++) {
-                    const wz = -DOMAIN_HALF + (z + 0.5) * VOXEL_SPACING;
-                    for (let y = 0; y < VOL_RES; y++) {
-                        const wy = -DOMAIN_HALF + (y + 0.5) * VOXEL_SPACING;
-                        for (let px = 0; px < VOL_RES; px++) {
-                            const wx = -DOMAIN_HALF + (px + 0.5) * VOXEL_SPACING;
-                            const distToHit = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
-
-                            if (distToHit <= brushRadius) {
-                                // Analytical CSG continuous carve:
-                                // d_new = max(d, R_brush - dist)
-                                const curD = volumeData[idx * 4] * DOMAIN_HALF;
-                                const carveD = brushRadius - distToHit;
-                                if (carveD > curD) {
-                                    volumeData[idx * 4] = carveD / DOMAIN_HALF;
-                                    modified = true;
-                                }
-                            }
-                            idx++;
-                        }
-                    }
-                }
-
-                if (modified && volumeTexture) {
-                    volumeTexture.needsUpdate = true;
-                }
+                carveSpherePoC4(hitPoint, brushRadius);
             },
 
-            // Nanite Titanium Armor Beam Reinforcement
             onReinforce: async (hitPoint, hitNormal, brushRadius) => {
-                let modified = false;
-                let idx = 0;
-
-                for (let z = 0; z < VOL_RES; z++) {
-                    const wz = -DOMAIN_HALF + (z + 0.5) * VOXEL_SPACING;
-                    for (let y = 0; y < VOL_RES; y++) {
-                        const wy = -DOMAIN_HALF + (y + 0.5) * VOXEL_SPACING;
-                        for (let px = 0; px < VOL_RES; px++) {
-                            const wx = -DOMAIN_HALF + (px + 0.5) * VOXEL_SPACING;
-                            const distToHit = Math.sqrt((wx - hitPoint.x)**2 + (wy - hitPoint.y)**2 + (wz - hitPoint.z)**2);
-
-                            if (distToHit <= brushRadius) {
-                                const curD = volumeData[idx * 4] * DOMAIN_HALF;
-                                if (curD < 0) {
-                                    volumeData[idx * 4 + 1] = 3.0; // Reinforced Titanium
-                                    modified = true;
-                                }
-                            }
-                            idx++;
-                        }
-                    }
-                }
-
-                if (modified && volumeTexture) {
-                    volumeTexture.needsUpdate = true;
-                }
+                reinforceSpherePoC4(hitPoint, brushRadius);
             },
 
             checkMaterialAtHit: (point, hit) => {
                 if (hit && hit.materialId >= 3) return true;
                 const sample = cpuSampleSDF(point.x, point.y, point.z);
-                return sample.mat >= 3.0;
+                return sample.mat >= 2.4;
             },
 
             onScaleChange: (scaleKey, radius) => {
                 currentRadius = radius;
                 initVolumeField();
-                if (volumeBoxMesh) {
+                if (volumeBoxMesh && raymarchMaterial) {
                     volumeBoxMesh.geometry.dispose();
                     volumeBoxMesh.geometry = new THREE.BoxGeometry(DOMAIN_HALF * 2, DOMAIN_HALF * 2, DOMAIN_HALF * 2);
                     raymarchMaterial.uniforms.uDomainHalf.value = DOMAIN_HALF;
+                    raymarchMaterial.uniforms.uAsteroidRadius.value = currentRadius;
+                    raymarchMaterial.uniforms.uVolume.value = volumeTexture;
                 }
             },
 
@@ -400,19 +583,39 @@
                 if (raymarchMaterial) {
                     raymarchMaterial.uniforms.uWireframe.value = enabled ? 1.0 : 0.0;
                 }
+            },
+
+            onToggleXRay: (enabled, plane) => {
+                if (raymarchMaterial) {
+                    raymarchMaterial.uniforms.uXRayEnabled.value = enabled ? 1.0 : 0.0;
+                    raymarchMaterial.uniforms.uXRayOffset.value = plane.constant;
+                }
             }
         });
 
-        // Update Camera Position uniform continuously for raymarcher
+        // Update Camera Position & ViewProj uniforms continuously for raymarcher
         const origAnimate = sandbox.animate;
         sandbox.animate = function(now) {
             if (raymarchMaterial) {
+                sandbox.camera.updateMatrixWorld();
+                viewProjMatrix.multiplyMatrices(sandbox.camera.projectionMatrix, sandbox.camera.matrixWorldInverse);
                 raymarchMaterial.uniforms.uCameraPos.value.copy(sandbox.camera.position);
+                raymarchMaterial.uniforms.uViewProjMatrix.value.copy(viewProjMatrix);
+                raymarchMaterial.uniforms.uXRayEnabled.value = sandbox.isXRay ? 1.0 : 0.0;
+                raymarchMaterial.uniforms.uXRayOffset.value = sandbox.clipPlane.constant;
             }
             origAnimate.call(sandbox, now);
         };
 
         setupRaymarcher(sandbox.scene);
+        // Starter tunnel entrance + reinforced titanium wall showcase
+        {
+            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
+            const surfPt = findSurfacePoint(evalDensityPoC4, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
+            carveSpherePoC4(surfPt, 220);
+            carveSpherePoC4(surfPt.clone().addScaledVector(tunnelDir, -160), 200);
+            reinforceSpherePoC4(surfPt.clone().addScaledVector(tunnelDir, -150), 250);
+        }
     </script>
 </body>
 </html>
