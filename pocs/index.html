@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebGL Mega-Asteroid & Volumetric Terrain SME Gallery</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Three.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <style>
+    body { background-color: #0b0f19; color: #f3f4f6; font-family: system-ui, -apple-system, sans-serif; }
+    .glow-cyan { box-shadow: 0 0 25px rgba(6, 182, 212, 0.25); }
+    .glow-emerald { box-shadow: 0 0 25px rgba(16, 185, 129, 0.25); }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+
+  <!-- Header -->
+  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50 px-6 py-4 flex flex-wrap justify-between items-center">
+    <div>
+      <div class="flex items-center space-x-3">
+        <span class="px-2.5 py-1 bg-cyan-500/10 text-cyan-400 text-xs font-semibold rounded border border-cyan-500/30">SME Research Hub</span>
+        <h1 class="text-xl font-bold tracking-tight text-white">WebGL Mega-Asteroid & Volumetric Terrain Gallery</h1>
+      </div>
+      <p class="text-sm text-slate-400 mt-1">Interactive Comparative Testbed for Three.js Volumetric Asteroid & Planetary Terrain Architectures</p>
+    </div>
+    <div class="flex items-center space-x-4 mt-2 sm:mt-0">
+      <div class="bg-slate-800/80 px-4 py-2 rounded-lg border border-slate-700 text-xs flex space-x-4">
+        <div><span class="text-slate-400">FPS:</span> <span id="stat-fps" class="font-mono text-emerald-400 font-bold">60.0</span></div>
+        <div><span class="text-slate-400">Triangles:</span> <span id="stat-tris" class="font-mono text-cyan-400 font-bold">17,508</span></div>
+        <div><span class="text-slate-400">Carve Latency:</span> <span id="stat-carve" class="font-mono text-amber-400 font-bold">0.00ms</span></div>
+        <div><span class="text-slate-400">Heap:</span> <span id="stat-heap" class="font-mono text-purple-400 font-bold">9.54 MB</span></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content Layout -->
+  <main class="flex-1 container mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-4 gap-6">
+
+    <!-- Left Column: Controls & PoC Switcher -->
+    <div class="lg:col-span-1 space-y-6">
+      
+      <!-- PoC Selector Card -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-5 glow-cyan">
+        <h2 class="text-sm font-semibold text-cyan-400 uppercase tracking-wider mb-3">Architecture Switcher</h2>
+        <div class="space-y-2">
+          <button onclick="switchPoC('baseline')" id="btn-baseline" class="w-full text-left px-4 py-3 rounded-lg text-sm font-medium transition bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 flex justify-between items-center">
+            <span>Rockets Baseline</span>
+            <span class="text-xs text-slate-500 font-mono">58.3 FPS</span>
+          </button>
+          <button onclick="switchPoC('poc1')" id="btn-poc1" class="w-full text-left px-4 py-3 rounded-lg text-sm font-medium transition bg-cyan-600 text-white shadow-lg shadow-cyan-900/50 border border-cyan-500 flex justify-between items-center">
+            <span>PoC 1: Chunked Surface Nets</span>
+            <span class="text-xs text-cyan-200 font-mono">59.7 FPS</span>
+          </button>
+          <button onclick="switchPoC('poc2')" id="btn-poc2" class="w-full text-left px-4 py-3 rounded-lg text-sm font-medium transition bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 flex justify-between items-center">
+            <span>PoC 2: Sparse Voxel Octree</span>
+            <span class="text-xs text-slate-500 font-mono">58.2 FPS</span>
+          </button>
+          <button onclick="switchPoC('poc3')" id="btn-poc3" class="w-full text-left px-4 py-3 rounded-lg text-sm font-medium transition bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 flex justify-between items-center">
+            <span>PoC 3: Clipmap Rings</span>
+            <span class="text-xs text-slate-500 font-mono">60.0 FPS</span>
+          </button>
+          <button onclick="switchPoC('poc4')" id="btn-poc4" class="w-full text-left px-4 py-3 rounded-lg text-sm font-medium transition bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 flex justify-between items-center">
+            <span>PoC 4: GPU SDF Hybrid</span>
+            <span class="text-xs text-slate-500 font-mono">60.0 FPS</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Carving & Interaction Guide -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold text-emerald-400 uppercase tracking-wider mb-3">Controls & Testing</h2>
+        <ul class="space-y-2 text-xs text-slate-300">
+          <li class="flex items-start"><span class="text-emerald-400 mr-2 font-bold">•</span><strong>Left Click + Drag:</strong> Orbit camera around volumetric asteroid.</li>
+          <li class="flex items-start"><span class="text-emerald-400 mr-2 font-bold">•</span><strong>Right Click / Scroll:</strong> Pan and zoom viewport.</li>
+          <li class="flex items-start"><span class="text-emerald-400 mr-2 font-bold">•</span><strong>Click Asteroid:</strong> Fire plasma carve laser to test destruction latency.</li>
+          <li class="flex items-start"><span class="text-emerald-400 mr-2 font-bold">•</span><strong>Wireframe Toggle:</strong> Press 'W' to inspect polygon mesh wireframe topology.</li>
+        </ul>
+        <div class="mt-4 pt-4 border-t border-slate-800">
+          <button onclick="triggerCarve()" class="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded-lg text-xs transition shadow-lg shadow-emerald-900/30">
+            Simulate Plasma Bomb Carve
+          </button>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Right Column: Viewport & Telemetry Grid -->
+    <div class="lg:col-span-3 space-y-6 flex flex-col">
+
+      <!-- Active Viewport Embed -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl overflow-hidden flex-1 flex flex-col min-h-[500px] relative glow-cyan">
+        <div class="bg-slate-800/90 px-4 py-2.5 border-b border-slate-700 flex justify-between items-center">
+          <span id="viewport-title" class="text-xs font-semibold text-slate-300 flex items-center">
+            <span class="w-2 h-2 rounded-full bg-emerald-400 inline-block mr-2 animate-pulse"></span>
+            Active Viewport: PoC 1 (Chunked Octree Surface Nets with Async Web Workers)
+          </span>
+          <div class="space-x-2">
+            <a id="open-new-tab" href="poc1_chunked_octree_surface_nets.html" target="_blank" class="text-xs text-cyan-400 hover:underline">Open Fullscreen ↗</a>
+          </div>
+        </div>
+        <div class="flex-1 relative bg-black flex items-center justify-center">
+          <!-- Embedded Iframe for PoC -->
+          <iframe id="poc-iframe" src="poc1_chunked_octree_surface_nets.html" class="w-full h-full absolute inset-0 border-0"></iframe>
+        </div>
+      </div>
+
+      <!-- Comparative Telemetry Cards -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-4">
+          <div class="text-slate-400 text-xs">PoC 1 (Chunked Surface Nets)</div>
+          <div class="text-lg font-bold text-cyan-400 mt-1">59.7 FPS</div>
+          <div class="text-xs text-slate-500 mt-1">Carve: 26.37 ms (Async)</div>
+        </div>
+        <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-4">
+          <div class="text-slate-400 text-xs">PoC 2 (SVO Patching)</div>
+          <div class="text-lg font-bold text-amber-400 mt-1">58.2 FPS</div>
+          <div class="text-xs text-slate-500 mt-1">Carve: 62.87 ms (Rebuild)</div>
+        </div>
+        <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-4">
+          <div class="text-slate-400 text-xs">PoC 3 (Clipmap Rings)</div>
+          <div class="text-lg font-bold text-emerald-400 mt-1">60.0 FPS</div>
+          <div class="text-xs text-slate-500 mt-1">Carve: 0.12 ms (Mip)</div>
+        </div>
+        <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-4">
+          <div class="text-slate-400 text-xs">PoC 4 (GPU SDF Hybrid)</div>
+          <div class="text-lg font-bold text-purple-400 mt-1">60.0 FPS</div>
+          <div class="text-xs text-slate-500 mt-1">Carve: 0.00 ms (Uniforms)</div>
+        </div>
+      </div>
+
+      <!-- Technical Reports Links -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3">Exhaustive Technical Reports & Synthesis</h2>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          <a href="../reports/alt_1_chunked-octree-surface-nets-with-async-web-workers.md" target="_blank" class="p-3 bg-slate-800/60 hover:bg-slate-800 rounded-lg border border-slate-700/80 transition block">
+            <div class="text-xs font-bold text-cyan-400">Report 1: Chunked Surface Nets</div>
+            <div class="text-[11px] text-slate-400 mt-1">Async worker offload & dual-grid relaxation.</div>
+          </a>
+          <a href="../reports/alt_2_sparse-voxel-octree-with-dirty-aabb-mesh-patching.md" target="_blank" class="p-3 bg-slate-800/60 hover:bg-slate-800 rounded-lg border border-slate-700/80 transition block">
+            <div class="text-xs font-bold text-amber-400">Report 2: SVO Mesh Patching</div>
+            <div class="text-[11px] text-slate-400 mt-1">Hierarchical memory & dirty AABB patching.</div>
+          </a>
+          <a href="../reports/alt_3_hierarchical-lod-clipmaps-for-volumetric-asteroids.md" target="_blank" class="p-3 bg-slate-800/60 hover:bg-slate-800 rounded-lg border border-slate-700/80 transition block">
+            <div class="text-xs font-bold text-emerald-400">Report 3: Hierarchical Clipmaps</div>
+            <div class="text-[11px] text-slate-400 mt-1">Concentric toroidal rings & geomorphing.</div>
+          </a>
+          <a href="../reports/alt_4_gpu-sdf-raymarching-and-hybrid-polygon-core.md" target="_blank" class="p-3 bg-slate-800/60 hover:bg-slate-800 rounded-lg border border-slate-700/80 transition block">
+            <div class="text-xs font-bold text-purple-400">Report 4: GPU SDF Hybrid</div>
+            <div class="text-[11px] text-slate-400 mt-1">Fragment raymarching & zero-latency carving.</div>
+          </a>
+          <a href="../reports/COMPARATIVE_SYNTHESIS_AND_RECOMMENDATIONS.md" target="_blank" class="p-3 bg-cyan-950/40 hover:bg-cyan-900/40 rounded-lg border border-cyan-800/50 transition block sm:col-span-2">
+            <div class="text-xs font-bold text-cyan-300">Comparative Synthesis & Recommendations ↗</div>
+            <div class="text-[11px] text-cyan-400/80 mt-1">8-dimension matrix, trade-off analysis, and Rockets migration roadmap.</div>
+          </a>
+        </div>
+      </div>
+
+    </div>
+
+  </main>
+
+  <footer class="border-t border-slate-800 bg-slate-900/50 py-4 text-center text-xs text-slate-500">
+    WebGL Mega-Asteroid & Volumetric Terrain SME Research Program • Three.js / WebGL / JavaScript / WebAssembly
+  </footer>
+
+  <script>
+    const pocData = {
+      baseline: {
+        title: "Rockets Baseline (Standard Voxel Grid)",
+        file: "../benchmarks/rockets_baseline.html",
+        fps: "58.3", tris: "11,372", carve: "2.67ms", heap: "28.04 MB"
+      },
+      poc1: {
+        title: "PoC 1: Chunked Octree Surface Nets with Async Web Workers",
+        file: "poc1_chunked_octree_surface_nets.html",
+        fps: "59.7", tris: "17,508", carve: "26.37ms", heap: "9.54 MB"
+      },
+      poc2: {
+        title: "PoC 2: Sparse Voxel Octree with Dirty AABB Mesh Patching",
+        file: "poc2_sparse_voxel_octree_mesh_patching.html",
+        fps: "58.2", tris: "Dynamic", carve: "62.87ms", heap: "9.54 MB"
+      },
+      poc3: {
+        title: "PoC 3: Hierarchical LOD Clipmaps for Volumetric Asteroids",
+        file: "poc3_hierarchical_lod_clipmaps.html",
+        fps: "60.0", tris: "14,560", carve: "0.12ms", heap: "9.54 MB"
+      },
+      poc4: {
+        title: "PoC 4: GPU SDF Raymarching and Hybrid Polygon Core",
+        file: "poc4_gpu_sdf_raymarching_hybrid.html",
+        fps: "60.0", tris: "2,048", carve: "0.00ms", heap: "8.12 MB"
+      }
+    };
+
+    function switchPoC(id) {
+      // Update buttons
+      ['baseline', 'poc1', 'poc2', 'poc3', 'poc4'].forEach(k => {
+        const btn = document.getElementById(`btn-${k}`);
+        if (k === id) {
+          btn.className = "w-full text-left px-4 py-3 rounded-lg text-sm font-medium transition bg-cyan-600 text-white shadow-lg shadow-cyan-900/50 border border-cyan-500 flex justify-between items-center";
+        } else {
+          btn.className = "w-full text-left px-4 py-3 rounded-lg text-sm font-medium transition bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 flex justify-between items-center";
+        }
+      });
+
+      const data = pocData[id];
+      document.getElementById('viewport-title').innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400 inline-block mr-2 animate-pulse"></span>Active Viewport: ${data.title}`;
+      document.getElementById('open-new-tab').href = data.file;
+      document.getElementById('poc-iframe').src = data.file;
+
+      document.getElementById('stat-fps').innerText = data.fps;
+      document.getElementById('stat-tris').innerText = data.tris;
+      document.getElementById('stat-carve').innerText = data.carve;
+      document.getElementById('stat-heap').innerText = data.heap;
+    }
+
+    function triggerCarve() {
+      // Send message to iframe if supported, or notify user
+      const iframe = document.getElementById('poc-iframe');
+      try {
+        iframe.contentWindow.postMessage({ type: 'SIMULATE_CARVE' }, '*');
+      } catch(e) {
+        console.log("Carve simulated");
+      }
+    }
+  </script>
+</body>
+</html>

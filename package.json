@@ -1,0 +1,13 @@
+{
+  "name": "high-performance-volumetric-mega-asteroids-and-planetary-terrain-in-webgl-sme",
+  "version": "1.0.0",
+  "description": "Subject Matter Expert investigation into high-performance volumetric terrain, chunked surface nets, sparse octrees, hierarchical clipmaps, and GPU SDF raymarching for Three.js/WebGL.",
+  "type": "module",
+  "scripts": {
+    "benchmark": "node benchmarks/run_benchmarks.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.65.0",
+    "three": "^0.170.0"
+  }
+}

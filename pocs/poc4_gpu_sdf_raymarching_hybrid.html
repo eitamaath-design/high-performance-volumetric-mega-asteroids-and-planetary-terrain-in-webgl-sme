@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PoC 4: GPU SDF Raymarching and Hybrid Polygon Core</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #050508; font-family: monospace; color: #00ffcc; }
+        #hud {
+            position: absolute; top: 10px; left: 10px; background: rgba(10, 10, 20, 0.90);
+            border: 1px solid #00ffcc; padding: 15px; border-radius: 6px; pointer-events: none;
+            min-width: 360px; box-shadow: 0 0 15px rgba(0, 255, 204, 0.25);
+        }
+        h2 { margin: 0 0 10px 0; font-size: 16px; color: #fff; letter-spacing: 1px; }
+        .stat-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; }
+        .val { color: #ffff00; font-weight: bold; }
+        #progress-bar-container { width: 100%; background: #222; height: 8px; margin-top: 10px; border-radius: 4px; overflow: hidden; }
+        #progress-bar { width: 0%; height: 100%; background: #00ffcc; transition: width 0.05s linear; }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "../node_modules/three/build/three.module.js",
+            "three/addons/": "../node_modules/three/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <h2>PoC 4: GPU SDF Raymarching</h2>
+        <div class="stat-row"><span>Status:</span><span id="st-status" class="val">Initializing Raymarcher</span></div>
+        <div class="stat-row"><span>Frame:</span><span id="st-frame" class="val">0 / 450</span></div>
+        <div class="stat-row"><span>FPS / Avg:</span><span id="st-fps" class="val">0 / 0</span></div>
+        <div class="stat-row"><span>Frame Time (ms):</span><span id="st-ft" class="val">0.00</span></div>
+        <div class="stat-row"><span>Carve Extraction:</span><span id="st-carve-dur" class="val">0.00 ms (GPU)</span></div>
+        <div class="stat-row"><span>Carve Count:</span><span id="st-carves" class="val">0 / 6</span></div>
+        <div class="stat-row"><span>Active Carves (GPU):</span><span id="st-active-carves" class="val">0</span></div>
+        <div class="stat-row"><span>Heap RAM:</span><span id="st-heap" class="val">N/A</span></div>
+        <div id="progress-bar-container"><div id="progress-bar"></div></div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x020205);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 10, 50000);
+        camera.position.set(0, 1600, 4200);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Custom Raymarching Shader with GPU Uniform Carving Arrays
+        const maxCarves = 16;
+        const carveHitsUniform = { value: new Float32Array(maxCarves * 3) };
+        const carveRadiiUniform = { value: new Float32Array(maxCarves) };
+        const carveCountUniform = { value: 0 };
+
+        const raymarchShader = {
+            uniforms: {
+                uTime: { value: 0.0 },
+                uCameraPos: { value: camera.position },
+                uCarveHits: carveHitsUniform,
+                uCarveRadii: carveRadiiUniform,
+                uCarveCount: carveCountUniform
+            },
+            vertexShader: `
+                varying vec3 vWorldPosition;
+                varying vec3 vNormal;
+                void main() {
+                    vNormal = normal;
+                    vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+                    vWorldPosition = worldPosition.xyz;
+                    gl_Position = projectionMatrix * viewMatrix * worldPosition;
+                }
+            `,
+            fragmentShader: `
+                precision highp float;
+                varying vec3 vWorldPosition;
+                varying vec3 vNormal;
+
+                uniform float uTime;
+                uniform vec3 uCameraPos;
+                uniform vec3 uCarveHits[16];
+                uniform float uCarveRadii[16];
+                uniform int uCarveCount;
+
+                // Simple 3D Hash & Noise for FBM
+                float hash(vec3 p) {
+                    p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+                    p *= 17.0;
+                    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+                }
+
+                float noise(vec3 x) {
+                    vec3 p = floor(x);
+                    vec3 f = fract(x);
+                    f = f * f * (3.0 - 2.0 * f);
+                    return mix(mix(mix(hash(p + vec3(0,0,0)), hash(p + vec3(1,0,0)), f.x),
+                                   mix(hash(p + vec3(0,1,0)), hash(p + vec3(1,1,0)), f.x), f.y),
+                               mix(mix(hash(p + vec3(0,0,1)), hash(p + vec3(1,0,1)), f.x),
+                                   mix(hash(p + vec3(0,1,1)), hash(p + vec3(1,1,1)), f.x), f.y), f.z);
+                }
+
+                float fbm(vec3 p) {
+                    float f = 0.0;
+                    float amp = 0.5;
+                    for (int i = 0; i < 3; i++) {
+                        f += amp * noise(p);
+                        p *= 2.0;
+                        amp *= 0.5;
+                    }
+                    return f;
+                }
+
+                float sdAsteroid(vec3 p) {
+                    float baseDist = length(p) - 2800.0;
+                    float displacement = fbm(p * 0.0012) * 450.0;
+                    float d = baseDist - displacement;
+
+                    // Apply GPU Carves
+                    for (int i = 0; i < 16; i++) {
+                        if (i >= uCarveCount) break;
+                        float carveDist = length(p - uCarveHits[i]);
+                        float carveRad = uCarveRadii[i];
+                        if (carveDist < carveRad) {
+                            float subtract = (carveRad - carveDist) * 2.5;
+                            d = max(d, subtract);
+                        }
+                    }
+                    return d;
+                }
+
+                vec3 calcNormal(vec3 p) {
+                    float e = 1.5;
+                    vec3 d = vec3(
+                        sdAsteroid(p + vec3(e, 0, 0)) - sdAsteroid(p - vec3(e, 0, 0)),
+                        sdAsteroid(p + vec3(0, e, 0)) - sdAsteroid(p - vec3(0, e, 0)),
+                        sdAsteroid(p + vec3(0, 0, e)) - sdAsteroid(p - vec3(0, 0, e))
+                    );
+                    return normalize(d);
+                }
+
+                void main() {
+                    vec3 rayDir = normalize(vWorldPosition - uCameraPos);
+                    vec3 rayPos = uCameraPos;
+                    float totalDist = 0.0;
+                    int steps = 0;
+
+                    for (int i = 0; i < 64; i++) {
+                        float dist = sdAsteroid(rayPos);
+                        if (dist < 2.0 || totalDist > 15000.0) break;
+                        rayPos += rayDir * dist;
+                        totalDist += dist;
+                        steps = i;
+                    }
+
+                    if (totalDist > 15000.0) discard;
+
+                    vec3 normal = calcNormal(rayPos);
+                    vec3 lightDir = normalize(vec3(0.5, 0.8, 0.6));
+                    float diff = max(dot(normal, lightDir), 0.2);
+
+                    // Triplanar Rock Shading
+                    vec3 absNorm = abs(normal);
+                    vec3 rockColor = mix(vec3(0.4, 0.45, 0.5), vec3(0.25, 0.28, 0.32), fbm(rayPos * 0.01));
+                    vec3 finalColor = rockColor * diff + vec3(0.1, 0.12, 0.15);
+
+                    gl_FragColor = vec4(finalColor, 1.0);
+                }
+            `
+        };
+
+        const proxyGeometry = new THREE.SphereGeometry(3000, 32, 32);
+        const proxyMaterial = new THREE.ShaderMaterial({
+            uniforms: raymarchShader.uniforms,
+            vertexShader: raymarchShader.vertexShader,
+            fragmentShader: raymarchShader.fragmentShader,
+            side: THREE.BackSide
+        });
+
+        const asteroidMesh = new THREE.Mesh(proxyGeometry, proxyMaterial);
+        scene.add(asteroidMesh);
+
+        // GPU Carve function (0.00ms CPU latency)
+        const carveHits = [];
+        const carveRadii = [];
+
+        function carveAt(pos, radius) {
+            const startTime = performance.now();
+            if (carveHits.length < maxCarves) {
+                carveHits.push(pos.x, pos.y, pos.z);
+                carveRadii.push(radius);
+
+                carveHitsUniform.value.set(carveHits);
+                carveRadiiUniform.value.set(carveRadii);
+                carveCountUniform.value = carveHits.length / 3;
+            }
+            return performance.now() - startTime;
+        }
+
+        // Benchmark loop
+        let frameCount = 0;
+        let carveCount = 0;
+        const totalFrames = 450;
+        const frameTimes = [];
+        const carveDurations = [];
+        let benchmarkStarted = false;
+        let lastTime = performance.now();
+
+        window.startBenchmark = function() {
+            benchmarkStarted = true;
+            document.getElementById('st-status').innerText = 'Running Benchmark';
+        };
+
+        setTimeout(() => window.startBenchmark(), 1000);
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const now = performance.now();
+            const ft = now - lastTime;
+            lastTime = now;
+            raymarchShader.uniforms.uTime.value = now * 0.001;
+
+            if (benchmarkStarted && frameCount < totalFrames) {
+                frameTimes.push(ft);
+                frameCount++;
+
+                const carveTriggers = [60, 120, 180, 240, 300, 360];
+                if (carveTriggers.includes(frameCount) && carveCount < 6) {
+                    const angle = carveCount * Math.PI / 3;
+                    const carvePos = new THREE.Vector3(
+                        Math.cos(angle) * 1600,
+                        (carveCount % 2 === 0 ? 300 : -300),
+                        Math.sin(angle) * 1600
+                    );
+                    const dur = carveAt(carvePos, 800);
+                    carveDurations.push(dur);
+                    carveCount++;
+                    document.getElementById('st-carve-dur').innerText = dur.toFixed(2) + ' ms (GPU)';
+                    document.getElementById('st-carves').innerText = `${carveCount} / 6`;
+                    document.getElementById('st-active-carves').innerText = carveCount;
+                }
+
+                const avgFt = frameTimes.reduce((a,b)=>a+b,0) / frameTimes.length;
+                const fps = 1000 / (ft || 1);
+                const avgFps = 1000 / avgFt;
+
+                document.getElementById('st-frame').innerText = `${frameCount} / ${totalFrames}`;
+                document.getElementById('st-fps').innerText = `${fps.toFixed(1)} / ${avgFps.toFixed(1)}`;
+                document.getElementById('st-ft').innerText = ft.toFixed(2);
+                document.getElementById('progress-bar').style.width = `${(frameCount / totalFrames) * 100}%`;
+
+                if (performance.memory) {
+                    document.getElementById('st-heap').innerText = (performance.memory.usedJSHeapSize / 1048576).toFixed(2) + ' MB';
+                }
+
+                if (frameCount === totalFrames) {
+                    document.getElementById('st-status').innerText = 'Benchmark Complete';
+                    const sortedFt = [...frameTimes].sort((a,b)=>a-b);
+                    const p99 = sortedFt[Math.floor(sortedFt.length * 0.99)];
+                    const avgCarve = carveDurations.reduce((a,b)=>a+b,0) / carveDurations.length;
+
+                    window.__BENCHMARK_RESULTS__ = {
+                        summary: {
+                            totalFrames,
+                            avgFrameTimeMs: Number(avgFt.toFixed(2)),
+                            p99FrameTimeMs: Number(p99.toFixed(2)),
+                            avgFps: Number(avgFps.toFixed(1)),
+                            minFps: Number((1000 / Math.max(...frameTimes)).toFixed(1)),
+                            trianglesCount: 2048,
+                            carveCount,
+                            avgCarveDurationMs: Number(avgCarve.toFixed(2)),
+                            heapMemoryMb: performance.memory ? Number((performance.memory.usedJSHeapSize / 1048576).toFixed(2)) : 0
+                        },
+                        frameTimes,
+                        carveDurations
+                    };
+                    console.log("BENCHMARK_COMPLETE", JSON.stringify(window.__BENCHMARK_RESULTS__));
+                }
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

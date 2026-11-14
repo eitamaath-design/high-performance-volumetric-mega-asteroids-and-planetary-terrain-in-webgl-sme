@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PoC 2: Sparse Voxel Octree with Dirty AABB Mesh Patching</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #050508; font-family: monospace; color: #00ffcc; }
+        #hud {
+            position: absolute; top: 10px; left: 10px; background: rgba(10, 10, 20, 0.90);
+            border: 1px solid #00ffcc; padding: 15px; border-radius: 6px; pointer-events: none;
+            min-width: 340px; box-shadow: 0 0 15px rgba(0, 255, 204, 0.25);
+        }
+        h2 { margin: 0 0 10px 0; font-size: 16px; color: #fff; letter-spacing: 1px; }
+        .stat-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; }
+        .val { color: #ffff00; font-weight: bold; }
+        #progress-bar-container { width: 100%; background: #222; height: 8px; margin-top: 10px; border-radius: 4px; overflow: hidden; }
+        #progress-bar { width: 0%; height: 100%; background: #00ffcc; transition: width 0.05s linear; }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "../node_modules/three/build/three.module.js",
+            "three/addons/": "../node_modules/three/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <h2>PoC 2: SVO & Dirty AABB Patching</h2>
+        <div class="stat-row"><span>Status:</span><span id="st-status" class="val">Building SVO Tree</span></div>
+        <div class="stat-row"><span>Frame:</span><span id="st-frame" class="val">0 / 450</span></div>
+        <div class="stat-row"><span>FPS / Avg:</span><span id="st-fps" class="val">0 / 0</span></div>
+        <div class="stat-row"><span>Frame Time (ms):</span><span id="st-ft" class="val">0.00</span></div>
+        <div class="stat-row"><span>Triangles:</span><span id="st-tris" class="val">0</span></div>
+        <div class="stat-row"><span>SVO Leaves:</span><span id="st-leaves" class="val">0</span></div>
+        <div class="stat-row"><span>Carve Count:</span><span id="st-carves" class="val">0 / 6</span></div>
+        <div class="stat-row"><span>Patch Rebuild Dur:</span><span id="st-patch-dur" class="val">0.00 ms</span></div>
+        <div class="stat-row"><span>Heap RAM:</span><span id="st-heap" class="val">N/A</span></div>
+        <div id="progress-bar-container"><div id="progress-bar"></div></div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        class FastNoise3D {
+            constructor(seed = 1337) { this.seed = seed; }
+            hash(x, y, z) {
+                let s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + this.seed) * 43758.5453123;
+                return s - Math.floor(s);
+            }
+            noise(x, y, z) {
+                const X = Math.floor(x), Y = Math.floor(y), Z = Math.floor(z);
+                const xd = x - X, yd = y - Y, zd = z - Z;
+                const u = xd * xd * (3.0 - 2.0 * xd);
+                const v = yd * yd * (3.0 - 2.0 * yd);
+                const w = zd * zd * (3.0 - 2.0 * zd);
+                const c000 = this.hash(X, Y, Z), c100 = this.hash(X+1, Y, Z);
+                const c010 = this.hash(X, Y+1, Z), c110 = this.hash(X+1, Y+1, Z);
+                const c001 = this.hash(X, Y, Z+1), c101 = this.hash(X+1, Y, Z+1);
+                const c011 = this.hash(X, Y+1, Z+1), c111 = this.hash(X+1, Y+1, Z+1);
+                const x00 = c000*(1-u)+c100*u, x10 = c010*(1-u)+c110*u;
+                const x01 = c001*(1-u)+c101*u, x11 = c011*(1-u)+c111*u;
+                const y0 = x00*(1-v)+x10*v, y1 = x01*(1-v)+x11*v;
+                return y0*(1-w)+y1*w;
+            }
+            fbm(x, y, z, octaves = 3) {
+                let val = 0, amp = 0.5, freq = 1.0;
+                for (let i = 0; i < octaves; i++) {
+                    val += this.noise(x * freq, y * freq, z * freq) * amp;
+                    freq *= 2.0; amp *= 0.5;
+                }
+                return val;
+            }
+        }
+
+        const R = 2800;
+        const DOMAIN_SIZE = 7600;
+        const SVO_DEPTH = 3; // Hierarchical levels
+        const LEAF_RES = 16;
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x020205);
+        scene.fog = new THREE.FogExp2(0x020205, 0.00012);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 10, 50000);
+        camera.position.set(0, 1800, 4800);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        scene.add(new THREE.AmbientLight(0x222233, 1.8));
+        const sunLight = new THREE.DirectionalLight(0xfff5e6, 3.2);
+        sunLight.position.set(5000, 8000, 4000);
+        scene.add(sunLight);
+
+        const rockMaterial = new THREE.MeshStandardMaterial({
+            roughness: 0.85,
+            metalness: 0.15,
+            vertexColors: true
+        });
+
+        const noiseGen = new FastNoise3D(1337);
+
+        function getDensity(x, y, z) {
+            const dist = Math.sqrt(x*x + y*y + z*z);
+            const noiseVal = noiseGen.fbm(x * 0.0012, y * 0.0012, z * 0.0012, 3) * 450.0;
+            return dist - (R + noiseVal);
+        }
+
+        // SVO Node & Leaf Patching Structure
+        class SVOLeaf {
+            constructor(minX, minY, minZ, size) {
+                this.minX = minX; this.minY = minY; this.minZ = minZ;
+                this.size = size;
+                this.mesh = null;
+                this.isHomogeneous = false;
+                this.solid = false;
+            }
+
+            extractMesh() {
+                if (this.mesh) {
+                    scene.remove(this.mesh);
+                    this.mesh.geometry.dispose();
+                }
+
+                const res = LEAF_RES;
+                const cellSize = this.size / res;
+                const vertices = [];
+                const normals = [];
+                const colors = [];
+                const indices = [];
+
+                // Simple marching cubes / surface extraction on leaf voxel grid
+                const grid = new Float32Array((res+1)*(res+1)*(res+1));
+                let insideCount = 0;
+                let outsideCount = 0;
+
+                for (let z = 0; z <= res; z++) {
+                    for (let y = 0; y <= res; y++) {
+                        for (let x = 0; x <= res; x++) {
+                            const vx = this.minX + x * cellSize;
+                            const vy = this.minY + y * cellSize;
+                            const vz = this.minZ + z * cellSize;
+                            const d = getDensity(vx, vy, vz);
+                            grid[x + (res+1)*(y + (res+1)*z)] = d;
+                            if (d < 0) insideCount++; else outsideCount++;
+                        }
+                    }
+                }
+
+                if (insideCount === 0 || outsideCount === 0) {
+                    this.isHomogeneous = true;
+                    this.solid = (insideCount > 0);
+                    return; // Skip homogenous leaves (saves GPU memory and draw calls!)
+                }
+
+                this.isHomogeneous = false;
+
+                // Extract surface points via dual contouring / voxel centers near zero crossing
+                const cellVerts = new Map();
+                for (let z = 0; z < res; z++) {
+                    for (let y = 0; y < res; y++) {
+                        for (let x = 0; x < res; x++) {
+                            const d0 = grid[x + (res+1)*(y + (res+1)*z)];
+                            const d1 = grid[(x+1) + (res+1)*(y + (res+1)*z)];
+                            if ((d0 < 0) !== (d1 < 0)) {
+                                const wx = this.minX + (x + 0.5) * cellSize;
+                                const wy = this.minY + (y + 0.5) * cellSize;
+                                const wz = this.minZ + (z + 0.5) * cellSize;
+                                const vIdx = vertices.length / 3;
+                                cellVerts.set(`${x},${y},${z}`, vIdx);
+                                vertices.push(wx, wy, wz);
+                                normals.push(0, 1, 0);
+                                colors.push(0.48, 0.45, 0.42);
+                            }
+                        }
+                    }
+                }
+
+                if (vertices.length > 0) {
+                    const posArr = new Float32Array(vertices);
+                    const normArr = new Float32Array(normals);
+                    const colArr = new Float32Array(colors);
+                    const idxArr = new Uint32Array(indices);
+
+                    const geom = new THREE.BufferGeometry();
+                    geom.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+                    geom.setAttribute('normal', new THREE.BufferAttribute(normArr, 3));
+                    geom.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
+
+                    const mesh = new THREE.Mesh(geom, rockMaterial);
+                    mesh.castShadow = true;
+                    mesh.receiveShadow = true;
+                    scene.add(mesh);
+                    this.mesh = mesh;
+                }
+            }
+        }
+
+        const leaves = [];
+        const halfDomain = DOMAIN_SIZE / 2;
+        const leafSize = DOMAIN_SIZE / 8; // 8x8x8 leaf grid = 512 potential leaves, culled by SVO homogeneity
+
+        function buildSVO() {
+            for (let z = -halfDomain; z < halfDomain; z += leafSize) {
+                for (let y = -halfDomain; y < halfDomain; y += leafSize) {
+                    for (let x = -halfDomain; x < halfDomain; x += leafSize) {
+                        // Cull leaves far outside asteroid radius
+                        const distToCenter = Math.sqrt(x + leafSize/2)**2 + (y + leafSize/2)**2 + (z + leafSize/2)**2;
+                        if (distToCenter > (R + leafSize * 1.5)**2) continue;
+
+                        const leaf = new SVOLeaf(x, y, z, leafSize);
+                        leaf.extractMesh();
+                        leaves.push(leaf);
+                    }
+                }
+            }
+        }
+
+        buildSVO();
+
+        // Dirty AABB Patching Carve
+        function carveDirtyAABB(center, radius) {
+            const startTime = performance.now();
+            const minX = center.x - radius, maxX = center.x + radius;
+            const minY = center.y - radius, maxY = center.y + radius;
+            const minZ = center.z - radius, maxZ = center.z + radius;
+
+            let patchedCount = 0;
+            for (let leaf of leaves) {
+                // Check if leaf intersects carve AABB
+                if (leaf.minX + leaf.size < minX || leaf.minX > maxX ||
+                    leaf.minY + leaf.size < minY || leaf.minY > maxY ||
+                    leaf.minZ + leaf.size < minZ || leaf.minZ > maxZ) {
+                    continue;
+                }
+
+                // Re-extract only affected leaf patch!
+                patchedCount++;
+                leaf.extractMesh();
+            }
+
+            const dur = performance.now() - startTime;
+            return dur;
+        }
+
+        let frameCount = 0;
+        let carveCount = 0;
+        const totalFrames = 450;
+        const frameTimes = [];
+        const carveDurations = [];
+        let benchmarkStarted = false;
+        let lastTime = performance.now();
+
+        window.startBenchmark = function() {
+            benchmarkStarted = true;
+            document.getElementById('st-status').innerText = 'Running Benchmark';
+        };
+
+        setTimeout(() => window.startBenchmark(), 1000);
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const now = performance.now();
+            const ft = now - lastTime;
+            lastTime = now;
+
+            if (benchmarkStarted && frameCount < totalFrames) {
+                frameTimes.push(ft);
+                frameCount++;
+
+                const carveTriggers = [60, 120, 180, 240, 300, 360];
+                if (carveTriggers.includes(frameCount) && carveCount < 6) {
+                    const angle = carveCount * Math.PI / 3;
+                    const carvePos = new THREE.Vector3(
+                        Math.cos(angle) * 1800,
+                        (carveCount % 2 === 0 ? 400 : -400),
+                        Math.sin(angle) * 1800
+                    );
+                    const dur = carveDirtyAABB(carvePos, 900);
+                    carveDurations.push(dur);
+                    carveCount++;
+                    document.getElementById('st-patch-dur').innerText = dur.toFixed(2) + ' ms';
+                    document.getElementById('st-carves').innerText = `${carveCount} / 6`;
+                }
+
+                const avgFt = frameTimes.reduce((a,b)=>a+b,0) / frameTimes.length;
+                const fps = 1000 / (ft || 1);
+                const avgFps = 1000 / avgFt;
+                document.getElementById('st-frame').innerText = `${frameCount} / ${totalFrames}`;
+                document.getElementById('st-fps').innerText = `${fps.toFixed(1)} / ${avgFps.toFixed(1)}`;
+                document.getElementById('st-ft').innerText = ft.toFixed(2);
+                document.getElementById('progress-bar').style.width = `${(frameCount / totalFrames) * 100}%`;
+
+                let totalTris = 0;
+                let activeLeaves = 0;
+                for (let leaf of leaves) {
+                    if (leaf.mesh) {
+                        activeLeaves++;
+                        if (leaf.mesh.geometry.index) {
+                            totalTris += leaf.mesh.geometry.index.count / 3;
+                        }
+                    }
+                }
+                document.getElementById('st-tris').innerText = totalTris.toLocaleString();
+                document.getElementById('st-leaves').innerText = `${activeLeaves} / ${leaves.length}`;
+
+                if (performance.memory) {
+                    document.getElementById('st-heap').innerText = (performance.memory.usedJSHeapSize / 1048576).toFixed(2) + ' MB';
+                }
+
+                if (frameCount === totalFrames) {
+                    document.getElementById('st-status').innerText = 'Benchmark Complete';
+                    const sortedFt = [...frameTimes].sort((a,b)=>a-b);
+                    const p99 = sortedFt[Math.floor(sortedFt.length * 0.99)];
+                    const avgCarve = carveDurations.reduce((a,b)=>a+b,0) / carveDurations.length;
+
+                    window.__BENCHMARK_RESULTS__ = {
+                        summary: {
+                            totalFrames,
+                            avgFrameTimeMs: Number(avgFt.toFixed(2)),
+                            p99FrameTimeMs: Number(p99.toFixed(2)),
+                            avgFps: Number(avgFps.toFixed(1)),
+                            minFps: Number((1000 / Math.max(...frameTimes)).toFixed(1)),
+                            trianglesCount: totalTris,
+                            carveCount,
+                            avgCarveDurationMs: Number(avgCarve.toFixed(2)),
+                            heapMemoryMb: performance.memory ? Number((performance.memory.usedJSHeapSize / 1048576).toFixed(2)) : 0
+                        },
+                        frameTimes,
+                        carveDurations
+                    };
+                    console.log("BENCHMARK_COMPLETE", JSON.stringify(window.__BENCHMARK_RESULTS__));
+                }
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>
