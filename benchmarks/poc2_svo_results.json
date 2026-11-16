@@ -5,11 +5,11 @@
   "brushRadius": 140,
   "cellSize": "96.0u (14³)",
   "avgFps": 60,
-  "avgFrameTime": 16.66,
+  "avgFrameTime": 16.67,
   "p99FrameTime": 16.8,
-  "avgCarveLatency": 2.72,
-  "triangles": 36680,
+  "avgCarveLatency": 2.43,
+  "triangles": 36712,
   "drawCalls": 95,
-  "heapMemoryMB": 19.55,
+  "heapMemoryMB": 18.41,
   "visualCollisionError": "0.00u"
 }

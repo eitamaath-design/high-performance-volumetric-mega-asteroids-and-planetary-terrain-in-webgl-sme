@@ -216,14 +216,14 @@ Subterranean caves support structural reinforcement and tactical defense:
 | Metric | Rockets Baseline (Monolithic 64³) | Option 1: Chunked Surface Nets (PoC 1) | Option 2: Adaptive QEF SVO (PoC 2) | Option 3: Clipmap Shell & Portals (PoC 3) | Option 4: 3D GPU SDF Raymarching (PoC 4) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Status** | Verified Legacy | Verified / Next-Gen | Verified / Next-Gen | Verified / Next-Gen | Verified / Next-Gen |
-| **Average FPS** | $58.8\text{ FPS}$ | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
-| **Average Frame Time** | $17.00\text{ ms}$ | **$16.67\text{ ms}$** | **$16.66\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** |
+| **Average FPS** | $59.0\text{ FPS}$ | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
+| **Average Frame Time** | $16.96\text{ ms}$ | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** |
 | **P99 Frame Time** | $16.80\text{ ms}$ | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** |
-| **Carve Latency** | $1.78\text{ ms}$ | **$3.43\text{ ms}$** | **$2.72\text{ ms}$** | $6.88\text{ ms}$ | **$0.07\text{ ms}$** |
+| **Carve Latency** | $1.57\text{ ms}$ | **$3.43\text{ ms}$** | **$2.43\text{ ms}$** | $6.95\text{ ms}$ | **$0.08\text{ ms}$** |
 | **Visual-Collision Error** | $> 30.00\text{u}$ | **$0.00\text{u}$** | **$0.00\text{u}$** | **$0.00\text{u}$** | **$0.00\text{u}$** |
-| **Active Triangles** | 6,936 | 69,480 | 36,680 | 33,529 | 1,244 (Proxy) |
-| **Draw Calls** | 1 | 139 | 95 | 29 | 15 |
-| **JS Heap Memory** | $28.04\text{ MB}$ | $26.32\text{ MB}$ | **$19.55\text{ MB}$** | **$18.41\text{ MB}$** | **$19.55\text{ MB}$** |
+| **Active Triangles** | 6,936 | 69,484 | 36,712 | 33,520 | 1,244 (Proxy) |
+| **Draw Calls** | 1 | 139 | 95 | 28 | 15 |
+| **JS Heap Memory** | $28.04\text{ MB}$ | $24.80\text{ MB}$ | **$18.41\text{ MB}$** | **$17.36\text{ MB}$** | **$19.55\text{ MB}$** |
 
 ---
 

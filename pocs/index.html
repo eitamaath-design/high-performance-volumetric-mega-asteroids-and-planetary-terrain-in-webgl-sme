@@ -421,6 +421,7 @@
 
     let activePoC = 'poc1';
     const currentParams = { scale: '10p', quality: 'high', radius: 140 };
+    let lastParamChangeTime = 0;
     let isRunningBenchmark = false;
     let benchmarkQueue = [];
     let benchmarkResolver = null;
@@ -469,6 +470,7 @@
 
     function setShowcaseScale(scale) {
       currentParams.scale = scale;
+      lastParamChangeTime = performance.now();
       syncShowcaseParamButtons();
       if (!isRunningBenchmark) {
         dispatchMsg('SET_SCALE', { scale });
@@ -477,6 +479,7 @@
 
     function setShowcaseQuality(quality) {
       currentParams.quality = quality;
+      lastParamChangeTime = performance.now();
       syncShowcaseParamButtons();
       if (!isRunningBenchmark) {
         dispatchMsg('SET_QUALITY', { quality });
@@ -660,7 +663,7 @@
         document.getElementById('hdr-err').innerText = d.visualCollisionError || '0.00u';
         document.getElementById('hdr-heap').innerText = `${d.heap.toFixed(1)} MB`;
 
-        if (!isRunningBenchmark && (d.scale || d.quality)) {
+        if (!isRunningBenchmark && (performance.now() - lastParamChangeTime > 2500) && (d.scale || d.quality)) {
           let changed = false;
           if (d.scale && d.scale !== currentParams.scale) { currentParams.scale = d.scale; changed = true; }
           if (d.quality && d.quality !== currentParams.quality) { currentParams.quality = d.quality; changed = true; }
