@@ -47,13 +47,14 @@
 
         const noise = new FastNoise3D(999);
 
+        const QUALITY_PRESETS_POC4 = { low: 64, medium: 96, high: 112, ultra: 136 };
         let currentRadius = 2800;
-        const VOL_RES = 80; // 80^3 Volume Texture (512,000 voxels)
+        let VOL_RES = 112; // Configurable by quality tier (64^3 .. 136^3)
         let DOMAIN_HALF = currentRadius * 1.32;
         let VOXEL_SPACING = (DOMAIN_HALF * 2.0) / VOL_RES;
 
         // RGBA Volume Buffer (R = Signed Distance, G = Material: 1=Rock, 2=Ore, 3=Titanium)
-        const volumeData = new Float32Array(VOL_RES * VOL_RES * VOL_RES * 4);
+        let volumeData = new Float32Array(VOL_RES * VOL_RES * VOL_RES * 4);
         let volumeTexture = null;
         let volumeBoxMesh = null;
         let raymarchMaterial = null;
@@ -61,7 +62,8 @@
 
         function evalDensityPoC4(wx, wy, wz) {
             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-            const n = (noise.fbm(wx * 0.0015, wy * 0.0015, wz * 0.0015, 3) - 0.35) * (currentRadius * 0.22);
+            const freq = 0.0015 * (2800.0 / currentRadius);
+            const n = (noise.fbm(wx * freq, wy * freq, wz * freq, 3) - 0.35) * (currentRadius * 0.22);
             return dist - (currentRadius + n);
         }
 
@@ -70,6 +72,12 @@
             DOMAIN_HALF = currentRadius * 1.32;
             VOXEL_SPACING = (DOMAIN_HALF * 2.0) / VOL_RES;
 
+            const neededLen = VOL_RES * VOL_RES * VOL_RES * 4;
+            if (volumeData.length !== neededLen) {
+                volumeData = new Float32Array(neededLen);
+            }
+
+            const oreFreq = 0.006 * (2800.0 / currentRadius);
             let idx = 0;
             for (let z = 0; z < VOL_RES; z++) {
                 const wz = -DOMAIN_HALF + (z + 0.5) * VOXEL_SPACING;
@@ -80,7 +88,7 @@
                         const d = evalDensityPoC4(wx, wy, wz);
 
                         volumeData[idx * 4] = d / DOMAIN_HALF;
-                        volumeData[idx * 4 + 1] = (d < -VOXEL_SPACING * 0.8 && Math.sin(wx * 0.006) * Math.cos(wy * 0.006) > 0.78) ? 2.0 : 1.0;
+                        volumeData[idx * 4 + 1] = (d < -VOXEL_SPACING * 0.8 && Math.sin(wx * oreFreq) * Math.cos(wy * oreFreq) > 0.78) ? 2.0 : 1.0;
                         volumeData[idx * 4 + 2] = 0.0;
                         volumeData[idx * 4 + 3] = 1.0;
                         idx++;
@@ -167,6 +175,7 @@
                 glslVersion: THREE.GLSL3,
                 uniforms: {
                     uVolume: { value: volumeTexture },
+                    uVolRes: { value: VOL_RES },
                     uDomainHalf: { value: DOMAIN_HALF },
                     uAsteroidRadius: { value: currentRadius },
                     uSunDir: { value: new THREE.Vector3(0.65, 0.55, 0.52).normalize() },
@@ -192,6 +201,7 @@
                     out vec4 fragColor;
 
                     uniform sampler3D uVolume;
+                    uniform float uVolRes;
                     uniform float uDomainHalf;
                     uniform float uAsteroidRadius;
                     uniform vec3 uSunDir;
@@ -280,14 +290,41 @@
                         return vec2(samp.r * uDomainHalf, samp.g);
                     }
 
+                    // C1 Hermite smoothstep interpolation via texelFetch to eliminate voxel boundary gradient creases
+                    float sampleSDFSmooth(vec3 localPos) {
+                        vec3 uvw = clamp((localPos + uDomainHalf) / (uDomainHalf * 2.0), vec3(0.0), vec3(1.0));
+                        vec3 g = clamp(uvw * uVolRes - 0.5, vec3(0.0), vec3(uVolRes - 1.001));
+                        ivec3 i0 = ivec3(floor(g));
+                        ivec3 i1 = min(i0 + 1, ivec3(int(uVolRes) - 1));
+                        vec3 f = fract(g);
+                        vec3 w = f * f * (3.0 - 2.0 * f);
+
+                        float c000 = texelFetch(uVolume, ivec3(i0.x, i0.y, i0.z), 0).r;
+                        float c100 = texelFetch(uVolume, ivec3(i1.x, i0.y, i0.z), 0).r;
+                        float c010 = texelFetch(uVolume, ivec3(i0.x, i1.y, i0.z), 0).r;
+                        float c110 = texelFetch(uVolume, ivec3(i1.x, i1.y, i0.z), 0).r;
+                        float c001 = texelFetch(uVolume, ivec3(i0.x, i0.y, i1.z), 0).r;
+                        float c101 = texelFetch(uVolume, ivec3(i1.x, i0.y, i1.z), 0).r;
+                        float c011 = texelFetch(uVolume, ivec3(i0.x, i1.y, i1.z), 0).r;
+                        float c111 = texelFetch(uVolume, ivec3(i1.x, i1.y, i1.z), 0).r;
+
+                        float d00 = mix(c000, c100, w.x);
+                        float d10 = mix(c010, c110, w.x);
+                        float d01 = mix(c001, c101, w.x);
+                        float d11 = mix(c011, c111, w.x);
+                        float d0 = mix(d00, d10, w.y);
+                        float d1 = mix(d01, d11, w.y);
+                        return mix(d0, d1, w.z) * uDomainHalf;
+                    }
+
                     vec3 calcNormal(vec3 p) {
-                        float eps = uDomainHalf * 0.015;
+                        float eps = max(uDomainHalf * 0.012, (uDomainHalf * 2.0 / uVolRes) * 0.45);
                         vec2 e = vec2(eps, -eps);
                         return normalize(
-                            e.xyy * sampleSDF(p + e.xyy).x +
-                            e.yyx * sampleSDF(p + e.yyx).x +
-                            e.yxy * sampleSDF(p + e.yxy).x +
-                            e.xxx * sampleSDF(p + e.xxx).x
+                            e.xyy * sampleSDFSmooth(p + e.xyy) +
+                            e.yyx * sampleSDFSmooth(p + e.yyx) +
+                            e.yxy * sampleSDFSmooth(p + e.yxy) +
+                            e.xxx * sampleSDFSmooth(p + e.xxx)
                         );
                     }
 
@@ -317,23 +354,24 @@
                         bool hit = false;
                         float matId = 1.0;
                         float prevT = t;
+                        float minStep = max(uAsteroidRadius * 0.001, 1.5);
 
-                        for (int i = 0; i < 128; i++) {
+                        for (int i = 0; i < 160; i++) {
                             if (t > tEnd) break;
                             p = ro + rd * t;
                             vec2 res = sampleSDF(p);
                             float dist = res.x;
-                            if (dist <= 2.0) {
+                            if (dist <= 0.0) {
                                 hit = true;
                                 matId = res.y;
                                 if (i == 0 && hitSliceCap) {
                                     // Ray hit solid interior right on the X-Ray slice plane
                                     break;
                                 }
-                                // Binary bisection refinement between prevT and t for smooth curves
+                                // 6-iteration root bisection between prevT (d > 0) and t (d <= 0)
                                 float a = prevT;
                                 float b = t;
-                                for (int k = 0; k < 5; k++) {
+                                for (int k = 0; k < 6; k++) {
                                     float m = 0.5 * (a + b);
                                     float dm = sampleSDF(ro + rd * m).x;
                                     if (dm <= 0.0) b = m;
@@ -346,24 +384,30 @@
                                 break;
                             }
                             prevT = t;
-                            t += max(dist * 0.85, 8.0);
+                            t += max(dist * 0.88, clamp(dist * 0.5, minStep, 6.0));
                         }
 
                         if (!hit) {
                             discard;
                         }
 
+                        float camDist = length(p - ro);
+                        float scaleRatio = uAsteroidRadius / 2800.0;
+                        float invScale = 2800.0 / uAsteroidRadius;
+                        float detailFade = clamp((uAsteroidRadius * 1.1) / max(camDist, uAsteroidRadius * 0.25), 0.15, 0.85);
+
                         vec3 norm = hitSliceCap ? vec3(0.0, 1.0, 0.0) : calcNormal(p);
-                        float fbmMacro = rmFbm(p * 0.006);
-                        float fbmMicro = rmFbm(p * 0.028);
+                        float fbmMacro = rmFbm(p * (0.006 * invScale));
+                        float fbmMicro = rmFbm(p * (0.028 * invScale));
                         if (!hitSliceCap && matId < 2.35) {
-                            float epsB = 6.0;
-                            float bx = rmFbm((p + vec3(epsB, 0.0, 0.0)) * 0.028) - fbmMicro;
-                            float by = rmFbm((p + vec3(0.0, epsB, 0.0)) * 0.028) - fbmMicro;
-                            float bz = rmFbm((p + vec3(0.0, 0.0, epsB)) * 0.028) - fbmMicro;
+                            float epsB = max(18.0, camDist * 0.0045) * scaleRatio;
+                            float microFreq = 0.028 * invScale;
+                            float bx = rmFbm((p + vec3(epsB, 0.0, 0.0)) * microFreq) - fbmMicro;
+                            float by = rmFbm((p + vec3(0.0, epsB, 0.0)) * microFreq) - fbmMicro;
+                            float bz = rmFbm((p + vec3(0.0, 0.0, epsB)) * microFreq) - fbmMicro;
                             vec3 bumpGrad = vec3(bx, by, bz) / epsB;
                             bumpGrad -= norm * dot(bumpGrad, norm);
-                            norm = normalize(norm - bumpGrad * 18.0);
+                            norm = normalize(norm - bumpGrad * (3.8 * detailFade * detailFade * scaleRatio));
                         }
 
                         float sunDiff = max(dot(norm, uSunDir), 0.0);
@@ -372,18 +416,19 @@
                         float lighting = 0.22 + sunDiff * 1.15 + fillDiff * 0.35 + camLight;
 
                         float rDist = length(p);
-                        float strata = 0.5 + 0.5 * sin(rDist * 0.045 + fbmMacro * 6.0);
+                        float strata = 0.5 + 0.5 * sin(rDist * (0.045 * invScale) + fbmMacro * 6.0);
                         float depthShade = smoothstep(uAsteroidRadius * 0.25, uAsteroidRadius * 1.05, rDist);
 
-                        vec3 exteriorRock = mix(vec3(0.34, 0.36, 0.40), vec3(0.58, 0.56, 0.52), fbmMacro * 0.7 + fbmMicro * 0.45);
-                        vec3 interiorRock = mix(vec3(0.24, 0.27, 0.34), vec3(0.42, 0.39, 0.36), strata * 0.65 + fbmMicro * 0.45);
-                        vec3 baseCol = mix(interiorRock, exteriorRock, depthShade) * (0.85 + 0.3 * fbmMicro);
+                        float microBlend = mix(0.5, fbmMicro, detailFade);
+                        vec3 exteriorRock = mix(vec3(0.34, 0.36, 0.40), vec3(0.58, 0.56, 0.52), fbmMacro * 0.7 + microBlend * 0.45);
+                        vec3 interiorRock = mix(vec3(0.24, 0.27, 0.34), vec3(0.42, 0.39, 0.36), strata * 0.65 + microBlend * 0.45);
+                        vec3 baseCol = mix(interiorRock, exteriorRock, depthShade) * (0.85 + 0.3 * microBlend);
                         vec3 emissiveCol = vec3(0.0);
 
                         if (matId >= 2.4) {
                             // Reinforced Titanium Bulkhead with glowing cyan hex seam grid
-                            float hexMask = rmTriplanarHex(p, norm, 0.032);
-                            vec3 plate = mix(vec3(0.16, 0.25, 0.34), vec3(0.28, 0.40, 0.52), fbmMicro * 0.6);
+                            float hexMask = rmTriplanarHex(p, norm, 0.032 * invScale);
+                            vec3 plate = mix(vec3(0.16, 0.25, 0.34), vec3(0.28, 0.40, 0.52), microBlend * 0.6);
                             vec3 seam = vec3(0.0, 0.95, 1.0);
                             baseCol = mix(seam, plate, hexMask);
                             vec3 halfVec = normalize(uSunDir - rd);
@@ -392,8 +437,8 @@
                             emissiveCol = vec3(0.0, 0.75, 0.95) * (1.0 - hexMask) * 1.2 + vec3(0.02, 0.12, 0.18);
                         } else if (matId > 1.30) {
                             // Subtle Gold Mineral Ore Vein matching Surface Nets triplanar shader
-                            float oreMask = smoothstep(1.30, 1.85, matId) * smoothstep(0.30, 0.72, fbmMicro);
-                            vec3 oreCol = mix(vec3(0.68, 0.42, 0.08), vec3(0.98, 0.78, 0.22), fbmMicro);
+                            float oreMask = smoothstep(1.30, 1.85, matId) * smoothstep(0.30, 0.72, microBlend);
+                            vec3 oreCol = mix(vec3(0.68, 0.42, 0.08), vec3(0.98, 0.78, 0.22), microBlend);
                             baseCol = mix(baseCol, oreCol, oreMask * 0.85);
                             emissiveCol = vec3(0.18, 0.09, 0.01) * oreMask;
                         }
@@ -401,7 +446,7 @@
                         vec3 finalColor = baseCol * lighting + emissiveCol;
 
                         if (uWireframe > 0.5) {
-                            vec3 grid = abs(fract(p / (uDomainHalf * 2.0 / 80.0) - 0.5) - 0.5) / 0.08;
+                            vec3 grid = abs(fract(p / (uDomainHalf * 2.0 / uVolRes) - 0.5) - 0.5) / 0.08;
                             float line = 1.0 - min(min(grid.x, min(grid.y, grid.z)), 1.0);
                             finalColor = mix(finalColor, vec3(0.1, 0.95, 0.8), line * 0.75);
                         }
@@ -494,6 +539,29 @@
             }
         }
 
+        function applyQualityPoC4(qualityKey) {
+            VOL_RES = QUALITY_PRESETS_POC4[qualityKey] || 112;
+            VOXEL_SPACING = (DOMAIN_HALF * 2.0) / VOL_RES;
+        }
+
+        function rebuildVolumePoC4() {
+            initVolumeField();
+            if (volumeBoxMesh && raymarchMaterial) {
+                volumeBoxMesh.geometry.dispose();
+                volumeBoxMesh.geometry = new THREE.BoxGeometry(DOMAIN_HALF * 2, DOMAIN_HALF * 2, DOMAIN_HALF * 2);
+                raymarchMaterial.uniforms.uDomainHalf.value = DOMAIN_HALF;
+                raymarchMaterial.uniforms.uAsteroidRadius.value = currentRadius;
+                raymarchMaterial.uniforms.uVolRes.value = VOL_RES;
+                raymarchMaterial.uniforms.uVolume.value = volumeTexture;
+            }
+            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
+            const surfPt = findSurfacePoint(evalDensityPoC4, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
+            const scaleFactor = currentRadius / 2800.0;
+            carveSpherePoC4(surfPt, 220 * scaleFactor);
+            carveSpherePoC4(surfPt.clone().addScaledVector(tunnelDir, -160 * scaleFactor), 200 * scaleFactor);
+            reinforceSpherePoC4(surfPt.clone().addScaledVector(tunnelDir, -150 * scaleFactor), 250 * scaleFactor);
+        }
+
         // Shared Sandbox Setup
         const sandbox = new PlanetaryBaseSandbox({
             pocId: 'poc4',
@@ -501,6 +569,17 @@
             defaultRadius: currentRadius,
             getCollisionMesh: () => volumeBoxMesh,
             getVisualMesh: () => volumeBoxMesh,
+            getCellSize: () => `${VOXEL_SPACING.toFixed(1)}u (${VOL_RES}³)`,
+            onBeforeRender: () => {
+                if (raymarchMaterial) {
+                    sandbox.camera.updateMatrixWorld();
+                    viewProjMatrix.multiplyMatrices(sandbox.camera.projectionMatrix, sandbox.camera.matrixWorldInverse);
+                    raymarchMaterial.uniforms.uCameraPos.value.copy(sandbox.camera.position);
+                    raymarchMaterial.uniforms.uViewProjMatrix.value.copy(viewProjMatrix);
+                    raymarchMaterial.uniforms.uXRayEnabled.value = sandbox.isXRay ? 1.0 : 0.0;
+                    raymarchMaterial.uniforms.uXRayOffset.value = sandbox.clipPlane.constant;
+                }
+            },
 
             // Analytical CPU Sphere-Marching Raycast (0.00u visual-to-collision parity)
             customRaycast: (raycaster, camera, mousePos) => {
@@ -518,20 +597,33 @@
                     return null;
                 }
                 let t = box.containsPoint(ro) ? 0 : ro.distanceTo(entryPt) + 1.0;
+                let prevT = t;
                 const maxT = t + DOMAIN_HALF * 4.0;
                 const p = new THREE.Vector3();
+                const minStep = Math.max(currentRadius * 0.001, 1.5);
 
-                for (let step = 0; step < 128 && t <= maxT; step++) {
+                for (let step = 0; step < 160 && t <= maxT; step++) {
                     p.copy(ro).addScaledVector(rd, t);
                     if (sandbox.isXRay && p.y > -sandbox.xRayOffset) {
                         if (rd.y >= -1e-5) return null;
                         const tPlane = (-sandbox.xRayOffset - ro.y) / rd.y;
                         t = Math.max(t + 1.0, tPlane);
+                        prevT = t;
                         continue;
                     }
                     const res = cpuSampleSDF(p.x, p.y, p.z);
-                    if (res.d <= 4.0) {
-                        const eps = 10.0;
+                    if (res.d <= 0.0) {
+                        let a = prevT, b = t;
+                        for (let k = 0; k < 6; k++) {
+                            const m = 0.5 * (a + b);
+                            const mp = ro.clone().addScaledVector(rd, m);
+                            if (cpuSampleSDF(mp.x, mp.y, mp.z).d <= 0.0) b = m;
+                            else a = m;
+                        }
+                        const refinedT = 0.5 * (a + b);
+                        p.copy(ro).addScaledVector(rd, refinedT);
+                        const finalSamp = cpuSampleSDF(p.x, p.y, p.z);
+                        const eps = Math.max(10.0, VOXEL_SPACING * 0.45);
                         const norm = new THREE.Vector3(
                             cpuSampleSDF(p.x + eps, p.y, p.z).d - cpuSampleSDF(p.x - eps, p.y, p.z).d,
                             cpuSampleSDF(p.x, p.y + eps, p.z).d - cpuSampleSDF(p.x, p.y - eps, p.z).d,
@@ -543,12 +635,13 @@
                         return {
                             point: p.clone(),
                             normal: norm,
-                            distance: t,
-                            materialId: Math.round(res.mat),
+                            distance: refinedT,
+                            materialId: Math.round(finalSamp.mat),
                             object: volumeBoxMesh
                         };
                     }
-                    t += Math.max(res.d * 0.85, 8.0);
+                    prevT = t;
+                    t += Math.max(res.d * 0.88, Math.min(6.0, Math.max(minStep, res.d * 0.5)));
                 }
                 return null;
             },
@@ -569,14 +662,12 @@
 
             onScaleChange: (scaleKey, radius) => {
                 currentRadius = radius;
-                initVolumeField();
-                if (volumeBoxMesh && raymarchMaterial) {
-                    volumeBoxMesh.geometry.dispose();
-                    volumeBoxMesh.geometry = new THREE.BoxGeometry(DOMAIN_HALF * 2, DOMAIN_HALF * 2, DOMAIN_HALF * 2);
-                    raymarchMaterial.uniforms.uDomainHalf.value = DOMAIN_HALF;
-                    raymarchMaterial.uniforms.uAsteroidRadius.value = currentRadius;
-                    raymarchMaterial.uniforms.uVolume.value = volumeTexture;
-                }
+                rebuildVolumePoC4();
+            },
+
+            onQualityChange: (qualityKey) => {
+                applyQualityPoC4(qualityKey);
+                rebuildVolumePoC4();
             },
 
             onToggleWireframe: (enabled) => {
@@ -593,29 +684,19 @@
             }
         });
 
-        // Update Camera Position & ViewProj uniforms continuously for raymarcher
-        const origAnimate = sandbox.animate;
-        sandbox.animate = function(now) {
-            if (raymarchMaterial) {
-                sandbox.camera.updateMatrixWorld();
-                viewProjMatrix.multiplyMatrices(sandbox.camera.projectionMatrix, sandbox.camera.matrixWorldInverse);
-                raymarchMaterial.uniforms.uCameraPos.value.copy(sandbox.camera.position);
-                raymarchMaterial.uniforms.uViewProjMatrix.value.copy(viewProjMatrix);
-                raymarchMaterial.uniforms.uXRayEnabled.value = sandbox.isXRay ? 1.0 : 0.0;
-                raymarchMaterial.uniforms.uXRayOffset.value = sandbox.clipPlane.constant;
-            }
-            origAnimate.call(sandbox, now);
-        };
-
+        currentRadius = sandbox.currentRadius;
+        applyQualityPoC4(sandbox.currentQuality);
         setupRaymarcher(sandbox.scene);
         // Starter tunnel entrance + reinforced titanium wall showcase
         {
             const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
             const surfPt = findSurfacePoint(evalDensityPoC4, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
-            carveSpherePoC4(surfPt, 220);
-            carveSpherePoC4(surfPt.clone().addScaledVector(tunnelDir, -160), 200);
-            reinforceSpherePoC4(surfPt.clone().addScaledVector(tunnelDir, -150), 250);
+            const scaleFactor = currentRadius / 2800.0;
+            carveSpherePoC4(surfPt, 220 * scaleFactor);
+            carveSpherePoC4(surfPt.clone().addScaledVector(tunnelDir, -160 * scaleFactor), 200 * scaleFactor);
+            reinforceSpherePoC4(surfPt.clone().addScaledVector(tunnelDir, -150 * scaleFactor), 250 * scaleFactor);
         }
+        sandbox.updateCellSizeLabel();
     </script>
 </body>
 </html>

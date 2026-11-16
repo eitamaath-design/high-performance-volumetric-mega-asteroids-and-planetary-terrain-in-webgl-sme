@@ -164,6 +164,49 @@
         </button>
       </div>
 
+      <!-- Parameters & Live Benchmark Suite -->
+      <div class="panel" style="border-color: rgba(16, 185, 129, 0.45);">
+        <h2 style="font-size: 13px; text-transform: uppercase; color: var(--amber-glow); margin: 0 0 10px 0;">Simulation Parameters &amp; Benchmark</h2>
+
+        <div style="margin-bottom: 10px;">
+          <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">Planetary Scale:</div>
+          <div style="display: flex; gap: 6px;">
+            <button id="btn-param-scale-10p" class="btn-action" style="flex:1; border-color:#00f0ff; background:#003344; color:#00f0ff;" onclick="setShowcaseScale('10p')">10P (2800u)</button>
+            <button id="btn-param-scale-30p" class="btn-action" style="flex:1;" onclick="setShowcaseScale('30p')">30P (4800u)</button>
+            <button id="btn-param-scale-50p" class="btn-action" style="flex:1;" onclick="setShowcaseScale('50p')">50P (8000u)</button>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 10px;">
+          <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">Resolution / Quality:</div>
+          <div style="display: flex; gap: 5px;">
+            <button id="btn-param-quality-low" class="btn-action" style="flex:1;" onclick="setShowcaseQuality('low')">Low</button>
+            <button id="btn-param-quality-medium" class="btn-action" style="flex:1;" onclick="setShowcaseQuality('medium')">Med</button>
+            <button id="btn-param-quality-high" class="btn-action" style="flex:1; border-color:#10b981; background:#064e3b; color:#6ee7b7;" onclick="setShowcaseQuality('high')">High</button>
+            <button id="btn-param-quality-ultra" class="btn-action" style="flex:1;" onclick="setShowcaseQuality('ultra')">Ultra</button>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 12px;">
+          <div style="display:flex; justify-content:space-between; font-size: 11px; color: #cbd5e1; margin-bottom: 4px;">
+            <span>Laser Brush Radius:</span>
+            <b id="showcase-radius-val" style="color:var(--cyan-glow);">140u</b>
+          </div>
+          <input id="showcase-radius-slider" type="range" min="40" max="360" value="140" oninput="setShowcaseRadius(this.value)" style="width:100%; accent-color:#00f0ff; cursor:pointer;">
+        </div>
+
+        <button id="btn-run-all-benchmarks" class="btn-action" onclick="runAllModesBenchmark()" style="width:100%; padding:10px 12px; font-weight:bold; font-size:12px; background:linear-gradient(90deg, rgba(0,240,255,0.2), rgba(16,185,129,0.22)); border-color:var(--cyan-glow); color:#ffffff;">
+          ⚡ Run Benchmark (All 4 Modes)
+        </button>
+
+        <div id="bench-progress-wrap" style="display:none; margin-top:8px;">
+          <div style="width:100%; height:6px; background:#0f172a; border-radius:4px; overflow:hidden; border:1px solid #1e293b;">
+            <div id="bench-progress-bar" style="width:0%; height:100%; background:linear-gradient(90deg, #00f0ff, #10b981); transition:width 0.2s;"></div>
+          </div>
+          <div id="bench-status" style="font-size:10px; color:#94a3b8; margin-top:4px;">Idle</div>
+        </div>
+      </div>
+
       <!-- Live Gameplay & Remote Testbed Dispatcher -->
       <div class="panel">
         <h2 style="font-size: 13px; text-transform: uppercase; color: var(--green-glow); margin: 0 0 10px 0;">Live Gameplay Tool Dispatcher</h2>
@@ -233,6 +276,31 @@
         <iframe id="main-iframe" class="viewport-iframe" src="poc1_chunked_octree_surface_nets.html"></iframe>
       </div>
 
+      <!-- Live Multi-Mode Benchmark Results (Populated when Run Benchmark executes) -->
+      <div id="live-benchmark-panel" class="panel" style="display:none; border-color: rgba(0, 240, 255, 0.5);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:8px;">
+          <h2 style="font-size: 15px; color: var(--cyan-glow); margin: 0;">Live Showcase Benchmark Results (All 4 Modes)</h2>
+          <span id="live-bench-meta" class="badge">Scale: 10P &bull; Quality: High &bull; Radius: 140u</span>
+        </div>
+        <div style="overflow-x: auto;">
+          <table style="width:100%; border-collapse:collapse; font-size:12px;">
+            <thead>
+              <tr style="background:#0f172a; color:#00f0ff; text-align:left;">
+                <th style="padding:8px; border:1px solid #1e293b;">Architecture</th>
+                <th style="padding:8px; border:1px solid #1e293b;">Effective Cell / Res</th>
+                <th style="padding:8px; border:1px solid #1e293b;">Avg FPS</th>
+                <th style="padding:8px; border:1px solid #1e293b;">Frame Time (Avg / P99)</th>
+                <th style="padding:8px; border:1px solid #1e293b;">Carve Latency</th>
+                <th style="padding:8px; border:1px solid #1e293b;">Triangles / Draws</th>
+                <th style="padding:8px; border:1px solid #1e293b;">Heap RAM</th>
+                <th style="padding:8px; border:1px solid #1e293b;">Error</th>
+              </tr>
+            </thead>
+            <tbody id="live-benchmark-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- Interactive Technology Breakdown & Comparison Matrix -->
       <div class="panel">
         <h2 style="font-size: 15px; color: #fff; margin: 0 0 12px 0;">Technology Breakdown & Architectural Comparison Matrix</h2>
@@ -258,35 +326,35 @@
                 <td style="padding:8px; border:1px solid #1e293b;">Unsupported (Single Mat)</td>
                 <td style="padding:8px; border:1px solid #1e293b;">Unscalable (Megabyte payloads)</td>
               </tr>
-              <tr>
+              <tr id="row-poc1">
                 <td style="padding:8px; border:1px solid #1e293b; color:#38bdf8; font-weight:bold;">Option 1: Chunked Surface Nets</td>
-                <td style="padding:8px; border:1px solid #1e293b;">4.0u - 8.0u</td>
+                <td id="cell-poc1-ext" style="padding:8px; border:1px solid #1e293b;">4.0u - 8.0u</td>
                 <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">0.00u (Exact BVH)</td>
-                <td style="padding:8px; border:1px solid #1e293b; color:#10b981;">0.48 ms (Async Worker)</td>
+                <td id="cell-poc1-carve" style="padding:8px; border:1px solid #1e293b; color:#10b981;">0.48 ms (Async Worker)</td>
                 <td style="padding:8px; border:1px solid #1e293b;">Multi-material Vertex Plating</td>
                 <td style="padding:8px; border:1px solid #1e293b;">High (Independent Chunks)</td>
               </tr>
-              <tr>
+              <tr id="row-poc2">
                 <td style="padding:8px; border:1px solid #1e293b; color:#fbbf24; font-weight:bold;">Option 2: Adaptive QEF SVO</td>
-                <td style="padding:8px; border:1px solid #1e293b;">2.0u - 8.0u</td>
+                <td id="cell-poc2-ext" style="padding:8px; border:1px solid #1e293b;">2.0u - 8.0u</td>
                 <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">0.00u (Exact BVH)</td>
-                <td style="padding:8px; border:1px solid #1e293b; color:#10b981;">4.20 ms (Leaf Patch)</td>
+                <td id="cell-poc2-carve" style="padding:8px; border:1px solid #1e293b; color:#10b981;">4.20 ms (Leaf Patch)</td>
                 <td style="padding:8px; border:1px solid #1e293b;">Sharp 90° Bulkhead Chamfers</td>
                 <td style="padding:8px; border:1px solid #1e293b;">High (Sparse Octree Leaves)</td>
               </tr>
-              <tr>
+              <tr id="row-poc3">
                 <td style="padding:8px; border:1px solid #1e293b; color:#34d399; font-weight:bold;">Option 3: Clipmap Shell & Portals</td>
-                <td style="padding:8px; border:1px solid #1e293b;">2.0u - 4.0u (Cavern)</td>
+                <td id="cell-poc3-ext" style="padding:8px; border:1px solid #1e293b;">2.0u - 4.0u (Cavern)</td>
                 <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">0.00u (Exact BVH)</td>
-                <td style="padding:8px; border:1px solid #1e293b; color:#10b981;">1.10 ms (Local Chunk)</td>
+                <td id="cell-poc3-carve" style="padding:8px; border:1px solid #1e293b; color:#10b981;">1.10 ms (Local Chunk)</td>
                 <td style="padding:8px; border:1px solid #1e293b;">Supported in Cavern Manifolds</td>
                 <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">Maximum (Planetary R=8000u+)</td>
               </tr>
-              <tr>
+              <tr id="row-poc4">
                 <td style="padding:8px; border:1px solid #1e293b; color:#c084fc; font-weight:bold;">Option 4: 3D GPU SDF Raymarcher</td>
-                <td style="padding:8px; border:1px solid #1e293b;">Continuous Trilinear</td>
+                <td id="cell-poc4-ext" style="padding:8px; border:1px solid #1e293b;">Continuous Trilinear</td>
                 <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">0.00u (Trilinear Match)</td>
-                <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">< 0.05 ms (Texture)</td>
+                <td id="cell-poc4-carve" style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">< 0.05 ms (Texture)</td>
                 <td style="padding:8px; border:1px solid #1e293b;">Dual-Channel Texture Armor</td>
                 <td style="padding:8px; border:1px solid #1e293b;">Medium (VRAM Texture Limits)</td>
               </tr>
@@ -352,8 +420,86 @@
     };
 
     let activePoC = 'poc1';
+    const currentParams = { scale: '10p', quality: 'high', radius: 140 };
+    let isRunningBenchmark = false;
+    let benchmarkQueue = [];
+    let benchmarkResolver = null;
+    const benchmarkModeColors = {
+      poc1: '#38bdf8',
+      poc2: '#fbbf24',
+      poc3: '#34d399',
+      poc4: '#c084fc'
+    };
 
-    function switchPoC(id) {
+    function buildPoCUrl(file, benchmarkMode = false, frames = 150) {
+      const qs = new URLSearchParams({
+        scale: currentParams.scale,
+        quality: currentParams.quality,
+        radius: String(currentParams.radius)
+      });
+      if (benchmarkMode) {
+        qs.set('benchmark', 'true');
+        qs.set('frames', String(frames));
+      }
+      return `${file}?${qs.toString()}`;
+    }
+
+    function syncShowcaseParamButtons() {
+      ['10p', '30p', '50p'].forEach(s => {
+        const b = document.getElementById(`btn-param-scale-${s}`);
+        if (!b) return;
+        const active = s === currentParams.scale;
+        b.style.borderColor = active ? '#00f0ff' : '#334155';
+        b.style.background = active ? '#003344' : '#1e293b';
+        b.style.color = active ? '#00f0ff' : '#e2e8f0';
+      });
+      ['low', 'medium', 'high', 'ultra'].forEach(q => {
+        const b = document.getElementById(`btn-param-quality-${q}`);
+        if (!b) return;
+        const active = q === currentParams.quality;
+        b.style.borderColor = active ? '#10b981' : '#334155';
+        b.style.background = active ? '#064e3b' : '#1e293b';
+        b.style.color = active ? '#6ee7b7' : '#e2e8f0';
+      });
+      const slider = document.getElementById('showcase-radius-slider');
+      const lbl = document.getElementById('showcase-radius-val');
+      if (slider) slider.value = currentParams.radius;
+      if (lbl) lbl.innerText = `${currentParams.radius}u`;
+    }
+
+    function setShowcaseScale(scale) {
+      currentParams.scale = scale;
+      syncShowcaseParamButtons();
+      if (!isRunningBenchmark) {
+        dispatchMsg('SET_SCALE', { scale });
+      }
+    }
+
+    function setShowcaseQuality(quality) {
+      currentParams.quality = quality;
+      syncShowcaseParamButtons();
+      if (!isRunningBenchmark) {
+        dispatchMsg('SET_QUALITY', { quality });
+      }
+    }
+
+    function setShowcaseRadius(val) {
+      currentParams.radius = parseFloat(val);
+      syncShowcaseParamButtons();
+      if (!isRunningBenchmark) {
+        dispatchMsg('SET_RADIUS', { radius: currentParams.radius });
+      }
+    }
+
+    function switchPoC(id, options = {}) {
+      if (isRunningBenchmark && !options.fromBenchmark) {
+        isRunningBenchmark = false;
+        const btn = document.getElementById('btn-run-all-benchmarks');
+        if (btn) {
+          btn.disabled = false;
+          btn.innerText = '⚡ Run Benchmark (All 4 Modes)';
+        }
+      }
       activePoC = id;
       ['baseline', 'poc1', 'poc2', 'poc3', 'poc4'].forEach(k => {
         const btn = document.getElementById(`btn-${k}`);
@@ -365,12 +511,13 @@
       });
 
       const conf = pocConfigs[id];
+      const url = options.url || (id === 'baseline' ? conf.file : buildPoCUrl(conf.file, false));
       document.getElementById('vp-title').innerHTML = `
         <span style="width:8px; height:8px; border-radius:50%; background:var(--green-glow); display:inline-block;"></span>
-        Active Viewport: ${conf.title}
+        Active Viewport: ${conf.title}${options.fromBenchmark ? ' [BENCHMARKING]' : ''}
       `;
-      document.getElementById('btn-fullscreen').href = conf.file;
-      document.getElementById('main-iframe').src = conf.file;
+      document.getElementById('btn-fullscreen').href = url;
+      document.getElementById('main-iframe').src = url;
 
       document.getElementById('hdr-fps').innerText = conf.fps;
       document.getElementById('hdr-ft').innerText = conf.ft;
@@ -378,6 +525,116 @@
       document.getElementById('hdr-carve').innerText = conf.carve;
       document.getElementById('hdr-err').innerText = conf.err;
       document.getElementById('hdr-heap').innerText = conf.heap;
+    }
+
+    function runSingleModeBenchmark(id) {
+      return new Promise((resolve) => {
+        const conf = pocConfigs[id];
+        const url = buildPoCUrl(conf.file, true, 150);
+        let settled = false;
+
+        const timer = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            benchmarkResolver = null;
+            resolve({
+              poc: id,
+              scale: currentParams.scale,
+              quality: currentParams.quality,
+              brushRadius: currentParams.radius,
+              cellSize: 'Timeout',
+              avgFps: 0,
+              avgFrameTime: 0,
+              p99FrameTime: 0,
+              avgCarveLatency: 0,
+              triangles: 0,
+              drawCalls: 0,
+              heapMemoryMB: 0,
+              visualCollisionError: 'Timeout'
+            });
+          }
+        }, 45000);
+
+        benchmarkResolver = (res) => {
+          if (!settled && res && res.poc === id) {
+            settled = true;
+            clearTimeout(timer);
+            benchmarkResolver = null;
+            resolve(res);
+          }
+        };
+
+        switchPoC(id, { fromBenchmark: true, url });
+      });
+    }
+
+    function appendBenchmarkResultRow(res) {
+      const tbody = document.getElementById('live-benchmark-tbody');
+      const conf = pocConfigs[res.poc];
+      const color = benchmarkModeColors[res.poc] || '#e2e8f0';
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td style="padding:8px; border:1px solid #1e293b; color:${color}; font-weight:bold;">${conf ? conf.title : res.poc}</td>
+        <td style="padding:8px; border:1px solid #1e293b;">${res.cellSize || '--'}</td>
+        <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">${res.avgFps.toFixed(1)} FPS</td>
+        <td style="padding:8px; border:1px solid #1e293b;">${res.avgFrameTime.toFixed(2)} ms / ${res.p99FrameTime.toFixed(2)} ms</td>
+        <td style="padding:8px; border:1px solid #1e293b; color:#fbbf24; font-weight:bold;">${res.avgCarveLatency.toFixed(2)} ms</td>
+        <td style="padding:8px; border:1px solid #1e293b;">${res.triangles.toLocaleString()} / ${res.drawCalls}</td>
+        <td style="padding:8px; border:1px solid #1e293b;">${res.heapMemoryMB.toFixed(2)} MB</td>
+        <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">${res.visualCollisionError || '0.00u'}</td>
+      `;
+      tbody.appendChild(row);
+
+      const extEl = document.getElementById(`cell-${res.poc}-ext`);
+      const carveEl = document.getElementById(`cell-${res.poc}-carve`);
+      if (extEl && res.cellSize) extEl.innerText = res.cellSize;
+      if (carveEl) carveEl.innerText = `${res.avgCarveLatency.toFixed(2)} ms (${res.avgFps.toFixed(1)} FPS)`;
+    }
+
+    async function runAllModesBenchmark() {
+      if (isRunningBenchmark) return;
+      isRunningBenchmark = true;
+      const prevPoC = activePoC === 'baseline' ? 'poc1' : activePoC;
+
+      const btn = document.getElementById('btn-run-all-benchmarks');
+      const wrap = document.getElementById('bench-progress-wrap');
+      const bar = document.getElementById('bench-progress-bar');
+      const status = document.getElementById('bench-status');
+      const panel = document.getElementById('live-benchmark-panel');
+      const tbody = document.getElementById('live-benchmark-tbody');
+      const meta = document.getElementById('live-bench-meta');
+
+      btn.disabled = true;
+      wrap.style.display = 'block';
+      panel.style.display = 'block';
+      tbody.innerHTML = '';
+      meta.innerText = `Scale: ${currentParams.scale.toUpperCase()} • Quality: ${currentParams.quality.toUpperCase()} • Laser Radius: ${currentParams.radius}u`;
+
+      const modes = ['poc1', 'poc2', 'poc3', 'poc4'];
+      const results = [];
+
+      for (let i = 0; i < modes.length; i++) {
+        if (!isRunningBenchmark) break;
+        const m = modes[i];
+        btn.innerText = `⏳ Running ${i + 1}/4: ${pocConfigs[m].title}...`;
+        status.innerText = `Running ${m.toUpperCase()} (${i + 1}/4)...`;
+        bar.style.width = `${Math.round((i / modes.length) * 100)}%`;
+
+        const res = await runSingleModeBenchmark(m);
+        if (!isRunningBenchmark) break;
+        results.push(res);
+        appendBenchmarkResultRow(res);
+        bar.style.width = `${Math.round(((i + 1) / modes.length) * 100)}%`;
+      }
+
+      if (isRunningBenchmark) {
+        status.innerText = `Completed 4/4 modes (${currentParams.scale.toUpperCase()}, ${currentParams.quality.toUpperCase()}, ${currentParams.radius}u).`;
+        window.__SHOWCASE_BENCHMARK_RESULTS__ = results;
+        isRunningBenchmark = false;
+        btn.disabled = false;
+        btn.innerText = '⚡ Run Benchmark (All 4 Modes)';
+        switchPoC(prevPoC);
+      }
     }
 
     function dispatchMsg(type, payload = {}) {
@@ -391,9 +648,10 @@
       dispatchMsg('SET_TOOL', { tool });
     }
 
-    // Telemetry listener from active iframe
+    // Telemetry & Benchmark listener from active iframe
     window.addEventListener('message', (e) => {
-      if (e.data && e.data.type === 'TELEMETRY_UPDATE') {
+      if (!e.data) return;
+      if (e.data.type === 'TELEMETRY_UPDATE') {
         const d = e.data;
         document.getElementById('hdr-fps').innerText = d.fps.toFixed(1);
         document.getElementById('hdr-ft').innerText = `${d.frameTime.toFixed(1)}ms`;
@@ -401,6 +659,15 @@
         document.getElementById('hdr-carve').innerText = `${d.carveDur.toFixed(2)}ms`;
         document.getElementById('hdr-err').innerText = d.visualCollisionError || '0.00u';
         document.getElementById('hdr-heap').innerText = `${d.heap.toFixed(1)} MB`;
+
+        if (!isRunningBenchmark && (d.scale || d.quality)) {
+          let changed = false;
+          if (d.scale && d.scale !== currentParams.scale) { currentParams.scale = d.scale; changed = true; }
+          if (d.quality && d.quality !== currentParams.quality) { currentParams.quality = d.quality; changed = true; }
+          if (changed) syncShowcaseParamButtons();
+        }
+      } else if (e.data.type === 'BENCHMARK_COMPLETE' && benchmarkResolver) {
+        benchmarkResolver(e.data.results);
       }
     });
 

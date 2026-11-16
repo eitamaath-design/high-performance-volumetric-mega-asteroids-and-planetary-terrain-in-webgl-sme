@@ -45,7 +45,7 @@
         <div class="stat-row"><span>JS Heap RAM:</span><span id="st-heap" class="val">28.0 MB</span></div>
         <div id="progress-bar-container"><div id="progress-bar"></div></div>
         <div class="info-box">
-            <b>The Rockets Problem:</b> 64³ monolithic grid over ~7000u extent produces ~109.4u voxel cells. Click the asteroid to carve: notice jagged stepping, slow CPU retriangulation, and inability to reinforce walls.
+            <b>The Rockets Problem:</b> 64³ monolithic grid over ~7000u extent produces ~109.4u voxel cells. Hover &amp; press <b>Space</b> to carve, drag to rotate, <b>WASD/QE</b> to move: notice jagged stepping, slow CPU retriangulation, and inability to reinforce walls.
         </div>
     </div>
 
@@ -251,20 +251,18 @@
             return performance.now() - t0;
         }
 
-        // Raycasting for interactive click-carve
+        // Raycasting & decoupled controls (Mouse drag orbits, Spacebar carves, WASD/QE moves camera)
         const raycaster = new THREE.Raycaster();
         const mouse = new THREE.Vector2();
+        const keys = {};
+        let isSpaceDown = false;
+        let lastCarveTick = 0;
 
-        window.addEventListener('pointerdown', (e) => {
-            if (isBenchmarkMode) return;
-            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
-            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        function fireBaselineLaser() {
             raycaster.setFromCamera(mouse, camera);
-
             const hits = raycaster.intersectObject(mc, true);
             if (hits.length > 0) {
                 const hit = hits[0];
-                // Convert hit to grid coords
                 const local = mc.worldToLocal(hit.point.clone());
                 const half = mc.halfsize;
                 const gx = (local.x + 1.0) * half;
@@ -274,7 +272,39 @@
 
                 const dur = applyCarve(gx, gy, gz, dir.x, dir.y, dir.z, 3.5, 7.0, 85.0);
                 document.getElementById('st-carve-dur').textContent = `${dur.toFixed(2)} ms (Hitch!)`;
+                lastCarveTick = performance.now();
             }
+        }
+
+        window.addEventListener('pointermove', (e) => {
+            if (isBenchmarkMode) return;
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (isBenchmarkMode) return;
+            const k = e.key.toLowerCase();
+            keys[k] = true;
+            if (e.code === 'Space' || e.key === ' ') {
+                e.preventDefault();
+                if (!isSpaceDown) {
+                    isSpaceDown = true;
+                    fireBaselineLaser();
+                }
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            keys[e.key.toLowerCase()] = false;
+            if (e.code === 'Space' || e.key === ' ') {
+                isSpaceDown = false;
+            }
+        });
+
+        window.addEventListener('blur', () => {
+            isSpaceDown = false;
+            Object.keys(keys).forEach(k => { keys[k] = false; });
         });
 
         // Benchmark variables
@@ -304,12 +334,45 @@
             }
         });
 
+        function updateBaselineCameraWASD(dt) {
+            const moveForward = (keys['w'] || keys['arrowup'] ? 1 : 0) - (keys['s'] || keys['arrowdown'] ? 1 : 0);
+            const moveRight = (keys['d'] || keys['arrowright'] ? 1 : 0) - (keys['a'] || keys['arrowleft'] ? 1 : 0);
+            const moveUp = (keys['e'] ? 1 : 0) - (keys['q'] ? 1 : 0);
+            if (moveForward === 0 && moveRight === 0 && moveUp === 0) return;
+
+            const forward = new THREE.Vector3();
+            camera.getWorldDirection(forward);
+            const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+            const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+            const speed = 1540 * (keys['shift'] ? 2.2 : 1.0);
+
+            const forwardDelta = forward.clone().multiplyScalar(moveForward * speed * dt);
+            const lateralDelta = new THREE.Vector3()
+                .addScaledVector(right, moveRight * speed * dt)
+                .addScaledVector(up, moveUp * speed * dt);
+
+            const prevProj = controls.target.clone().sub(camera.position).dot(forward);
+            const minFollowDist = Math.min(Math.max(prevProj, 40), 420);
+
+            camera.position.add(forwardDelta).add(lateralDelta);
+            controls.target.add(lateralDelta);
+            if (moveForward < 0) {
+                controls.target.add(forwardDelta);
+            } else if (moveForward > 0) {
+                const newProj = controls.target.clone().sub(camera.position).dot(forward);
+                if (newProj < minFollowDist) {
+                    controls.target.addScaledVector(forward, minFollowDist - newProj);
+                }
+            }
+        }
+
         function animate(now) {
             if (isBenchmarkMode && benchmarkComplete) return;
             requestAnimationFrame(animate);
 
             const ft = now - lastTime;
             lastTime = now;
+            const dt = Math.min((ft || 16.6) / 1000, 0.1);
 
             if (ft > 0) {
                 benchmarkResults.frameTimes.push(ft);
@@ -336,7 +399,11 @@
                     document.getElementById('st-carve-dur').textContent = `${dur.toFixed(2)} ms`;
                 }
             } else {
+                updateBaselineCameraWASD(dt);
                 controls.update();
+                if (isSpaceDown && now - lastCarveTick >= 50) {
+                    fireBaselineLaser();
+                }
             }
 
             renderer.render(scene, camera);

@@ -1,11 +1,15 @@
 {
   "poc": "poc2",
+  "scale": "10p",
+  "quality": "medium",
+  "brushRadius": 140,
+  "cellSize": "96.0u (14³)",
   "avgFps": 60,
-  "avgFrameTime": 16.67,
+  "avgFrameTime": 16.66,
   "p99FrameTime": 16.8,
-  "avgCarveLatency": 3.13,
-  "triangles": 36700,
+  "avgCarveLatency": 2.72,
+  "triangles": 36680,
   "drawCalls": 95,
-  "heapMemoryMB": 16.31,
+  "heapMemoryMB": 19.55,
   "visualCollisionError": "0.00u"
 }

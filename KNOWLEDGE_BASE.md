@@ -87,8 +87,13 @@ Subterranean caves support structural reinforcement and tactical defense:
   - Visually manifests with glowing metallic cyan/slate hex plating, distinct specularity, and emissive nanite circuits.
   - Tactical Enforcement: Enemy raiders cannot tunnel through reinforced base walls; they must deploy specialized Heavy Breach Charges or infiltrate through player-defended hangars and tunnel checkpoints.
 
-### 2.4 Scalable 20–30+ Player Planetary Sizing & Base Machinery
-- **Scale Radii:** Scalable across $R = 2800\text{u}$ (10-player scrimmage asteroid), $R = 4800\text{u}$ (20–30 player planetary base hub), and $R = 8000\text{u}+$ (50+ player mega-planetoid).
+### 2.4 Scalable 20–30+ Player Planetary Sizing, Resolution Tiers, Controls & Base Machinery
+- **Scale Radii:** Scalable across $R = 2800\text{u}$ (10-player scrimmage asteroid), $R = 4800\text{u}$ (20–30 player planetary base hub), and $R = 8000\text{u}+$ (50+ player mega-planetoid). Procedural terrain noise frequency scales inversely with radius ($f \propto 2800 / R$) so massive 50P planetoids preserve smooth macro topology without Nyquist grid aliasing.
+- **Resolution / Quality Tiers (`low`, `medium`, `high`, `ultra`):** User-selectable resolution presets dynamically scale voxel/mesh density per architecture (`CHUNK_RES` 12–30 in PoC 1, `LEAF_RES` 10–26 in PoC 2, macro shell segments 80–224 and cavern chunk res 12–28 in PoC 3, `VOL_RES` 64–136 in PoC 4) both inside the 3D viewport HUD and from the Showcase control panel.
+- **Decoupled Interactive Camera & Tool Controls:**
+  - **Mouse Left-Drag / Right-Drag / Wheel:** Orbit camera rotation, panning, and zooming without triggering laser carving.
+  - **`WASD` / `Q` / `E` (+ `Shift` Boost):** Smooth 3D free-camera movement with dynamic `OrbitControls.target` tethering so pilots can fly close to the surface or inside tunnels and orbit around nearby terrain; `[V]` toggles wireframe mode, `[F]` toggles starfighter flight mode, `[X]` toggles X-Ray slicer.
+  - **`Spacebar`:** Fires the active tactical tool continuously at 20Hz (`carve`, `reinforce`, `raider`, `breach`, or `machinery` placement) aimed at the mouse cursor's 3D raycast hit.
 - **Subterranean Base Machinery:**
   - `Weapons Research Lab`: Unlocks advanced plasma payloads and high-yield laser emitters.
   - `Shield Generator Dome`: Projects structural integrity fields shielding cavern outposts from orbital kinetic strikes.
@@ -102,13 +107,13 @@ Subterranean caves support structural reinforcement and tactical defense:
 ### 2.5 Detailed Architectural Alternatives Evaluated
 
 #### Option 1 (`poc1_chunked_octree_surface_nets.html`): Sparse Chunked Dual-Grid Surface Nets + Exact Triangle BVH Collider + Async Web Workers
-- **Voxel Representation:** Sparse chunk map indexed by spatial hash `cx,cy,cz`. Each chunk represents $16^3$ voxels with a 2-voxel overlap halo ($res+5$) ensuring zero inter-chunk seams, identical finite-difference boundary gradients, and zero cracks.
+- **Voxel Representation:** Sparse chunk map indexed by spatial hash `cx,cy,cz`. Each chunk represents $12^3\text{--}30^3$ voxels (`CHUNK_RES` per quality tier, default $24^3$ interactive / $18^3$ benchmark) with a 2-voxel overlap halo ($res+5$) ensuring zero inter-chunk seams, identical finite-difference boundary gradients, and zero cracks.
 - **Meshing Algorithm:** True Dual-Grid Surface Nets. Identifies sign changes along edges, generates one relaxed dual vertex per sign-changing cell, and emits watertight quads across sign-changing interior edges.
 - **Threading Model:** Dedicated worker pool (2–4 Web Workers) receives dirty chunk voxel buffers via zero-copy `Transferable` `ArrayBuffer` objects, returning generated position, normal, color, and index buffers without stalling the main UI thread.
 - **Collision:** Main thread builds a local `THREE.Raycaster` and triangle BVH collider directly from the chunk geometry. Visual-collision parity is absolute (`0.00u`).
 
 #### Option 2 (`poc2_sparse_voxel_octree_mesh_patching.html`): Adaptive QEF Dual Contouring Sparse Voxel Octree (SVO) + Dirty AABB Mesh Patching
-- **Voxel Representation:** Sparse Voxel Octree where internal nodes collapse empty or solid space, refining exclusively at isosurface boundaries. Leaves maintain $12^3$ density and material arrays with a 2-voxel overlap halo ($res+5$) for seam-free cross-leaf QEF gradients.
+- **Voxel Representation:** Sparse Voxel Octree where internal nodes collapse empty or solid space, refining exclusively at isosurface boundaries. Leaves maintain $10^3\text{--}26^3$ density and material arrays (`LEAF_RES` per quality tier) with a 2-voxel overlap halo ($res+5$) for seam-free cross-leaf QEF gradients.
 - **Meshing Algorithm:** Dual Contouring minimizing the Quadratic Error Function (QEF):
   $$E(\mathbf{x}) = \sum_i \left(\mathbf{n}_i \cdot (\mathbf{x} - \mathbf{p}_i)\right)^2 + \lambda \|\mathbf{x} - \mathbf{p}_{\text{mass}}\|^2$$
   Solves via iterative Gauss-Seidel regularized gradient descent clamped within cell bounds.
@@ -116,16 +121,16 @@ Subterranean caves support structural reinforcement and tactical defense:
 - **Patching:** Carving updates mark an AABB dirty box; only intersecting leaf nodes re-contour and splice into active Three.js geometry buffers ($\sim 3.13\text{ ms}$ per carve pass).
 
 #### Option 3 (`poc3_hierarchical_lod_clipmaps.html`): Hybrid Planetary Clipmap Crust + Dynamic Entrance Portals + High-Res Subterranean Voxel Base Manifolds
-- **Planetary Macro Crust:** Multi-ring geodetic spherical clipmap shell spanning massive scale ($R = 2800\text{u}\text{--}8000\text{u}+$) rendered with triplanar crater rock shaders and dynamic distance rings.
-- **Dynamic Entrance Portals:** Firing a mining laser at the unbroken crust stamps an analytical portal aperture (via local shell vertex displacement and stencil masking) and anchors a high-resolution subterranean voxel chunk volume ($cell = 2\text{u}\text{--}4\text{u}$) directly at the entrance collar.
-- **Subterranean Expansion:** Voxel chunks allocate on-demand only along carved tunnel paths. Over $99.5\%$ of the massive planetoid volume consumes zero memory, enabling 30–100+ players to carve miles of subterranean bases without memory exhaustion.
+- **Planetary Macro Crust:** Multi-ring geodetic spherical clipmap shell spanning massive scale ($R = 2800\text{u}\text{--}8000\text{u}+$) with configurable tessellation (`80–224` segments) rendered with triplanar crater rock shaders.
+- **Clustered 3D Portal Grid & Exact Sphere List (`uPortalGridTex` + `uPortalListTex`):** Firing a mining laser at the unbroken crust appends an exact portal sphere $(x, y, z, R_{\text{cut}})$ into a $64 \times 64$ `FloatType` sphere list texture (`4,096` slots) indexed by a $32 \times 32 \times 32$ spatial grid texture (`1024 × 128`, 16 portal IDs per cell) in both the fragment shader and CPU raycaster. This guarantees pixel-exact circular portal cutouts across all planetary scales ($10\text{P}\text{--}50\text{P}$) and brush radii ($40\text{u}\text{--}360\text{u}$) in $O(1)$ shader lookup cost without uniform array caps or radius-merge artifacts, while anchoring high-resolution subterranean voxel chunks ($12^3\text{--}28^3$) at the entrance collar.
+- **Subterranean Expansion:** Voxel chunks allocate on-demand only along carved tunnel paths with minimal surface inset (`4.0u`) and seamless collar overlap. Over $99.5\%$ of the massive planetoid volume consumes zero memory, enabling 30–100+ players to carve miles of subterranean bases without memory exhaustion.
 
 #### Option 4 (`poc4_gpu_sdf_raymarching_hybrid.html`): WebGL2 3D Volume Texture (`Data3DTexture`) GPU SDF Raymarching + Shared Trilinear SDF Physics & Local Dual-Mesh Collision Proxy
-- **Voxel Representation:** Continuous 3D Volume Texture (`THREE.Data3DTexture` in WebGL2, with automatic 2D slice-atlas fallback for WebGL1/SwiftShader). Channel R stores continuous signed distance; Channel G stores material ID.
-- **GPU Rendering:** Full-screen fragment raymarcher with adaptive sphere tracing step sizes, soft interior ambient occlusion, triplanar rock texturing, and emissive nanite bulkhead shaders.
+- **Voxel Representation:** Continuous 3D Volume Texture (`THREE.Data3DTexture` in WebGL2, `64³–136³` configurable by quality tier). Channel R stores normalized continuous signed distance; Channel G stores material ID.
+- **GPU Rendering:** Full-screen fragment raymarcher marching to the true `dist <= 0.0` zero-crossing with 6-step root bisection/secant refinement, Hermite $C^1$ smoothstep normal gradient evaluation (`sampleSDFSmooth` via `texelFetch`) to eliminate voxel-cell derivative creases, and camera-distance-attenuated procedural bump shading to prevent Nyquist surface grain.
 - **CPU Physics Parity:** Analytical CPU sampling mirrors the GPU trilinear interpolation formula:
   $$\text{SDF}(\mathbf{x}) = \text{trilinear\_sample}(\text{volumeBuffer}, \mathbf{x})$$
-- **Collision Proxy:** Generates a real-time local Surface Nets mesh proxy around the starfighter and laser impact zone, allowing full visual-collision alignment inspection with `0.00u` error.
+- **Collision Proxy:** Analytical CPU sphere-marching raycaster evaluates the identical volume field with `0.00u` visual-to-collision error.
 
 ---
 
@@ -190,11 +195,12 @@ Subterranean caves support structural reinforcement and tactical defense:
 4. **Static Asset Zero-404 Gate:** All internal scripts, workers, import maps, and vendor assets must return HTTP 200 without network failures.
 5. **Headless Execution Compatibility Gate:** Automated benchmark harnesses must execute cleanly under Playwright headless SwiftShader.
 
-### 5.2 Automated Benchmark Harness
-The test harness runs all five comparative environments (`rockets_baseline`, `poc1`, `poc2`, `poc3`, `poc4`) under headless Playwright, performing continuous automated carve cycles, sampling frame times, triangles, and heap memory:
-```bash
-node benchmarks/run_all_benchmarks.cjs
-```
+### 5.2 Automated & In-Showcase Benchmark Harnesses
+- **CLI Headless Benchmark Suite:** Runs all five comparative environments (`rockets_baseline`, `poc1`, `poc2`, `poc3`, `poc4`) under headless Playwright, performing continuous automated carve cycles, sampling frame times, triangles, and heap memory:
+  ```bash
+  node benchmarks/run_all_benchmarks.cjs
+  ```
+- **In-Showcase Parameterized Benchmark Suite (`pocs/index.html`):** Users can configure **Scale** (`10p`, `30p`, `50p`), **Resolution/Quality** (`low`, `medium`, `high`, `ultra`), and **Laser Brush Radius** (`40u–360u`) directly inside the Showcase UI and trigger `runAllModesBenchmark()`, which sequentially loads `poc1`–`poc4` with `?benchmark=true&scale=...&quality=...&radius=...&frames=150`, aggregates `BENCHMARK_COMPLETE` postMessage telemetry, and updates the live Comparison Matrix and summary cards.
 
 ### 5.3 Benchmark Telemetry Inventory
 
@@ -202,13 +208,13 @@ node benchmarks/run_all_benchmarks.cjs
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Status** | Verified Legacy | Verified / Next-Gen | Verified / Next-Gen | Verified / Next-Gen | Verified / Next-Gen |
 | **Average FPS** | $58.8\text{ FPS}$ | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
-| **Average Frame Time** | $17.00\text{ ms}$ | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** |
+| **Average Frame Time** | $17.00\text{ ms}$ | **$16.67\text{ ms}$** | **$16.66\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** |
 | **P99 Frame Time** | $16.80\text{ ms}$ | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** |
-| **Carve Latency** | $1.73\text{ ms}$ | **$3.60\text{ ms}$** | **$3.13\text{ ms}$** | $7.65\text{ ms}$ | **$0.08\text{ ms}$** |
+| **Carve Latency** | $1.78\text{ ms}$ | **$3.43\text{ ms}$** | **$2.72\text{ ms}$** | $6.88\text{ ms}$ | **$0.07\text{ ms}$** |
 | **Visual-Collision Error** | $> 30.00\text{u}$ | **$0.00\text{u}$** | **$0.00\text{u}$** | **$0.00\text{u}$** | **$0.00\text{u}$** |
-| **Active Triangles** | 6,936 | 69,544 | 36,700 | 29,536 | 1,244 (Proxy) |
-| **Draw Calls** | 1 | 139 | 95 | 27 | 15 |
-| **JS Heap Memory** | $28.04\text{ MB}$ | $28.04\text{ MB}$ | **$16.31\text{ MB}$** | **$14.50\text{ MB}$** | **$14.50\text{ MB}$** |
+| **Active Triangles** | 6,936 | 69,480 | 36,680 | 33,529 | 1,244 (Proxy) |
+| **Draw Calls** | 1 | 139 | 95 | 29 | 15 |
+| **JS Heap Memory** | $28.04\text{ MB}$ | $26.32\text{ MB}$ | **$19.55\text{ MB}$** | **$18.41\text{ MB}$** | **$19.55\text{ MB}$** |
 
 ---
 
@@ -285,3 +291,4 @@ python C:\Users\eitama\.gemini\config\skills\knowledge-base\scripts\kb_housekeep
 | `reports/COMPARATIVE_SYNTHESIS_AND_RECOMMENDATIONS.md` | Comparative synthesis, multiplayer P2P replication specs, and decision blueprint |
 | `scratch/verify_task4.cjs` | Verification test script for headless testing and validation |
 | `scratch/verify_task4.js` | Verification script for browser automation validation |
+| `scratch/verify_tasks_1_to_4.cjs` | End-to-end Playwright verification suite covering Tasks 1–4 (controls, PoC3 65+ sweeps, 50P quality & Showcase benchmark runner, PoC4 smoothness) |

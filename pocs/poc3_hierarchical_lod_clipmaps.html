@@ -49,22 +49,53 @@
 
         let currentRadius = 2800;
         let planetaryMacroShell = null;
-        const MAX_SHADER_PORTALS = 48;
+        const MAX_PORTALS = 4096;
         const portalHoles = []; // Array of { point: Vector3, radius: number }
+        let nextPortalIndex = 0;
 
+        // Clustered 3D Spatial Grid (32x32x32 cells x 16 portal IDs/cell in 1024x128 RGBA Float)
+        // + Exact Portal Sphere List (64x64 RGBA Float = 4,096 portals)
+        const PORTAL_GRID_RES = 32;
+        const portalGridData = new Float32Array(1024 * 128 * 4);
+        const portalGridTex = new THREE.DataTexture(portalGridData, 1024, 128, THREE.RGBAFormat, THREE.FloatType);
+        portalGridTex.minFilter = THREE.NearestFilter;
+        portalGridTex.magFilter = THREE.NearestFilter;
+        portalGridTex.wrapS = THREE.ClampToEdgeWrapping;
+        portalGridTex.wrapT = THREE.ClampToEdgeWrapping;
+        portalGridTex.flipY = false;
+        portalGridTex.needsUpdate = true;
+
+        const portalListData = new Float32Array(64 * 64 * 4);
+        const portalListTex = new THREE.DataTexture(portalListData, 64, 64, THREE.RGBAFormat, THREE.FloatType);
+        portalListTex.minFilter = THREE.NearestFilter;
+        portalListTex.magFilter = THREE.NearestFilter;
+        portalListTex.wrapS = THREE.ClampToEdgeWrapping;
+        portalListTex.wrapT = THREE.ClampToEdgeWrapping;
+        portalListTex.flipY = false;
+        portalListTex.needsUpdate = true;
+
+        const QUALITY_PRESETS_POC3 = {
+            low: { macroSegs: 80, cavernRes: 12 },
+            medium: { macroSegs: 120, cavernRes: 16 },
+            high: { macroSegs: 168, cavernRes: 22 },
+            ultra: { macroSegs: 224, cavernRes: 28 }
+        };
+        let macroSegments = 168;
         // Subterranean high-density voxel chunks (spawned on-demand around portal openings & caverns)
-        const SUBTERRANEAN_CHUNK_RES = 16;
+        let SUBTERRANEAN_CHUNK_RES = 22;
         let SUBTERRANEAN_CHUNK_SIZE = 448;
         let SUBTERRANEAN_CELL_SIZE = SUBTERRANEAN_CHUNK_SIZE / SUBTERRANEAN_CHUNK_RES;
 
         const subterraneanChunks = new Map();
         const activeSubterraneanMeshes = [];
 
-        // High-res Triplanar Materials (Macro crust supports shader portal cutouts; Cavern supports vertex-color armor)
+        // High-res Triplanar Materials (Macro crust supports clustered portal cutouts; Cavern supports vertex-color armor)
         const macroCrustMaterial = createTriplanarAsteroidMaterial({
             vertexColors: false,
             hasPortals: true,
-            radius: currentRadius
+            radius: currentRadius,
+            portalGridTex,
+            portalListTex
         });
         const cavernMaterial = createTriplanarAsteroidMaterial({
             vertexColors: true,
@@ -74,52 +105,88 @@
 
         function evalMacroRadiusAt(wx, wy, wz) {
             const len = Math.sqrt(wx * wx + wy * wy + wz * wz) || 1.0;
-            const sx = (wx / len) * currentRadius;
-            const sy = (wy / len) * currentRadius;
-            const sz = (wz / len) * currentRadius;
-            const n = (noise.fbm(sx * 0.0014, sy * 0.0014, sz * 0.0014, 3) - 0.35) * (currentRadius * 0.18);
+            const freq = 0.0014 * 2800.0;
+            const nx = (wx / len) * freq;
+            const ny = (wy / len) * freq;
+            const nz = (wz / len) * freq;
+            const n = (noise.fbm(nx, ny, nz, 3) - 0.35) * (currentRadius * 0.18);
             return currentRadius + n;
         }
 
-        function syncPortalUniforms() {
-            const uniforms = macroCrustMaterial.userData.shaderUniforms;
-            const arr = uniforms.uPortals.value;
-            const count = Math.min(MAX_SHADER_PORTALS, portalHoles.length);
-            uniforms.uPortalCount.value = count;
-            for (let i = 0; i < count; i++) {
-                const p = portalHoles[i];
-                arr[i].set(p.point.x, p.point.y, p.point.z, p.radius);
-            }
-            for (let i = count; i < MAX_SHADER_PORTALS; i++) {
-                arr[i].set(0, 0, 0, -1);
-            }
+        function clearPortalGrid() {
+            portalHoles.length = 0;
+            nextPortalIndex = 0;
+            portalGridData.fill(0);
+            portalListData.fill(0);
+            portalGridTex.needsUpdate = true;
+            portalListTex.needsUpdate = true;
+            macroCrustMaterial.userData.shaderUniforms.uPortalDomainHalf.value = currentRadius * 1.30;
         }
 
         function registerPortalHole(point, brushRadius) {
-            const portalR = brushRadius * 1.02;
+            const cutRadius = brushRadius * 0.88;
             const distFromSurface = Math.abs(point.length() - evalMacroRadiusAt(point.x, point.y, point.z));
             // Only cut a surface portal in the macro crust if the carve sphere intersects the surface crust
-            if (distFromSurface > portalR * 1.25) return;
+            if (distFromSurface > brushRadius * 1.35) return;
 
             for (let i = 0; i < portalHoles.length; i++) {
-                if (portalHoles[i].point.distanceTo(point) < portalR * 0.45 && portalHoles[i].radius >= portalR * 0.9) {
+                if (portalHoles[i].point.distanceTo(point) < cutRadius * 0.40 && portalHoles[i].radius >= cutRadius * 0.92) {
                     return; // Already covered by an existing portal cutout
                 }
             }
 
-            if (portalHoles.length >= MAX_SHADER_PORTALS) {
-                // Merge into closest existing portal to keep slots bounded
-                let bestIdx = 0;
-                let bestDist = Infinity;
-                for (let i = 0; i < portalHoles.length; i++) {
-                    const d = portalHoles[i].point.distanceTo(point);
-                    if (d < bestDist) { bestDist = d; bestIdx = i; }
-                }
-                portalHoles[bestIdx].radius = Math.max(portalHoles[bestIdx].radius, bestDist + portalR * 0.5);
+            const portalSlot = nextPortalIndex % MAX_PORTALS;
+            nextPortalIndex++;
+            const portalObj = { point: point.clone(), radius: cutRadius };
+            if (portalHoles.length < MAX_PORTALS) {
+                portalHoles.push(portalObj);
             } else {
-                portalHoles.push({ point: point.clone(), radius: portalR });
+                portalHoles[portalSlot] = portalObj;
             }
-            syncPortalUniforms();
+
+            const listBase = portalSlot * 4;
+            portalListData[listBase] = point.x;
+            portalListData[listBase + 1] = point.y;
+            portalListData[listBase + 2] = point.z;
+            portalListData[listBase + 3] = cutRadius;
+            portalListTex.needsUpdate = true;
+
+            const portalId = portalSlot + 1.0;
+            const domainHalf = currentRadius * 1.30;
+            const domainSize = domainHalf * 2.0;
+            const minCX = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.x - cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
+            const maxCX = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.x + cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
+            const minCY = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.y - cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
+            const maxCY = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.y + cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
+            const minCZ = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.z - cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
+            const maxCZ = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.z + cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
+
+            for (let cz = minCZ; cz <= maxCZ; cz++) {
+                const tileX = cz % 8;
+                const tileY = Math.floor(cz / 8);
+                for (let cy = minCY; cy <= maxCY; cy++) {
+                    const baseY = tileY * 32 + cy;
+                    for (let cx = minCX; cx <= maxCX; cx++) {
+                        const baseX = (tileX * 32 + cx) * 4;
+                        const cellBaseIdx = (baseY * 1024 + baseX) * 4;
+                        let placed = false;
+                        for (let s = 0; s < 16; s++) {
+                            if (portalGridData[cellBaseIdx + s] === 0.0) {
+                                portalGridData[cellBaseIdx + s] = portalId;
+                                placed = true;
+                                break;
+                            }
+                        }
+                        if (!placed) {
+                            for (let s = 0; s < 15; s++) {
+                                portalGridData[cellBaseIdx + s] = portalGridData[cellBaseIdx + s + 1];
+                            }
+                            portalGridData[cellBaseIdx + 15] = portalId;
+                        }
+                    }
+                }
+            }
+            portalGridTex.needsUpdate = true;
         }
 
         // High-Resolution Smooth Macro Planetary Shell
@@ -130,8 +197,7 @@
                 planetaryMacroShell = null;
             }
 
-            const segments = 112;
-            const geo = new THREE.SphereGeometry(currentRadius, segments, segments);
+            const geo = new THREE.SphereGeometry(currentRadius, macroSegments, macroSegments);
             const pos = geo.attributes.position;
 
             for (let i = 0; i < pos.count; i++) {
@@ -147,7 +213,6 @@
             planetaryMacroShell = new THREE.Mesh(geo, macroCrustMaterial);
             planetaryMacroShell.userData = { isMacroShell: true };
             scene.add(planetaryMacroShell);
-            syncPortalUniforms();
         }
 
         // Subterranean Voxel Chunk (Dual-Grid Surface Nets mesher restricted to carved cavern manifolds)
@@ -180,11 +245,12 @@
                         for (let px = 0; px < pRes; px++) {
                             const wx = this.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
                             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-                            const surfaceD = dist - (evalMacroRadiusAt(wx, wy, wz) - 20.0);
+                            const surfaceD = dist - (evalMacroRadiusAt(wx, wy, wz) - 4.0);
 
                             this.voxelData[idx] = surfaceD;
                             this.carveField[idx] = -SUBTERRANEAN_CELL_SIZE * 4.0;
-                            this.materialData[idx] = (surfaceD < -SUBTERRANEAN_CELL_SIZE && Math.sin(wx * 0.008) * Math.cos(wy * 0.008) > 0.78) ? 2 : 1;
+                            const oreFreq = 0.008 * (2800.0 / currentRadius);
+                            this.materialData[idx] = (surfaceD < -SUBTERRANEAN_CELL_SIZE && Math.sin(wx * oreFreq) * Math.cos(wy * oreFreq) > 0.78) ? 2 : 1;
                             idx++;
                         }
                     }
@@ -297,7 +363,7 @@
                             const vIdx = vertices.length / 3;
                             cellVertMap[cx + cy * cellCount + cz * cellCount2] = vIdx;
                             // Flag untouched exterior crust cells so we don't z-fight with smooth macro shell
-                            vertIsExteriorCrust.push(maxCarveVal < -SUBTERRANEAN_CELL_SIZE * 0.4);
+                            vertIsExteriorCrust.push(maxCarveVal < -SUBTERRANEAN_CELL_SIZE * 0.85);
 
                             vertices.push(wx, wy, wz);
                             normals.push(unx, uny, unz);
@@ -504,6 +570,47 @@
             });
         }
 
+        function applyQualityConfigPoC3(qualityKey) {
+            const preset = QUALITY_PRESETS_POC3[qualityKey] || QUALITY_PRESETS_POC3.high;
+            macroSegments = preset.macroSegs;
+            SUBTERRANEAN_CHUNK_RES = preset.cavernRes;
+            SUBTERRANEAN_CHUNK_SIZE = currentRadius * 0.16;
+            SUBTERRANEAN_CELL_SIZE = SUBTERRANEAN_CHUNK_SIZE / SUBTERRANEAN_CHUNK_RES;
+        }
+
+        function buildStarterTunnelPoC3() {
+            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
+            const surfPt = findSurfacePoint(
+                (wx, wy, wz) => Math.hypot(wx, wy, wz) - evalMacroRadiusAt(wx, wy, wz),
+                tunnelDir,
+                currentRadius * 0.6,
+                currentRadius * 1.4
+            );
+            const scaleFactor = currentRadius / 2800.0;
+            carveSpherePoC3(surfPt, 230 * scaleFactor);
+            carveSpherePoC3(surfPt.clone().addScaledVector(tunnelDir, -160 * scaleFactor), 210 * scaleFactor);
+            reinforceSpherePoC3(surfPt.clone().addScaledVector(tunnelDir, -150 * scaleFactor), 250 * scaleFactor);
+        }
+
+        function rebuildScenePoC3() {
+            clearPortalGrid();
+            activeSubterraneanMeshes.forEach(m => {
+                sandbox.scene.remove(m);
+                m.geometry.dispose();
+            });
+            activeSubterraneanMeshes.length = 0;
+            subterraneanChunks.clear();
+
+            SUBTERRANEAN_CHUNK_SIZE = currentRadius * 0.16;
+            SUBTERRANEAN_CELL_SIZE = SUBTERRANEAN_CHUNK_SIZE / SUBTERRANEAN_CHUNK_RES;
+            macroCrustMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
+            macroCrustMaterial.userData.shaderUniforms.uPortalDomainHalf.value = currentRadius * 1.30;
+            cavernMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
+
+            buildMacroCrust(sandbox.scene);
+            buildStarterTunnelPoC3();
+        }
+
         // Shared Sandbox Setup
         const sandbox = new PlanetaryBaseSandbox({
             pocId: 'poc3',
@@ -521,6 +628,7 @@
                 list.push(...activeSubterraneanMeshes);
                 return list;
             },
+            getCellSize: () => `${SUBTERRANEAN_CELL_SIZE.toFixed(1)}u (${macroSegments}seg / ${SUBTERRANEAN_CHUNK_RES}³)`,
 
             // Portal-aware raycast so mining beam passes straight through shader-clipped portal openings
             customRaycast: (raycaster, camera, mousePos) => {
@@ -532,7 +640,7 @@
                 for (let i = 0; i < hits.length; i++) {
                     const h = hits[i];
                     if (h.object === planetaryMacroShell) {
-                        const insideCutout = portalHoles.some(p => h.point.distanceTo(p.point) < p.radius * 0.90);
+                        const insideCutout = portalHoles.some(p => h.point.distanceTo(p.point) < p.radius);
                         if (insideCutout) continue; // Ignore discarded portal pixels
                     }
                     return h;
@@ -563,20 +671,12 @@
 
             onScaleChange: (scaleKey, radius) => {
                 currentRadius = radius;
-                portalHoles.length = 0;
-                activeSubterraneanMeshes.forEach(m => {
-                    sandbox.scene.remove(m);
-                    m.geometry.dispose();
-                });
-                activeSubterraneanMeshes.length = 0;
-                subterraneanChunks.clear();
+                rebuildScenePoC3();
+            },
 
-                SUBTERRANEAN_CHUNK_SIZE = currentRadius * 0.16;
-                SUBTERRANEAN_CELL_SIZE = SUBTERRANEAN_CHUNK_SIZE / SUBTERRANEAN_CHUNK_RES;
-                macroCrustMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
-                cavernMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
-
-                buildMacroCrust(sandbox.scene);
+            onQualityChange: (qualityKey) => {
+                applyQualityConfigPoC3(qualityKey);
+                rebuildScenePoC3();
             },
 
             onToggleWireframe: (enabled) => {
@@ -592,20 +692,10 @@
             }
         });
 
-        buildMacroCrust(sandbox.scene);
-        // Starter Portal Entrance & Deep Cavern + Reinforced Bulkhead Wall
-        {
-            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
-            const surfPt = findSurfacePoint(
-                (wx, wy, wz) => Math.hypot(wx, wy, wz) - evalMacroRadiusAt(wx, wy, wz),
-                tunnelDir,
-                currentRadius * 0.6,
-                currentRadius * 1.4
-            );
-            carveSpherePoC3(surfPt, 230);
-            carveSpherePoC3(surfPt.clone().addScaledVector(tunnelDir, -160), 210);
-            reinforceSpherePoC3(surfPt.clone().addScaledVector(tunnelDir, -150), 250);
-        }
+        currentRadius = sandbox.currentRadius;
+        applyQualityConfigPoC3(sandbox.currentQuality);
+        rebuildScenePoC3();
+        sandbox.updateCellSizeLabel();
     </script>
 </body>
 </html>

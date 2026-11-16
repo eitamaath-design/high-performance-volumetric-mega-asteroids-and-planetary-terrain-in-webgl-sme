@@ -3,7 +3,7 @@
  * For Rockets Managed by Anti-Gravity (PoCs 1-4 & Baseline)
  * 
  * Features:
- * - Orbit & Sculpt Mode (Click/Drag Laser Sculpting + Right-Drag Orbit)
+ * - Decoupled Controls: Mouse Orbit Rotation + WASD/QE Free Camera + Spacebar Laser
  * - Starfighter Flight Mode (WASD + Mouse Flight + Spacebar Laser + Swept Collision)
  * - 5 Interactive Tools:
  *     [1] Continuous Spherical Carve Laser
@@ -11,6 +11,7 @@
  *     [3] Raider Laser (Blocked by reinforced bulkheads)
  *     [4] Heavy Breach Charge (Breaches bulkheads)
  *     [5] Place Base Machinery (Weapons, Shield, Foundry, Refinery) + Exterior Nodes
+ * - Resolution / Quality Presets (Low, Medium, High, Ultra)
  * - X-Ray Cross-Section Slicer (THREE.Plane clipping)
  * - 0.00u Visual-to-Collision Alignment Inspector
  * - 20-30+ Player Planetary Sizing Selector (R=2800u, R=4800u, R=8000u)
@@ -32,7 +33,11 @@ export function createTriplanarAsteroidMaterial(options = {}) {
     const uniforms = {
         uAsteroidRadius: { value: defaultRadius },
         uPortals: { value: Array.from({ length: 48 }, () => new THREE.Vector4(0, 0, 0, -1)) },
-        uPortalCount: { value: 0 }
+        uPortalCount: { value: 0 },
+        uPortalGridTex: { value: options.portalGridTex || null },
+        uPortalListTex: { value: options.portalListTex || null },
+        uUsePortalTex: { value: (options.portalGridTex && options.portalListTex) ? 1.0 : 0.0 },
+        uPortalDomainHalf: { value: defaultRadius * 1.30 }
     };
 
     const mat = new THREE.MeshStandardMaterial({
@@ -52,6 +57,10 @@ export function createTriplanarAsteroidMaterial(options = {}) {
         if (hasPortals) {
             shader.uniforms.uPortals = uniforms.uPortals;
             shader.uniforms.uPortalCount = uniforms.uPortalCount;
+            shader.uniforms.uPortalGridTex = uniforms.uPortalGridTex;
+            shader.uniforms.uPortalListTex = uniforms.uPortalListTex;
+            shader.uniforms.uUsePortalTex = uniforms.uUsePortalTex;
+            shader.uniforms.uPortalDomainHalf = uniforms.uPortalDomainHalf;
         }
 
         shader.vertexShader = shader.vertexShader
@@ -80,6 +89,39 @@ export function createTriplanarAsteroidMaterial(options = {}) {
             fragHeader += `
             uniform vec4 uPortals[48];
             uniform int uPortalCount;
+            uniform sampler2D uPortalGridTex;
+            uniform sampler2D uPortalListTex;
+            uniform float uUsePortalTex;
+            uniform float uPortalDomainHalf;
+
+            bool checkPortalId(float id, vec3 worldPos) {
+                if (id <= 0.0) return false;
+                float idx = id - 1.0;
+                vec2 listUV = vec2(mod(idx, 64.0) + 0.5, floor(idx / 64.0) + 0.5) / 64.0;
+                vec4 portal = texture2D(uPortalListTex, listUV);
+                return (portal.w > 0.0 && distance(worldPos, portal.xyz) < portal.w);
+            }
+
+            bool isInsideClusteredPortal(vec3 worldPos) {
+                vec3 uvw = (worldPos + uPortalDomainHalf) / (2.0 * uPortalDomainHalf);
+                if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) return false;
+                vec3 cell = clamp(floor(uvw * 32.0), vec3(0.0), vec3(31.0));
+                float baseX = (mod(cell.z, 8.0) * 32.0 + cell.x) * 4.0;
+                float baseY = floor(cell.z / 8.0) * 32.0 + cell.y;
+                for (int t = 0; t < 4; t++) {
+                    vec2 gridUV = vec2(baseX + float(t) + 0.5, baseY + 0.5) / vec2(1024.0, 128.0);
+                    vec4 ids = texture2D(uPortalGridTex, gridUV);
+                    if (ids.x <= 0.0) return false;
+                    if (checkPortalId(ids.x, worldPos)) return true;
+                    if (ids.y <= 0.0) return false;
+                    if (checkPortalId(ids.y, worldPos)) return true;
+                    if (ids.z <= 0.0) return false;
+                    if (checkPortalId(ids.z, worldPos)) return true;
+                    if (ids.w <= 0.0) return false;
+                    if (checkPortalId(ids.w, worldPos)) return true;
+                }
+                return false;
+            }
             `;
         }
 
@@ -142,10 +184,16 @@ export function createTriplanarAsteroidMaterial(options = {}) {
         let clipReplace = `#include <clipping_planes_fragment>`;
         if (hasPortals) {
             clipReplace += `
-            for (int i = 0; i < 48; i++) {
-                if (i >= uPortalCount) break;
-                if (uPortals[i].w > 0.0 && distance(vTriWorldPos, uPortals[i].xyz) < uPortals[i].w * 0.90) {
+            if (uUsePortalTex > 0.5) {
+                if (isInsideClusteredPortal(vTriWorldPos)) {
                     discard;
+                }
+            } else {
+                for (int i = 0; i < 48; i++) {
+                    if (i >= uPortalCount) break;
+                    if (uPortals[i].w > 0.0 && distance(vTriWorldPos, uPortals[i].xyz) < uPortals[i].w * 0.90) {
+                        discard;
+                    }
                 }
             }
             `;
@@ -265,12 +313,16 @@ export class PlanetaryBaseSandbox {
             pocId: 'poc1',
             pocTitle: 'Planetary Base Sandbox',
             defaultRadius: 2800,
+            defaultQuality: 'high',
             initialCameraDist: 5800,
             hasLocalCollisionMesh: true,
             onCarve: null,
             onReinforce: null,
             onBreach: null,
             onScaleChange: null,
+            onQualityChange: null,
+            getCellSize: null,
+            onBeforeRender: null,
             onToggleWireframe: null,
             onToggleXRay: null,
             getCollisionMesh: null,
@@ -279,9 +331,22 @@ export class PlanetaryBaseSandbox {
             checkMaterialAtHit: null
         }, config);
 
-        this.currentScaleKey = '10p'; // '10p'=2800u, '30p'=4800u, '50p'=8000u
-        this.currentRadius = this.config.defaultRadius;
-        this.brushRadius = 140.0; // Scalable carving radius
+        // Parse URL parameters for scale, quality, radius, benchmark frames
+        const params = new URLSearchParams(window.location.search);
+        this.isBenchmarkMode = params.get('benchmark') === 'true';
+        const urlScale = params.get('scale');
+        const urlQuality = params.get('quality');
+        const urlRadius = parseFloat(params.get('radius'));
+        const urlFrames = parseInt(params.get('frames'), 10);
+
+        const scaleRadii = { '10p': 2800, '30p': 4800, '50p': 8000 };
+        this.currentScaleKey = ['10p', '30p', '50p'].includes(urlScale) ? urlScale : '10p';
+        this.currentRadius = scaleRadii[this.currentScaleKey] || this.config.defaultRadius;
+        this.currentQuality = ['low', 'medium', 'high', 'ultra'].includes(urlQuality)
+            ? urlQuality
+            : (this.isBenchmarkMode ? 'medium' : (this.config.defaultQuality || 'high'));
+        this.brushRadius = (!isNaN(urlRadius) && urlRadius >= 40 && urlRadius <= 360) ? urlRadius : 140.0;
+        this.customBenchmarkFrames = (!isNaN(urlFrames) && urlFrames >= 30) ? urlFrames : 450;
 
         this.activeTool = 'carve'; // 'carve', 'reinforce', 'raider', 'breach', 'machinery'
         this.selectedMachinery = 'shield'; // 'weapons', 'shield', 'foundry', 'refinery'
@@ -291,7 +356,7 @@ export class PlanetaryBaseSandbox {
         this.xRayOffset = 0.0;
         this.showCollisionOverlay = true;
 
-        this.isMouseDown = false;
+        this.isSpaceDown = false;
         this.mousePos = new THREE.Vector2();
         this.raycaster = new THREE.Raycaster();
         this.lastCarveTick = 0;
@@ -313,10 +378,6 @@ export class PlanetaryBaseSandbox {
         this.placedMachinery = [];
         this.orbitalNodes = [];
 
-        // Benchmark flag
-        const params = new URLSearchParams(window.location.search);
-        this.isBenchmarkMode = params.get('benchmark') === 'true';
-
         this.initThree();
         this.initClippingPlanes();
         this.initLightingAndSky();
@@ -331,6 +392,8 @@ export class PlanetaryBaseSandbox {
             this.initAutomatedBenchmark();
         }
 
+        window.__SANDBOX__ = this;
+
         this.animate = this.animate.bind(this);
         requestAnimationFrame(this.animate);
     }
@@ -343,10 +406,11 @@ export class PlanetaryBaseSandbox {
 
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(0x04060c);
-        this.scene.fog = new THREE.FogExp2(0x04060c, 0.00004);
+        this.scene.fog = new THREE.FogExp2(0x04060c, 0.000025);
 
-        this.camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 5, 45000);
-        this.camera.position.set(0, this.currentRadius * 0.7, this.config.initialCameraDist);
+        this.camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 5, 75000);
+        const initCamZ = this.currentScaleKey === '10p' ? this.config.initialCameraDist : this.currentRadius * 2.1;
+        this.camera.position.set(0, this.currentRadius * 0.7, initCamZ);
 
         this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
         this.renderer.setSize(window.innerWidth, window.innerHeight);
@@ -357,7 +421,7 @@ export class PlanetaryBaseSandbox {
         this.controls = new OrbitControls(this.camera, this.renderer.domElement);
         this.controls.enableDamping = true;
         this.controls.dampingFactor = 0.05;
-        this.controls.maxDistance = 35000;
+        this.controls.maxDistance = 50000;
         this.controls.minDistance = 30;
 
         window.addEventListener('resize', () => {
@@ -600,13 +664,18 @@ export class PlanetaryBaseSandbox {
         `;
 
         this.hud.innerHTML = `
-            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1a3048; padding-bottom:8px; margin-bottom:10px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1a3048; padding-bottom:8px; margin-bottom:8px;">
                 <span style="font-weight:bold; color:#00f0ff; font-size:13px;">${this.config.pocTitle}</span>
                 <span id="hud-status" style="background:#003344; color:#00ffff; padding:2px 6px; border-radius:4px; font-size:10px;">INTERACTIVE</span>
             </div>
 
+            <!-- Controls Hint -->
+            <div style="background:rgba(0, 40, 60, 0.45); border:1px solid rgba(0, 240, 255, 0.22); border-radius:5px; padding:5px 8px; margin-bottom:8px; font-size:10px; color:#93c5fd; line-height:1.45;">
+                <b>Mouse Drag:</b> Rotate &bull; <b>WASD / Q E:</b> Move Camera &bull; <b>Space:</b> Fire Laser
+            </div>
+
             <!-- Tool Selector -->
-            <div style="margin-bottom:10px;">
+            <div style="margin-bottom:8px;">
                 <div style="color:#8bb0d0; font-size:11px; margin-bottom:4px; text-transform:uppercase;">Tactical Tools (Hotkeys 1-5):</div>
                 <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:5px;">
                     <button id="btn-tool-carve" class="hud-btn hud-btn-active" data-tool="carve" style="border:1px solid #00f0ff; background:#003344; color:#00ffff; padding:5px 8px; border-radius:4px; cursor:pointer; font-family:inherit; font-size:11px; text-align:left;">
@@ -631,15 +700,15 @@ export class PlanetaryBaseSandbox {
 
             <!-- Sliders & Modifiers -->
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                <span>Laser Radius: <b id="lbl-radius" style="color:#00ffff;">140u</b></span>
-                <input id="slider-radius" type="range" min="40" max="360" value="140" style="width:140px; accent-color:#00ffff; cursor:pointer;">
+                <span>Laser Radius: <b id="lbl-radius" style="color:#00ffff;">${this.brushRadius}u</b></span>
+                <input id="slider-radius" type="range" min="40" max="360" value="${this.brushRadius}" style="width:140px; accent-color:#00ffff; cursor:pointer;">
             </div>
 
             <!-- Planetary Scale Selector -->
-            <div style="margin-bottom:10px;">
+            <div style="margin-bottom:8px;">
                 <div style="color:#8bb0d0; font-size:11px; margin-bottom:4px;">Scale:</div>
                 <div style="display:flex; gap:4px;">
-                    <button id="btn-scale-10p" class="hud-scale-btn" data-scale="10p" style="flex:1; border:1px solid #00f0ff; background:#003344; color:#00ffff; padding:4px; border-radius:4px; font-size:10px; cursor:pointer;">
+                    <button id="btn-scale-10p" class="hud-scale-btn" data-scale="10p" style="flex:1; border:1px solid #445566; background:#111b26; color:#88a0b5; padding:4px; border-radius:4px; font-size:10px; cursor:pointer;">
                         10P (2800u)
                     </button>
                     <button id="btn-scale-30p" class="hud-scale-btn" data-scale="30p" style="flex:1; border:1px solid #445566; background:#111b26; color:#88a0b5; padding:4px; border-radius:4px; font-size:10px; cursor:pointer;">
@@ -651,13 +720,32 @@ export class PlanetaryBaseSandbox {
                 </div>
             </div>
 
+            <!-- Resolution / Quality Selector -->
+            <div style="margin-bottom:8px;">
+                <div style="color:#8bb0d0; font-size:11px; margin-bottom:4px;">Resolution / Quality:</div>
+                <div style="display:flex; gap:4px;">
+                    <button id="btn-quality-low" class="hud-quality-btn" data-quality="low" style="flex:1; border:1px solid #445566; background:#111b26; color:#88a0b5; padding:4px; border-radius:4px; font-size:10px; cursor:pointer;">
+                        Low
+                    </button>
+                    <button id="btn-quality-medium" class="hud-quality-btn" data-quality="medium" style="flex:1; border:1px solid #445566; background:#111b26; color:#88a0b5; padding:4px; border-radius:4px; font-size:10px; cursor:pointer;">
+                        Med
+                    </button>
+                    <button id="btn-quality-high" class="hud-quality-btn" data-quality="high" style="flex:1; border:1px solid #445566; background:#111b26; color:#88a0b5; padding:4px; border-radius:4px; font-size:10px; cursor:pointer;">
+                        High
+                    </button>
+                    <button id="btn-quality-ultra" class="hud-quality-btn" data-quality="ultra" style="flex:1; border:1px solid #445566; background:#111b26; color:#88a0b5; padding:4px; border-radius:4px; font-size:10px; cursor:pointer;">
+                        Ultra
+                    </button>
+                </div>
+            </div>
+
             <!-- Mode & View Toggles -->
             <div style="display:flex; gap:5px; margin-bottom:10px;">
                 <button id="btn-toggle-flight" style="flex:1; border:1px solid #3b82f6; background:#1e293b; color:#93c5fd; padding:5px; border-radius:4px; font-size:10px; cursor:pointer;">
-                    Fly Ship (WASD)
+                    Fly Ship [F]
                 </button>
                 <button id="btn-toggle-wireframe" style="flex:1; border:1px solid #475569; background:#1e293b; color:#94a3b8; padding:5px; border-radius:4px; font-size:10px; cursor:pointer;">
-                    Wireframe [W]
+                    Wireframe [V]
                 </button>
                 <button id="btn-toggle-xray" style="flex:1; border:1px solid #475569; background:#1e293b; color:#94a3b8; padding:5px; border-radius:4px; font-size:10px; cursor:pointer;">
                     X-Ray Slicer [X]
@@ -669,7 +757,7 @@ export class PlanetaryBaseSandbox {
                 <div style="display:flex; justify-content:space-between; font-size:10px; color:#6ee7b7; margin-bottom:2px;">
                     <span>Slicer Plane Y:</span><span id="lbl-xray-val">0u</span>
                 </div>
-                <input id="slider-xray" type="range" min="-3000" max="3000" value="0" style="width:100%; accent-color:#10b981; cursor:pointer;">
+                <input id="slider-xray" type="range" min="${-this.currentRadius}" max="${this.currentRadius}" value="0" style="width:100%; accent-color:#10b981; cursor:pointer;">
             </div>
 
             <!-- Live Telemetry -->
@@ -685,6 +773,10 @@ export class PlanetaryBaseSandbox {
                 <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
                     <span>Carve Latency:</span>
                     <span id="tel-carve-dur" style="color:#ffcc00; font-weight:bold;">0.00 ms</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
+                    <span>Voxel Cell / Res:</span>
+                    <span id="tel-cell-size" style="color:#a7f3d0;">--</span>
                 </div>
                 <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
                     <span>Triangles / Draws:</span>
@@ -703,8 +795,46 @@ export class PlanetaryBaseSandbox {
         `;
         document.body.appendChild(this.hud);
 
+        // Sync initial active button highlights for scale & quality
+        this.syncScaleButtons();
+        this.syncQualityButtons();
+        this.updateCellSizeLabel();
+
         // Bind HUD events
         this.bindHUDEvents();
+    }
+
+    syncScaleButtons() {
+        if (!this.hud) return;
+        const scaleBtns = this.hud.querySelectorAll('.hud-scale-btn');
+        scaleBtns.forEach(b => {
+            const isMatch = b.getAttribute('data-scale') === this.currentScaleKey;
+            b.style.border = isMatch ? '1px solid #00f0ff' : '1px solid #445566';
+            b.style.background = isMatch ? '#003344' : '#111b26';
+            b.style.color = isMatch ? '#00ffff' : '#88a0b5';
+        });
+    }
+
+    syncQualityButtons() {
+        if (!this.hud) return;
+        const qualityBtns = this.hud.querySelectorAll('.hud-quality-btn');
+        qualityBtns.forEach(b => {
+            const isMatch = b.getAttribute('data-quality') === this.currentQuality;
+            b.style.border = isMatch ? '1px solid #10b981' : '1px solid #445566';
+            b.style.background = isMatch ? '#064e3b' : '#111b26';
+            b.style.color = isMatch ? '#6ee7b7' : '#88a0b5';
+        });
+    }
+
+    updateCellSizeLabel() {
+        if (!this.hud) return;
+        const el = this.hud.querySelector('#tel-cell-size');
+        if (!el) return;
+        if (this.config.getCellSize) {
+            el.innerText = `${this.config.getCellSize()} [${this.currentQuality.toUpperCase()}]`;
+        } else {
+            el.innerText = this.currentQuality.toUpperCase();
+        }
     }
 
     bindHUDEvents() {
@@ -743,6 +873,15 @@ export class PlanetaryBaseSandbox {
             });
         });
 
+        // Quality Buttons
+        const qualityBtns = hud.querySelectorAll('.hud-quality-btn');
+        qualityBtns.forEach(btn => {
+            btn.addEventListener('click', () => {
+                const quality = btn.getAttribute('data-quality');
+                this.setQuality(quality);
+            });
+        });
+
         // Mode Toggles
         hud.querySelector('#btn-toggle-flight').addEventListener('click', () => this.toggleFlightMode());
         hud.querySelector('#btn-toggle-wireframe').addEventListener('click', () => this.toggleWireframe());
@@ -757,22 +896,48 @@ export class PlanetaryBaseSandbox {
             if (this.config.onToggleXRay) this.config.onToggleXRay(this.isXRay, this.clipPlane);
         });
 
-        // Keyboard Shortcuts
+        // Keyboard Shortcuts (Decoupled: Spacebar fires laser, WASD moves camera, V toggles wireframe)
         window.addEventListener('keydown', (e) => {
-            if (e.target.tagName === 'INPUT') return;
-            this.keys[e.key.toLowerCase()] = true;
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+            const k = e.key.toLowerCase();
+            this.keys[k] = true;
+
+            if (e.code === 'Space' || e.key === ' ') {
+                e.preventDefault();
+                if (!this.isSpaceDown) {
+                    this.isSpaceDown = true;
+                    if (!this.isFlightMode && !this.isBenchmarkMode) {
+                        this.executeActiveTool();
+                    }
+                }
+                return;
+            }
+
             if (e.key === '1') this.setActiveTool('carve');
             if (e.key === '2') this.setActiveTool('reinforce');
             if (e.key === '3') this.setActiveTool('raider');
             if (e.key === '4') this.setActiveTool('breach');
             if (e.key === '5') this.setActiveTool('machinery');
-            if (e.key.toLowerCase() === 'w') this.toggleWireframe();
-            if (e.key.toLowerCase() === 'x') this.toggleXRay();
-            if (e.key.toLowerCase() === 'f') this.toggleFlightMode();
+            if (k === 'v') this.toggleWireframe();
+            if (k === 'x') this.toggleXRay();
+            if (k === 'f') this.toggleFlightMode();
         });
 
         window.addEventListener('keyup', (e) => {
-            this.keys[e.key.toLowerCase()] = false;
+            const k = e.key.toLowerCase();
+            this.keys[k] = false;
+            if (e.code === 'Space' || e.key === ' ') {
+                this.isSpaceDown = false;
+                this.laserBeam.visible = false;
+                this.sparkPoints.visible = false;
+            }
+        });
+
+        window.addEventListener('blur', () => {
+            this.keys = {};
+            this.isSpaceDown = false;
+            this.laserBeam.visible = false;
+            this.sparkPoints.visible = false;
         });
     }
 
@@ -802,7 +967,17 @@ export class PlanetaryBaseSandbox {
         }
     }
 
-    setScale(scaleKey) {
+    async setQuality(qualityKey) {
+        if (!['low', 'medium', 'high', 'ultra'].includes(qualityKey)) return;
+        this.currentQuality = qualityKey;
+        this.syncQualityButtons();
+        if (this.config.onQualityChange) {
+            await this.config.onQualityChange(qualityKey);
+        }
+        this.updateCellSizeLabel();
+    }
+
+    async setScale(scaleKey) {
         this.currentScaleKey = scaleKey;
         const scales = {
             '10p': { r: 2800, name: '10 Players (R=2800u)' },
@@ -812,14 +987,7 @@ export class PlanetaryBaseSandbox {
         const info = scales[scaleKey] || scales['10p'];
         this.currentRadius = info.r;
 
-        // Update HUD buttons
-        const scaleBtns = this.hud.querySelectorAll('.hud-scale-btn');
-        scaleBtns.forEach(b => {
-            const isMatch = b.getAttribute('data-scale') === scaleKey;
-            b.style.border = isMatch ? '1px solid #00f0ff' : '1px solid #445566';
-            b.style.background = isMatch ? '#003344' : '#111b26';
-            b.style.color = isMatch ? '#00ffff' : '#88a0b5';
-        });
+        this.syncScaleButtons();
 
         // Update X-Ray Slider range
         const sliderXRay = this.hud.querySelector('#slider-xray');
@@ -841,8 +1009,9 @@ export class PlanetaryBaseSandbox {
         });
 
         if (this.config.onScaleChange) {
-            this.config.onScaleChange(scaleKey, this.currentRadius);
+            await this.config.onScaleChange(scaleKey, this.currentRadius);
         }
+        this.updateCellSizeLabel();
     }
 
     toggleFlightMode() {
@@ -851,7 +1020,7 @@ export class PlanetaryBaseSandbox {
         if (this.isFlightMode) {
             btn.style.background = '#2563eb';
             btn.style.color = '#ffffff';
-            btn.innerText = 'Exit Flight (Orbit)';
+            btn.innerText = 'Exit Flight [F]';
             this.controls.enabled = false;
             this.shipGroup.visible = true;
 
@@ -862,7 +1031,7 @@ export class PlanetaryBaseSandbox {
         } else {
             btn.style.background = '#1e293b';
             btn.style.color = '#93c5fd';
-            btn.innerText = 'Fly Ship (WASD)';
+            btn.innerText = 'Fly Ship [F]';
             this.controls.enabled = true;
             this.shipGroup.visible = false;
             this.camera.position.set(0, this.currentRadius * 0.7, this.currentRadius * 2.1);
@@ -902,13 +1071,9 @@ export class PlanetaryBaseSandbox {
     initControls() {
         const dom = this.renderer.domElement;
 
+        // Mouse strictly handles camera orbit/pan/zoom & aim tracking (never fires laser)
         dom.addEventListener('pointerdown', (e) => {
-            // Left click = 0
-            if (e.button === 0) {
-                this.isMouseDown = true;
-                this.updateMousePos(e);
-                this.executeActiveTool();
-            }
+            this.updateMousePos(e);
         });
 
         dom.addEventListener('pointermove', (e) => {
@@ -916,34 +1081,46 @@ export class PlanetaryBaseSandbox {
             if (!this.isFlightMode && !this.isBenchmarkMode) {
                 this.updateBrushPreview();
             }
-            if (this.isMouseDown && !this.isFlightMode) {
-                const now = performance.now();
-                if (now - this.lastCarveTick >= this.carveTickInterval) {
-                    this.executeActiveTool();
-                }
-            }
         });
 
         dom.addEventListener('pointerleave', () => {
             if (this.brushCursorMesh) this.brushCursorMesh.visible = false;
         });
+    }
 
-        dom.addEventListener('pointerup', (e) => {
-            if (e.button === 0) {
-                this.isMouseDown = false;
-                this.laserBeam.visible = false;
-                this.sparkPoints.visible = false;
-            }
-        });
+    updateCameraWASD(dt) {
+        const moveForward = (this.keys['w'] || this.keys['arrowup'] ? 1 : 0) - (this.keys['s'] || this.keys['arrowdown'] ? 1 : 0);
+        const moveRight = (this.keys['d'] || this.keys['arrowright'] ? 1 : 0) - (this.keys['a'] || this.keys['arrowleft'] ? 1 : 0);
+        const moveUp = (this.keys['e'] ? 1 : 0) - (this.keys['q'] ? 1 : 0);
 
-        dom.addEventListener('contextmenu', (e) => {
-            // Allow right click to orbit freely without tool interference
-            if (this.isMouseDown) {
-                this.isMouseDown = false;
-                this.laserBeam.visible = false;
-                this.sparkPoints.visible = false;
+        if (moveForward === 0 && moveRight === 0 && moveUp === 0) return false;
+
+        const forward = new THREE.Vector3();
+        this.camera.getWorldDirection(forward);
+        const right = new THREE.Vector3().crossVectors(forward, this.camera.up).normalize();
+        const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+
+        const speed = Math.max(400, this.currentRadius * 0.55) * (this.keys['shift'] ? 2.2 : 1.0);
+        const forwardDelta = forward.clone().multiplyScalar(moveForward * speed * dt);
+        const lateralDelta = new THREE.Vector3()
+            .addScaledVector(right, moveRight * speed * dt)
+            .addScaledVector(up, moveUp * speed * dt);
+
+        const prevProj = this.controls.target.clone().sub(this.camera.position).dot(forward);
+        const minFollowDist = Math.min(Math.max(prevProj, this.controls.minDistance + 10), Math.max(220, this.currentRadius * 0.15));
+
+        this.camera.position.add(forwardDelta).add(lateralDelta);
+        this.controls.target.add(lateralDelta);
+
+        if (moveForward < 0) {
+            this.controls.target.add(forwardDelta);
+        } else if (moveForward > 0) {
+            const newProj = this.controls.target.clone().sub(this.camera.position).dot(forward);
+            if (newProj < minFollowDist) {
+                this.controls.target.addScaledVector(forward, minFollowDist - newProj);
             }
-        });
+        }
+        return true;
     }
 
     updateBrushPreview() {
@@ -1202,6 +1379,9 @@ export class PlanetaryBaseSandbox {
                 case 'SET_SCALE':
                     this.setScale(data.scale);
                     break;
+                case 'SET_QUALITY':
+                    this.setQuality(data.quality);
+                    break;
                 case 'TOGGLE_WIREFRAME':
                     this.toggleWireframe();
                     break;
@@ -1221,6 +1401,10 @@ export class PlanetaryBaseSandbox {
                 case 'PLACE_MACHINERY_DEMO':
                     this.setActiveTool('machinery');
                     this.simulateRandomCarve();
+                    break;
+                case 'START_BENCHMARK':
+                    this.isBenchmarkMode = true;
+                    this.initAutomatedBenchmark(data.frames);
                     break;
             }
         });
@@ -1244,13 +1428,21 @@ export class PlanetaryBaseSandbox {
         this.executeActiveTool(hit);
     }
 
-    initAutomatedBenchmark() {
+    initAutomatedBenchmark(overrideFrames = null) {
         console.log(`[PlanetaryBaseSandbox] Initializing Automated Benchmark Mode for ${this.config.pocId}...`);
+        this.benchmarkDone = false;
         this.benchmarkFrames = 0;
-        this.benchmarkMaxFrames = 450;
-        this.benchmarkCarveTicks = [60, 120, 180, 240, 300, 360];
+        this.benchmarkMaxFrames = overrideFrames || this.customBenchmarkFrames || 450;
+        const nTicks = 6;
+        this.benchmarkCarveTicks = this.benchmarkMaxFrames >= 400
+            ? [60, 120, 180, 240, 300, 360]
+            : Array.from({ length: nTicks }, (_, i) => Math.max(15, Math.round(((i + 1) / (nTicks + 1)) * this.benchmarkMaxFrames)));
         this.benchmarkResults = {
             poc: this.config.pocId,
+            scale: this.currentScaleKey,
+            quality: this.currentQuality,
+            brushRadius: this.brushRadius,
+            cellSize: this.config.getCellSize ? this.config.getCellSize() : '--',
             avgFps: 0,
             avgFrameTime: 0,
             p99FrameTime: 0,
@@ -1261,9 +1453,11 @@ export class PlanetaryBaseSandbox {
             visualCollisionError: '0.00u'
         };
         this.carveLatencies = [];
+        this.frameHistory = [];
     }
 
     stepBenchmark() {
+        if (this.benchmarkDone) return;
         this.benchmarkFrames++;
 
         if (this.benchmarkCarveTicks.includes(this.benchmarkFrames)) {
@@ -1276,6 +1470,7 @@ export class PlanetaryBaseSandbox {
         }
 
         if (this.benchmarkFrames >= this.benchmarkMaxFrames) {
+            this.benchmarkDone = true;
             const sumFt = this.frameHistory.reduce((a, b) => a + b, 0);
             const avgFt = sumFt / Math.max(1, this.frameHistory.length);
             const sortedFt = [...this.frameHistory].sort((a, b) => a - b);
@@ -1289,6 +1484,10 @@ export class PlanetaryBaseSandbox {
 
             this.benchmarkResults = {
                 poc: this.config.pocId,
+                scale: this.currentScaleKey,
+                quality: this.currentQuality,
+                brushRadius: this.brushRadius,
+                cellSize: this.config.getCellSize ? this.config.getCellSize() : '--',
                 avgFps: parseFloat((1000 / avgFt).toFixed(1)),
                 avgFrameTime: parseFloat(avgFt.toFixed(2)),
                 p99FrameTime: parseFloat(p99Ft.toFixed(2)),
@@ -1301,6 +1500,12 @@ export class PlanetaryBaseSandbox {
 
             window.__BENCHMARK_RESULTS__ = this.benchmarkResults;
             console.log('BENCHMARK_COMPLETE', JSON.stringify(this.benchmarkResults));
+            if (window.parent && window.parent !== window) {
+                window.parent.postMessage({
+                    type: 'BENCHMARK_COMPLETE',
+                    results: this.benchmarkResults
+                }, '*');
+            }
         }
     }
 
@@ -1346,11 +1551,26 @@ export class PlanetaryBaseSandbox {
         this.updateShipPhysics(dt);
 
         if (!this.isFlightMode) {
+            if (!this.isBenchmarkMode) {
+                const moved = this.updateCameraWASD(dt);
+                if (moved) {
+                    this.updateBrushPreview();
+                }
+                if (this.isSpaceDown && this.activeTool !== 'machinery') {
+                    if (now - this.lastCarveTick >= this.carveTickInterval) {
+                        this.executeActiveTool();
+                    }
+                }
+            }
             this.controls.update();
         }
 
         if (this.headlamp) {
             this.headlamp.position.copy(this.isFlightMode ? this.shipGroup.position : this.camera.position);
+        }
+
+        if (this.config.onBeforeRender) {
+            this.config.onBeforeRender();
         }
 
         this.renderer.render(this.scene, this.camera);
@@ -1363,6 +1583,7 @@ export class PlanetaryBaseSandbox {
         if (this.frameCount % 10 === 0) {
             this.hud.querySelector('#tel-fps').innerText = `${this.fps.toFixed(1)} / ${this.frameTime.toFixed(1)}ms`;
             this.hud.querySelector('#tel-tris').innerText = `${this.triangles.toLocaleString()} / ${this.drawCalls}`;
+            this.updateCellSizeLabel();
 
             // Emit Telemetry to parent gallery via postMessage
             if (window.parent && window.parent !== window) {
@@ -1378,6 +1599,8 @@ export class PlanetaryBaseSandbox {
                     heap: (window.performance && window.performance.memory) ?
                         parseFloat((window.performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(2)) : 9.54,
                     scale: this.currentScaleKey,
+                    quality: this.currentQuality,
+                    cellSize: this.config.getCellSize ? this.config.getCellSize() : '--',
                     activeTool: this.activeTool
                 }, '*');
             }

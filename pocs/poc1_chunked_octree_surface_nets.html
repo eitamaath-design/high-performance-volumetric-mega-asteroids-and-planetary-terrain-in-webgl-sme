@@ -48,8 +48,9 @@
         const noise = new FastNoise3D(2026);
 
         // --- Option 1 Constants ---
+        const QUALITY_PRESETS_POC1 = { low: 12, medium: 18, high: 24, ultra: 30 };
         let currentRadius = 2800;
-        const CHUNK_RES = 18; // 18x18x18 cells per chunk
+        let CHUNK_RES = 24; // Configurable by quality tier (12..30 cells per chunk)
         let CHUNK_SIZE = 1260;
         let CELL_SIZE = CHUNK_SIZE / CHUNK_RES;
         let worldEpoch = 0;
@@ -135,7 +136,8 @@
                             const d = evalDensityPoC1(wx, wy, wz);
                             this.voxelData[idx] = d;
 
-                            if (d < -CELL_SIZE && Math.sin(wx * 0.0055 + wy * 0.002) * Math.cos(wz * 0.0055) > 0.78) {
+                            const oreFreq = 0.0055 * (2800.0 / currentRadius);
+                            if (d < -CELL_SIZE && Math.sin(wx * oreFreq + wy * oreFreq * 0.36) * Math.cos(wz * oreFreq) > 0.78) {
                                 this.materialData[idx] = 2; // Ore vein
                             } else {
                                 this.materialData[idx] = 1; // Native rock
@@ -347,6 +349,26 @@
             await Promise.all(rebuilds);
         }
 
+        function applyQualityPoC1(qualityKey) {
+            CHUNK_RES = QUALITY_PRESETS_POC1[qualityKey] || 24;
+            CHUNK_SIZE = currentRadius * 0.45;
+            CELL_SIZE = CHUNK_SIZE / CHUNK_RES;
+        }
+
+        async function rebuildAllPoC1() {
+            const myEpoch = worldEpoch + 1;
+            await initAsteroidChunks(sandbox.scene);
+            if (worldEpoch !== myEpoch) return;
+            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
+            const surfPt = findSurfacePoint(evalDensityPoC1, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
+            const scaleFactor = currentRadius / 2800.0;
+            await carveSpherePoC1(surfPt, 220 * scaleFactor);
+            if (worldEpoch !== myEpoch) return;
+            await carveSpherePoC1(surfPt.clone().addScaledVector(tunnelDir, -160 * scaleFactor), 200 * scaleFactor);
+            if (worldEpoch !== myEpoch) return;
+            await reinforceSpherePoC1(surfPt.clone().addScaledVector(tunnelDir, -150 * scaleFactor), 250 * scaleFactor);
+        }
+
         // Initialize Shared Sandbox
         const sandbox = new PlanetaryBaseSandbox({
             pocId: 'poc1',
@@ -354,6 +376,7 @@
             defaultRadius: currentRadius,
             getCollisionMesh: () => activeChunkMeshes,
             getVisualMesh: () => activeChunkMeshes,
+            getCellSize: () => `${CELL_SIZE.toFixed(1)}u (${CHUNK_RES}³)`,
 
             onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
                 await carveSpherePoC1(hitPoint, brushRadius);
@@ -378,7 +401,13 @@
 
             onScaleChange: async (scaleKey, radius) => {
                 currentRadius = radius;
-                await initAsteroidChunks(sandbox.scene);
+                CELL_SIZE = (currentRadius * 0.45) / CHUNK_RES;
+                await rebuildAllPoC1();
+            },
+
+            onQualityChange: async (qualityKey) => {
+                applyQualityPoC1(qualityKey);
+                await rebuildAllPoC1();
             },
 
             onToggleWireframe: (enabled) => {
@@ -393,19 +422,16 @@
 
         function evalDensityPoC1(wx, wy, wz) {
             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-            const n = (noise.fbm(wx * 0.0014, wy * 0.0014, wz * 0.0014, 3) - 0.35) * (currentRadius * 0.24);
+            const freq = 0.0014 * (2800.0 / currentRadius);
+            const n = (noise.fbm(wx * freq, wy * freq, wz * freq, 3) - 0.35) * (currentRadius * 0.24);
             return dist - (currentRadius + n);
         }
 
         // Initial Build + Starter Demonstration Tunnel & Reinforced Alcove
-        (async () => {
-            await initAsteroidChunks(sandbox.scene);
-            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
-            const surfPt = findSurfacePoint(evalDensityPoC1, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
-            await carveSpherePoC1(surfPt, 220);
-            await carveSpherePoC1(surfPt.clone().addScaledVector(tunnelDir, -160), 200);
-            await reinforceSpherePoC1(surfPt.clone().addScaledVector(tunnelDir, -150), 250);
-        })();
+        currentRadius = sandbox.currentRadius;
+        applyQualityPoC1(sandbox.currentQuality);
+        sandbox.updateCellSizeLabel();
+        rebuildAllPoC1();
     </script>
 </body>
 </html>

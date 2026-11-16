@@ -7,7 +7,7 @@
   "trianglesCount": 6936,
   "drawCalls": 1,
   "carveCount": 6,
-  "avgCarveDurationMs": 1.73,
+  "avgCarveDurationMs": 1.78,
   "heapMemoryMb": 28.04,
   "visualCollisionError": "> 30.00u"
 }

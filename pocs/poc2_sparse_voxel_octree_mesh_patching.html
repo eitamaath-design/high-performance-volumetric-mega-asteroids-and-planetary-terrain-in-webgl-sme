@@ -47,8 +47,9 @@
 
         const noise = new FastNoise3D(4242);
 
+        const QUALITY_PRESETS_POC2 = { low: 10, medium: 14, high: 20, ultra: 26 };
         let currentRadius = 2800;
-        const LEAF_RES = 14; // 14x14x14 interior cells per SVO leaf (17^3 padded grid)
+        let LEAF_RES = 20; // Configurable by quality tier (10..26 interior cells per SVO leaf)
         let LEAF_SIZE = 1344;
         let CELL_SIZE = LEAF_SIZE / LEAF_RES;
 
@@ -106,7 +107,8 @@
                             const d = evalDensityPoC2(wx, wy, wz);
                             this.density[idx] = d;
 
-                            if (d < -this.cellSize && Math.sin(wx * 0.007) * Math.cos(wy * 0.007) > 0.78) {
+                            const oreFreq = 0.007 * (2800.0 / currentRadius);
+                            if (d < -this.cellSize && Math.sin(wx * oreFreq) * Math.cos(wy * oreFreq) > 0.78) {
                                 this.material[idx] = 2; // Ore vein
                             } else {
                                 this.material[idx] = 1; // Rock
@@ -391,7 +393,8 @@
 
         function evalDensityPoC2(wx, wy, wz) {
             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-            const n = (noise.fbm(wx * 0.0015, wy * 0.0015, wz * 0.0015, 3) - 0.35) * (currentRadius * 0.22);
+            const freq = 0.0015 * (2800.0 / currentRadius);
+            const n = (noise.fbm(wx * freq, wy * freq, wz * freq, 3) - 0.35) * (currentRadius * 0.22);
             return dist - (currentRadius + n);
         }
 
@@ -509,6 +512,22 @@
             }
         }
 
+        function applyQualityPoC2(qualityKey) {
+            LEAF_RES = QUALITY_PRESETS_POC2[qualityKey] || 20;
+            LEAF_SIZE = currentRadius * 0.48;
+            CELL_SIZE = LEAF_SIZE / LEAF_RES;
+        }
+
+        function rebuildAllPoC2() {
+            initSVO(sandbox.scene);
+            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
+            const surfPt = findSurfacePoint(evalDensityPoC2, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
+            const scaleFactor = currentRadius / 2800.0;
+            carveSpherePoC2(surfPt, 220 * scaleFactor);
+            carveSpherePoC2(surfPt.clone().addScaledVector(tunnelDir, -160 * scaleFactor), 200 * scaleFactor);
+            reinforceSpherePoC2(surfPt.clone().addScaledVector(tunnelDir, -150 * scaleFactor), 250 * scaleFactor);
+        }
+
         // Shared Sandbox Setup
         const sandbox = new PlanetaryBaseSandbox({
             pocId: 'poc2',
@@ -516,6 +535,7 @@
             defaultRadius: currentRadius,
             getCollisionMesh: () => activeLeafMeshes,
             getVisualMesh: () => activeLeafMeshes,
+            getCellSize: () => `${CELL_SIZE.toFixed(1)}u (${LEAF_RES}³)`,
 
             onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
                 carveSpherePoC2(hitPoint, brushRadius);
@@ -540,7 +560,12 @@
 
             onScaleChange: (scaleKey, radius) => {
                 currentRadius = radius;
-                initSVO(sandbox.scene);
+                rebuildAllPoC2();
+            },
+
+            onQualityChange: (qualityKey) => {
+                applyQualityPoC2(qualityKey);
+                rebuildAllPoC2();
             },
 
             onToggleWireframe: (enabled) => {
@@ -553,14 +578,10 @@
             }
         });
 
-        initSVO(sandbox.scene);
-        {
-            const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
-            const surfPt = findSurfacePoint(evalDensityPoC2, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
-            carveSpherePoC2(surfPt, 220);
-            carveSpherePoC2(surfPt.clone().addScaledVector(tunnelDir, -160), 200);
-            reinforceSpherePoC2(surfPt.clone().addScaledVector(tunnelDir, -150), 250);
-        }
+        currentRadius = sandbox.currentRadius;
+        applyQualityPoC2(sandbox.currentQuality);
+        rebuildAllPoC2();
+        sandbox.updateCellSizeLabel();
     </script>
 </body>
 </html>
