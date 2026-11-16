@@ -58,8 +58,8 @@ flowchart TD
                                             |
                            [Option 4: 3D GPU SDF Raymarching]
                             - 3D Volume Data3DTexture (Float32/RGBA)
-                            - Shared Trilinear CPU/GPU SDF Collider
-                            - Multi-Material Channel (0=Void, 1=Rock, 2=Armor)
+                            - Separated 4-Channel RGBA (R=SDF, G=Ore [0,1], B=Armor [0,1])
+                            - C² Tricubic B-Spline SDF & Shared CPU/GPU Physics
 ```
 
 ---
@@ -86,6 +86,8 @@ Subterranean caves support structural reinforcement and tactical defense:
   - Possesses $10\times\text{--}50\times$ mining resistance; completely immune to standard raider mining beams.
   - Visually manifests with glowing metallic cyan/slate hex plating, distinct specularity, and emissive nanite circuits.
   - Tactical Enforcement: Enemy raiders cannot tunnel through reinforced base walls; they must deploy specialized Heavy Breach Charges or infiltrate through player-defended hangars and tunnel checkpoints.
+> [!NOTE]
+> In Option 4 (GPU SDF Raymarching), discrete materials are mapped into orthogonal continuous channels ($R = \text{SDF}$, $G = \text{Ore } [0, 1]$, $B = \text{Titanium Armor } [0, 1]$). This orthogonal decomposition guarantees that hardware trilinear and $C^2$ tricubic B-spline filtering never interpolates across intermediate material IDs (e.g., void-to-armor transitions never bleed into spurious ore veins).
 
 ### 2.4 Scalable 20–30+ Player Planetary Sizing, Resolution Tiers, Controls & Base Machinery
 - **Scale Radii:** Scalable across $R = 2800\text{u}$ (10-player scrimmage asteroid), $R = 4800\text{u}$ (20–30 player planetary base hub), and $R = 8000\text{u}+$ (50+ player mega-planetoid). Procedural terrain noise frequency scales inversely with radius ($f \propto 2800 / R$) so massive 50P planetoids preserve smooth macro topology without Nyquist grid aliasing.
@@ -125,12 +127,18 @@ Subterranean caves support structural reinforcement and tactical defense:
 - **Clustered 3D Portal Grid & Exact Sphere List (`uPortalGridTex` + `uPortalListTex`):** Firing a mining laser at the unbroken crust appends an exact portal sphere $(x, y, z, R_{\text{cut}})$ into a $64 \times 64$ `FloatType` sphere list texture (`4,096` slots) indexed by a $32 \times 32 \times 32$ spatial grid texture (`1024 × 128`, 16 portal IDs per cell) in both the fragment shader and CPU raycaster. This guarantees pixel-exact circular portal cutouts across all planetary scales ($10\text{P}\text{--}50\text{P}$) and brush radii ($40\text{u}\text{--}360\text{u}$) in $O(1)$ shader lookup cost without uniform array caps or radius-merge artifacts, while anchoring high-resolution subterranean voxel chunks ($12^3\text{--}28^3$) at the entrance collar.
 - **Subterranean Expansion:** Voxel chunks allocate on-demand only along carved tunnel paths with minimal surface inset (`4.0u`) and seamless collar overlap. Over $99.5\%$ of the massive planetoid volume consumes zero memory, enabling 30–100+ players to carve miles of subterranean bases without memory exhaustion.
 
-#### Option 4 (`poc4_gpu_sdf_raymarching_hybrid.html`): WebGL2 3D Volume Texture (`Data3DTexture`) GPU SDF Raymarching + Shared Trilinear SDF Physics & Local Dual-Mesh Collision Proxy
-- **Voxel Representation:** Continuous 3D Volume Texture (`THREE.Data3DTexture` in WebGL2, `64³–136³` configurable by quality tier). Channel R stores normalized continuous signed distance; Channel G stores material ID.
-- **GPU Rendering:** Full-screen fragment raymarcher marching to the true `dist <= 0.0` zero-crossing with 6-step root bisection/secant refinement, Hermite $C^1$ smoothstep normal gradient evaluation (`sampleSDFSmooth` via `texelFetch`) to eliminate voxel-cell derivative creases, and camera-distance-attenuated procedural bump shading to prevent Nyquist surface grain.
-- **CPU Physics Parity:** Analytical CPU sampling mirrors the GPU trilinear interpolation formula:
-  $$\text{SDF}(\mathbf{x}) = \text{trilinear\_sample}(\text{volumeBuffer}, \mathbf{x})$$
-- **Collision Proxy:** Analytical CPU sphere-marching raycaster evaluates the identical volume field with `0.00u` visual-to-collision error.
+#### Option 4 (`poc4_gpu_sdf_raymarching_hybrid.html`): WebGL2 3D Volume Texture (`Data3DTexture`) GPU SDF Raymarching + Shared C² Tricubic B-Spline SDF Physics & Collision Proxy
+- **4-Channel RGBA Volume Texture Layout:** Continuous 3D Volume Texture (`THREE.Data3DTexture` in WebGL2, `64³–136³` configurable by quality tier, verified via `OES_texture_float_linear`). Orthogonal continuous channel mapping:
+  - `R`: Normalized continuous signed distance $d / \text{DOMAIN\_HALF}$.
+  - `G`: Mineral Ore Vein mask $[0, 1]$.
+  - `B`: Reinforced Titanium Bulkhead mask $[0, 1]$.
+  - `A`: Uniform alpha padding ($1.0$).
+- **Hardware-Accelerated $C^2$ Tricubic B-Spline SDF & Normal Evaluation:** Evaluated via `sampleVolumeBspline` using 8 hardware trilinear texture fetches per Sigg & Hadwiger (*GPU Gems 2*, Ch. 20). Eliminates both $C^0$ voxel boundary creases and smoothstep zero-derivative grid quilting artifacts, guaranteeing continuous second-order derivatives $\nabla^2 d(\mathbf{x})$ and silky-smooth normal vectors.
+- **Analytical Bounding-Sphere Early-Out & Sphere-Marching:** Directly following box intersection, the ray is clipped against an analytical asteroid bounding sphere ($R_{\text{bound}} = 1.25 \cdot R$). Rays that miss or exit early are pruned immediately. Sphere tracing leverages coarse 1-tap trilinear lookups (`sampleVolumeFast`) for distant steps and transitions to $C^2$ B-spline evaluation near the isosurface, refined by 6-step root bisection.
+- **4-Tap SDF Cavity Ambient Occlusion:** Ray hit points sample 4 outward normal SDF offsets via `calcCavityAO`, accumulating smooth ambient contact shadows inside subterranean caverns and tunnels without geometry overhead.
+- **Scaled-Space Procedural Bump & PBR Parity:** Multi-scale procedural FBM with scaled-space bump gradients projected orthogonally to surface normals and distance-attenuated to eliminate Nyquist noise, paired with triplanar titanium hex armor plating, metallic specular lobe, and emissive nanite seams.
+- **Near-Surface Armor Shell & Breach Mode:** Nanite Armor Beams reinforce cavern perimeters with near-surface padding (`VOXEL_SPACING * 0.55`) and shell depth limit (`curD <= VOXEL_SPACING * 0.90`), covering the immediate boundary layer across $d = 0$ without bloating into open air while setting Channel B to $1.0$. Subterranean mineral ore is seeded organically via multi-octave `FastNoise3D` veins strictly $> 2.1$ voxels deep (`d < -VOXEL_SPACING * 2.1`) so the 4-tap B-spline stencil never bleeds onto untouched exterior crust. Tactical Heavy Breach Charges (`mode === 'breach'`) strip armor plating, while deep voids reset both ore and armor masks.
+- **CPU Physics Parity & Collision Proxy:** Analytical CPU sphere-marching raycaster mirrors the identical volume field, providing absolute $0.00\text{u}$ visual-to-collision error.
 
 ---
 
@@ -141,10 +149,10 @@ Subterranean caves support structural reinforcement and tactical defense:
 | Evaluation Criteria | Rockets Baseline (Monolithic 64³) | Option 1: Chunked Surface Nets + Workers (PoC 1) | Option 2: Adaptive QEF SVO + AABB (PoC 2) | Option 3: Clipmap Shell + Subterranean Manifolds (PoC 3) | Option 4: GPU 3D SDF Raymarching (PoC 4) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Architectural Type** | Monolithic Uniform Grid | Sparse Chunk Dual-Grid | Hierarchical SVO Dual Contouring | Macro Shell + Dynamic Cavern Voxels | Volumetric GPU Texture Raymarching |
-| **Effective Voxel Cell Size** | $\sim 109.4\text{u}$ (Extremely coarse) | $4.0\text{u}\text{--}8.0\text{u}$ (High fidelity) | $2.0\text{u}\text{--}8.0\text{u}$ (Adaptive) | $2.0\text{u}\text{--}4.0\text{u}$ (Caverns) | Continuous Trilinear Grid |
+| **Effective Voxel Cell Size** | $\sim 109.4\text{u}$ (Extremely coarse) | $4.0\text{u}\text{--}8.0\text{u}$ (High fidelity) | $2.0\text{u}\text{--}8.0\text{u}$ (Adaptive) | $2.0\text{u}\text{--}4.0\text{u}$ (Caverns) | Continuous C² Tricubic B-Spline Grid |
 | **Laser Carve Precision (R=6.5u)** | Erratic voxel snapping, jagged | Perfectly smooth sphere | Smooth curves + crisp corners | Razor-sharp inside caverns | Sub-voxel precision ($0.00\text{u}$) |
 | **Visual-to-Collision Error** | $> 30.00\text{u}$ (Fatal mismatch) | **$0.00\text{u}$ (Identical Mesh BVH)** | **$0.00\text{u}$ (Identical Mesh BVH)** | **$0.00\text{u}$ (Identical Mesh BVH)** | **$0.00\text{u}$ (Shared Trilinear SDF)** |
-| **Base Wall Reinforcement** | Single-material only | Multi-material vertex color & mask | Multi-material QEF sharp corners | Multi-material subterranean chunks | Dual-channel volume texture |
+| **Base Wall Reinforcement** | Single-material only | Multi-material vertex color & mask | Multi-material QEF sharp corners | Multi-material subterranean chunks | Orthogonal 4-Channel RGBA Volume (R: SDF, G: Ore, B: Armor) |
 | **Scalability (20–30+ Players)** | Unscalable (Bandwidth/CPU blowup) | High (Independent spatial chunks) | High (Sparse tree branches) | **Maximum (Planetary $R=8000\text{u}+$ scale)** | Medium (VRAM texture limits) |
 | **Carve Latency (Execution)** | $1.72\text{ ms}$ (Coarse sync) | **$0.45\text{ ms}$ (Worker async)** | **$0.18\text{ ms}$ (Leaf patch)** | $22.52\text{ ms}$ (Chunk init) | **$1.65\text{ ms}$ (Texture update)** |
 | **Average Frame Rate** | $58.7\text{ FPS}$ | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
@@ -194,6 +202,7 @@ Subterranean caves support structural reinforcement and tactical defense:
 3. **Multi-Material Base Reinforcement Gate:** Wall reinforcement must transition voxels to `materialId = 3`, visually rendering cyan metallic bulkheads that reject standard raider laser attacks.
 4. **Static Asset Zero-404 Gate:** All internal scripts, workers, import maps, and vendor assets must return HTTP 200 without network failures.
 5. **Headless Execution Compatibility Gate:** Automated benchmark harnesses must execute cleanly under Playwright headless SwiftShader.
+6. **SDF Visual Continuity & Material Isolation Gate:** GPU SDF rendering must maintain continuous $C^2$ surface normals across voxel boundaries without grid quilting or derivative creases, and orthogonal RGBA material channels must preserve zero material crosstalk during trilinear and tricubic interpolation.
 
 ### 5.2 Automated & In-Showcase Benchmark Harnesses
 - **CLI Headless Benchmark Suite:** Runs all five comparative environments (`rockets_baseline`, `poc1`, `poc2`, `poc3`, `poc4`) under headless Playwright, performing continuous automated carve cycles, sampling frame times, triangles, and heap memory:
@@ -270,7 +279,7 @@ python C:\Users\eitama\.gemini\config\skills\knowledge-base\scripts\kb_housekeep
 | `pocs/poc1_chunked_octree_surface_nets.html` | Option 1: Chunked Octree Surface Nets + Triangle BVH + Async Web Workers |
 | `pocs/poc2_sparse_voxel_octree_mesh_patching.html` | Option 2: Adaptive QEF Dual Contouring SVO + Dirty AABB Mesh Patching |
 | `pocs/poc3_hierarchical_lod_clipmaps.html` | Option 3: Hybrid Planetary Clipmap Crust + Entrance Portals + Cavern Manifolds |
-| `pocs/poc4_gpu_sdf_raymarching_hybrid.html` | Option 4: 3D Volume SDF Raymarching + Shared Trilinear SDF Physics & Mesh Proxy |
+| `pocs/poc4_gpu_sdf_raymarching_hybrid.html` | Option 4: 3D Volume SDF Raymarching + C² Tricubic B-Spline + 4-Channel RGBA Multi-Material |
 | `pocs/workers/surface_nets_worker.js` | Dedicated Web Worker implementing true Dual-Grid Surface Nets meshing |
 | `pocs/vendor/three.module.js` | Vendored Three.js r170 core ESM library |
 | `pocs/vendor/OrbitControls.js` | Vendored Three.js r170 OrbitControls ESM module |
@@ -292,3 +301,4 @@ python C:\Users\eitama\.gemini\config\skills\knowledge-base\scripts\kb_housekeep
 | `scratch/verify_task4.cjs` | Verification test script for headless testing and validation |
 | `scratch/verify_task4.js` | Verification script for browser automation validation |
 | `scratch/verify_tasks_1_to_4.cjs` | End-to-end Playwright verification suite covering Tasks 1–4 (controls, PoC3 65+ sweeps, 50P quality & Showcase benchmark runner, PoC4 smoothness) |
+| `scratch/test_poc4_improvements.cjs` | Targeted Playwright test verifying Option 4 C² B-spline shader, carving, breach mode, and armor reinforcement |
