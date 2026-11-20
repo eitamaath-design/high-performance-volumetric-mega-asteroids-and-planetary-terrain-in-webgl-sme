@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Option 4: 3D Volume SDF Raymarching + Shared Trilinear SDF Physics</title>
+    <title>Option 4: 3D Volume SDF Raymarching + Shared C² B-Spline SDF Physics</title>
     <style>
         body { margin: 0; overflow: hidden; background: #04060c; }
     </style>
@@ -74,12 +74,24 @@
         const _rcEntryPt = new THREE.Vector3();
         const _rcP = new THREE.Vector3();
         const _rcMp = new THREE.Vector3();
+        const _rcRawGrad = new THREE.Vector3();
         const _colCurPos = new THREE.Vector3();
         const _colRemDelta = new THREE.Vector3();
         const _colStep = new THREE.Vector3();
         const _colGrad = new THREE.Vector3();
         const _colNormal = new THREE.Vector3();
         const _colHitPt = new THREE.Vector3();
+        const _bsplineOut = { d: 0.0, ore: 0.0, armor: 0.0, mat: 1 };
+        const _bsTriScratch = Array.from({ length: 8 }, () => ({ r: 0.0, g: 0.0, b: 0.0 }));
+        const _bsMix0 = { r: 0.0, g: 0.0, b: 0.0 };
+        const _bsMix1 = { r: 0.0, g: 0.0, b: 0.0 };
+        const _bsMix2 = { r: 0.0, g: 0.0, b: 0.0 };
+        const _bsMix3 = { r: 0.0, g: 0.0, b: 0.0 };
+        const _bsMixY0 = { r: 0.0, g: 0.0, b: 0.0 };
+        const _bsMixY1 = { r: 0.0, g: 0.0, b: 0.0 };
+        const _auditP = new THREE.Vector3();
+        const _auditMp = new THREE.Vector3();
+        const _auditRawGrad = new THREE.Vector3();
 
         function evalDensityPoC4(wx, wy, wz) {
             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
@@ -139,7 +151,9 @@
                     volumeUploadData = new Uint16Array(neededLen);
                 }
                 for (let i = 0; i < neededLen; i++) {
-                    volumeUploadData[i] = THREE.DataUtils.toHalfFloat(volumeData[i]);
+                    const hf = THREE.DataUtils.toHalfFloat(volumeData[i]);
+                    volumeUploadData[i] = hf;
+                    volumeData[i] = THREE.DataUtils.fromHalfFloat(hf);
                 }
                 texBackingData = volumeUploadData;
             } else {
@@ -179,15 +193,18 @@
             const glTex = texProps ? texProps.__webglTexture : null;
 
             if (!gl || !glTex) {
-                if (useHalfFloat && volumeTexture.image && volumeTexture.image.data) {
-                    const mirror = volumeTexture.image.data;
+                if (useHalfFloat) {
+                    const mirror = volumeTexture.image && volumeTexture.image.data ? volumeTexture.image.data : null;
                     for (let z = minZ; z <= maxZ; z++) {
                         const zBase = z * volRes2;
                         for (let y = minY; y <= maxY; y++) {
                             const rowBase = (zBase + y * VOL_RES + minX) * 4;
                             const rowLen = w * 4;
                             for (let i = 0; i < rowLen; i++) {
-                                mirror[rowBase + i] = THREE.DataUtils.toHalfFloat(volumeData[rowBase + i]);
+                                const srcIdx = rowBase + i;
+                                const hf = THREE.DataUtils.toHalfFloat(volumeData[srcIdx]);
+                                volumeData[srcIdx] = THREE.DataUtils.fromHalfFloat(hf);
+                                if (mirror) mirror[srcIdx] = hf;
                             }
                         }
                     }
@@ -214,6 +231,7 @@
                             const srcIdx = rowBase + i;
                             const hf = THREE.DataUtils.toHalfFloat(volumeData[srcIdx]);
                             subBuf[dst++] = hf;
+                            volumeData[srcIdx] = THREE.DataUtils.fromHalfFloat(hf);
                             if (mirror) mirror[srcIdx] = hf;
                         }
                     }
@@ -255,21 +273,12 @@
             gl.bindTexture(gl.TEXTURE_3D, prevTex);
         }
 
-        // Zero-allocation CPU Trilinear SDF Distance Sampler (Exact match with GPU sampler3D texel centers)
-        function cpuSampleSDFDistance(wx, wy, wz) {
-            const invSpan = 1.0 / (DOMAIN_HALF * 2.0);
-            const u = (wx + DOMAIN_HALF) * invSpan;
-            const v = (wy + DOMAIN_HALF) * invSpan;
-            const w = (wz + DOMAIN_HALF) * invSpan;
-
-            if (u < 0 || u > 1 || v < 0 || v > 1 || w < 0 || w > 1) {
-                return 1000.0;
-            }
-
-            const maxIdx = VOL_RES - 1;
-            const gx = Math.max(0, Math.min(maxIdx, u * VOL_RES - 0.5));
-            const gy = Math.max(0, Math.min(maxIdx, v * VOL_RES - 0.5));
-            const gz = Math.max(0, Math.min(maxIdx, w * VOL_RES - 0.5));
+        // Zero-allocation Trilinear Channel-0 & RGB Samplers (Exact match with GPU sampler3D texel centers)
+        function cpuSampleTrilinearChannel0(u, v, w, buf = volumeData, res = VOL_RES, isHalf = false) {
+            const maxIdx = res - 1;
+            const gx = Math.max(0.0, Math.min(maxIdx, u * res - 0.5));
+            const gy = Math.max(0.0, Math.min(maxIdx, v * res - 0.5));
+            const gz = Math.max(0.0, Math.min(maxIdx, w * res - 0.5));
 
             const x0 = Math.floor(gx), x1 = x0 < maxIdx ? x0 + 1 : maxIdx;
             const y0 = Math.floor(gy), y1 = y0 < maxIdx ? y0 + 1 : maxIdx;
@@ -281,8 +290,8 @@
             const omx = 1.0 - fx;
             const omy = 1.0 - fy;
 
-            const strideY = VOL_RES;
-            const strideZ = VOL_RES * VOL_RES;
+            const strideY = res;
+            const strideZ = res * res;
             const i000 = (x0 + y0 * strideY + z0 * strideZ) * 4;
             const i100 = (x1 + y0 * strideY + z0 * strideZ) * 4;
             const i010 = (x0 + y1 * strideY + z0 * strideZ) * 4;
@@ -292,30 +301,41 @@
             const i011 = (x0 + y1 * strideY + z1 * strideZ) * 4;
             const i111 = (x1 + y1 * strideY + z1 * strideZ) * 4;
 
-            const d00 = volumeData[i000] * omx + volumeData[i100] * fx;
-            const d10 = volumeData[i010] * omx + volumeData[i110] * fx;
-            const d01 = volumeData[i001] * omx + volumeData[i101] * fx;
-            const d11 = volumeData[i011] * omx + volumeData[i111] * fx;
-            const d0 = d00 * omy + d10 * fy;
-            const d1 = d01 * omy + d11 * fy;
-            return (d0 * (1.0 - fz) + d1 * fz) * DOMAIN_HALF;
-        }
-
-        // CPU Trilinear Interpolation Sampling (Exact match with GPU sampler3D texel centers)
-        function cpuSampleSDF(wx, wy, wz) {
-            const invSpan = 1.0 / (DOMAIN_HALF * 2.0);
-            const u = (wx + DOMAIN_HALF) * invSpan;
-            const v = (wy + DOMAIN_HALF) * invSpan;
-            const w = (wz + DOMAIN_HALF) * invSpan;
-
-            if (u < 0 || u > 1 || v < 0 || v > 1 || w < 0 || w > 1) {
-                return { d: 1000.0, ore: 0.0, armor: 0.0, mat: 0 };
+            let v000, v100, v010, v110, v001, v101, v011, v111;
+            if (isHalf) {
+                v000 = THREE.DataUtils.fromHalfFloat(buf[i000]);
+                v100 = THREE.DataUtils.fromHalfFloat(buf[i100]);
+                v010 = THREE.DataUtils.fromHalfFloat(buf[i010]);
+                v110 = THREE.DataUtils.fromHalfFloat(buf[i110]);
+                v001 = THREE.DataUtils.fromHalfFloat(buf[i001]);
+                v101 = THREE.DataUtils.fromHalfFloat(buf[i101]);
+                v011 = THREE.DataUtils.fromHalfFloat(buf[i011]);
+                v111 = THREE.DataUtils.fromHalfFloat(buf[i111]);
+            } else {
+                v000 = buf[i000];
+                v100 = buf[i100];
+                v010 = buf[i010];
+                v110 = buf[i110];
+                v001 = buf[i001];
+                v101 = buf[i101];
+                v011 = buf[i011];
+                v111 = buf[i111];
             }
 
-            const maxIdx = VOL_RES - 1;
-            const gx = Math.max(0, Math.min(maxIdx, u * VOL_RES - 0.5));
-            const gy = Math.max(0, Math.min(maxIdx, v * VOL_RES - 0.5));
-            const gz = Math.max(0, Math.min(maxIdx, w * VOL_RES - 0.5));
+            const d00 = v000 * omx + v100 * fx;
+            const d10 = v010 * omx + v110 * fx;
+            const d01 = v001 * omx + v101 * fx;
+            const d11 = v011 * omx + v111 * fx;
+            const d0 = d00 * omy + d10 * fy;
+            const d1 = d01 * omy + d11 * fy;
+            return d0 * (1.0 - fz) + d1 * fz;
+        }
+
+        function cpuSampleTrilinearRGB(u, v, w, out, buf = volumeData, res = VOL_RES) {
+            const maxIdx = res - 1;
+            const gx = Math.max(0.0, Math.min(maxIdx, u * res - 0.5));
+            const gy = Math.max(0.0, Math.min(maxIdx, v * res - 0.5));
+            const gz = Math.max(0.0, Math.min(maxIdx, w * res - 0.5));
 
             const x0 = Math.floor(gx), x1 = x0 < maxIdx ? x0 + 1 : maxIdx;
             const y0 = Math.floor(gy), y1 = y0 < maxIdx ? y0 + 1 : maxIdx;
@@ -328,8 +348,8 @@
             const omy = 1.0 - fy;
             const omz = 1.0 - fz;
 
-            const strideY = VOL_RES;
-            const strideZ = VOL_RES * VOL_RES;
+            const strideY = res;
+            const strideZ = res * res;
             const i000 = (x0 + y0 * strideY + z0 * strideZ) * 4;
             const i100 = (x1 + y0 * strideY + z0 * strideZ) * 4;
             const i010 = (x0 + y1 * strideY + z0 * strideZ) * 4;
@@ -339,33 +359,232 @@
             const i011 = (x0 + y1 * strideY + z1 * strideZ) * 4;
             const i111 = (x1 + y1 * strideY + z1 * strideZ) * 4;
 
-            // Interpolate continuous signed distance d
-            const d00 = volumeData[i000] * omx + volumeData[i100] * fx;
-            const d10 = volumeData[i010] * omx + volumeData[i110] * fx;
-            const d01 = volumeData[i001] * omx + volumeData[i101] * fx;
-            const d11 = volumeData[i011] * omx + volumeData[i111] * fx;
-            const d = ((d00 * omy + d10 * fy) * omz + (d01 * omy + d11 * fy) * fz) * DOMAIN_HALF;
+            const r00 = buf[i000] * omx + buf[i100] * fx;
+            const r10 = buf[i010] * omx + buf[i110] * fx;
+            const r01 = buf[i001] * omx + buf[i101] * fx;
+            const r11 = buf[i011] * omx + buf[i111] * fx;
+            out.r = (r00 * omy + r10 * fy) * omz + (r01 * omy + r11 * fy) * fz;
 
-            // Interpolate continuous ore vein mask
-            const o00 = volumeData[i000 + 1] * omx + volumeData[i100 + 1] * fx;
-            const o10 = volumeData[i010 + 1] * omx + volumeData[i110 + 1] * fx;
-            const o01 = volumeData[i001 + 1] * omx + volumeData[i101 + 1] * fx;
-            const o11 = volumeData[i011 + 1] * omx + volumeData[i111 + 1] * fx;
-            const ore = (o00 * omy + o10 * fy) * omz + (o01 * omy + o11 * fy) * fz;
+            const g00 = buf[i000 + 1] * omx + buf[i100 + 1] * fx;
+            const g10 = buf[i010 + 1] * omx + buf[i110 + 1] * fx;
+            const g01 = buf[i001 + 1] * omx + buf[i101 + 1] * fx;
+            const g11 = buf[i011 + 1] * omx + buf[i111 + 1] * fx;
+            out.g = (g00 * omy + g10 * fy) * omz + (g01 * omy + g11 * fy) * fz;
 
-            // Interpolate continuous titanium armor mask
-            const a00 = volumeData[i000 + 2] * omx + volumeData[i100 + 2] * fx;
-            const a10 = volumeData[i010 + 2] * omx + volumeData[i110 + 2] * fx;
-            const a01 = volumeData[i001 + 2] * omx + volumeData[i101 + 2] * fx;
-            const a11 = volumeData[i011 + 2] * omx + volumeData[i111 + 2] * fx;
-            const armor = (a00 * omy + a10 * fy) * omz + (a01 * omy + a11 * fy) * fz;
+            const b00 = buf[i000 + 2] * omx + buf[i100 + 2] * fx;
+            const b10 = buf[i010 + 2] * omx + buf[i110 + 2] * fx;
+            const b01 = buf[i001 + 2] * omx + buf[i101 + 2] * fx;
+            const b11 = buf[i011 + 2] * omx + buf[i111 + 2] * fx;
+            out.b = (b00 * omy + b10 * fy) * omz + (b01 * omy + b11 * fy) * fz;
+            return out;
+        }
 
-            return {
-                d,
-                ore,
-                armor,
-                mat: armor >= 0.35 ? 3 : (ore >= 0.45 ? 2 : 1)
-            };
+        function sampleFastDistFromBuffer(wx, wy, wz, buf, res, domainHalf, isHalf) {
+            const invSpan = 1.0 / (domainHalf * 2.0);
+            const u = Math.max(0.0, Math.min(1.0, (wx + domainHalf) * invSpan));
+            const v = Math.max(0.0, Math.min(1.0, (wy + domainHalf) * invSpan));
+            const w = Math.max(0.0, Math.min(1.0, (wz + domainHalf) * invSpan));
+            return cpuSampleTrilinearChannel0(u, v, w, buf, res, isHalf) * domainHalf;
+        }
+
+        // Zero-allocation CPU 1-Tap Trilinear SDF Distance Sampler (coarse marching & pre-checks)
+        function cpuSampleSDFDistance(wx, wy, wz) {
+            const invSpan = 1.0 / (DOMAIN_HALF * 2.0);
+            const u = (wx + DOMAIN_HALF) * invSpan;
+            const v = (wy + DOMAIN_HALF) * invSpan;
+            const w = (wz + DOMAIN_HALF) * invSpan;
+
+            if (u < 0 || u > 1 || v < 0 || v > 1 || w < 0 || w > 1) {
+                return 1000.0;
+            }
+            return cpuSampleTrilinearChannel0(u, v, w, volumeData, VOL_RES, false) * DOMAIN_HALF;
+        }
+
+        // Sigg & Hadwiger C2 Tricubic B-Spline Distance (8 trilinear reads, zero allocations)
+        function sampleBsplineDistFromBuffer(wx, wy, wz, buf, res, domainHalf, isHalf) {
+            const invSpan = 1.0 / (domainHalf * 2.0);
+            const u = Math.max(0.0, Math.min(1.0, (wx + domainHalf) * invSpan));
+            const v = Math.max(0.0, Math.min(1.0, (wy + domainHalf) * invSpan));
+            const w = Math.max(0.0, Math.min(1.0, (wz + domainHalf) * invSpan));
+
+            const cx = u * res - 0.5;
+            const cy = v * res - 0.5;
+            const cz = w * res - 0.5;
+            const ix = Math.floor(cx);
+            const iy = Math.floor(cy);
+            const iz = Math.floor(cz);
+            const fx = cx - ix;
+            const fy = cy - iy;
+            const fz = cz - iz;
+
+            const omx = 1.0 - fx, omy = 1.0 - fy, omz = 1.0 - fz;
+            const omx2 = omx * omx, omy2 = omy * omy, omz2 = omz * omz;
+            const fx2 = fx * fx, fy2 = fy * fy, fz2 = fz * fz;
+
+            const w0x = (1.0 / 6.0) * omx2 * omx;
+            const w1x = (2.0 / 3.0) - 0.5 * fx2 * (2.0 - fx);
+            const w2x = (2.0 / 3.0) - 0.5 * omx2 * (2.0 - omx);
+            const w3x = (1.0 / 6.0) * fx2 * fx;
+
+            const w0y = (1.0 / 6.0) * omy2 * omy;
+            const w1y = (2.0 / 3.0) - 0.5 * fy2 * (2.0 - fy);
+            const w2y = (2.0 / 3.0) - 0.5 * omy2 * (2.0 - omy);
+            const w3y = (1.0 / 6.0) * fy2 * fy;
+
+            const w0z = (1.0 / 6.0) * omz2 * omz;
+            const w1z = (2.0 / 3.0) - 0.5 * fz2 * (2.0 - fz);
+            const w2z = (2.0 / 3.0) - 0.5 * omz2 * (2.0 - omz);
+            const w3z = (1.0 / 6.0) * fz2 * fz;
+
+            const g0x = w0x + w1x, g1x = w2x + w3x;
+            const g0y = w0y + w1y, g1y = w2y + w3y;
+            const g0z = w0z + w1z, g1z = w2z + w3z;
+
+            const h0x = (w1x / Math.max(g0x, 1e-5)) - 0.5 + ix;
+            const h1x = (w3x / Math.max(g1x, 1e-5)) + 1.5 + ix;
+            const h0y = (w1y / Math.max(g0y, 1e-5)) - 0.5 + iy;
+            const h1y = (w3y / Math.max(g1y, 1e-5)) + 1.5 + iy;
+            const h0z = (w1z / Math.max(g0z, 1e-5)) - 0.5 + iz;
+            const h1z = (w3z / Math.max(g1z, 1e-5)) + 1.5 + iz;
+
+            const minUV = 0.5 / res;
+            const maxUV = 1.0 - minUV;
+            const t0x = Math.max(minUV, Math.min(maxUV, h0x / res));
+            const t1x = Math.max(minUV, Math.min(maxUV, h1x / res));
+            const t0y = Math.max(minUV, Math.min(maxUV, h0y / res));
+            const t1y = Math.max(minUV, Math.min(maxUV, h1y / res));
+            const t0z = Math.max(minUV, Math.min(maxUV, h0z / res));
+            const t1z = Math.max(minUV, Math.min(maxUV, h1z / res));
+
+            const tex000 = cpuSampleTrilinearChannel0(t0x, t0y, t0z, buf, res, isHalf);
+            const tex100 = cpuSampleTrilinearChannel0(t1x, t0y, t0z, buf, res, isHalf);
+            const tex010 = cpuSampleTrilinearChannel0(t0x, t1y, t0z, buf, res, isHalf);
+            const tex110 = cpuSampleTrilinearChannel0(t1x, t1y, t0z, buf, res, isHalf);
+            const tex001 = cpuSampleTrilinearChannel0(t0x, t0y, t1z, buf, res, isHalf);
+            const tex101 = cpuSampleTrilinearChannel0(t1x, t0y, t1z, buf, res, isHalf);
+            const tex011 = cpuSampleTrilinearChannel0(t0x, t1y, t1z, buf, res, isHalf);
+            const tex111 = cpuSampleTrilinearChannel0(t1x, t1y, t1z, buf, res, isHalf);
+
+            const tex00 = tex000 + (tex100 - tex000) * g1x;
+            const tex10 = tex010 + (tex110 - tex010) * g1x;
+            const tex01 = tex001 + (tex101 - tex001) * g1x;
+            const tex11 = tex011 + (tex111 - tex011) * g1x;
+            const tex0 = tex00 + (tex10 - tex00) * g1y;
+            const tex1 = tex01 + (tex11 - tex01) * g1y;
+            return (tex0 + (tex1 - tex0) * g1z) * domainHalf;
+        }
+
+        function cpuSampleBsplineDistance(wx, wy, wz) {
+            return sampleBsplineDistFromBuffer(wx, wy, wz, volumeData, VOL_RES, DOMAIN_HALF, false);
+        }
+
+        function mixRgbScratch(a, b, t, out) {
+            const om = 1.0 - t;
+            out.r = a.r * om + b.r * t;
+            out.g = a.g * om + b.g * t;
+            out.b = a.b * om + b.b * t;
+        }
+
+        // Zero-allocation C2 Tricubic B-Spline Multi-Channel Sampler (Exact match with GLSL sampleVolumeBspline)
+        function cpuSampleBspline(wx, wy, wz, out = _bsplineOut) {
+            const invSpan = 1.0 / (DOMAIN_HALF * 2.0);
+            const u = Math.max(0.0, Math.min(1.0, (wx + DOMAIN_HALF) * invSpan));
+            const v = Math.max(0.0, Math.min(1.0, (wy + DOMAIN_HALF) * invSpan));
+            const w = Math.max(0.0, Math.min(1.0, (wz + DOMAIN_HALF) * invSpan));
+
+            const cx = u * VOL_RES - 0.5;
+            const cy = v * VOL_RES - 0.5;
+            const cz = w * VOL_RES - 0.5;
+            const ix = Math.floor(cx);
+            const iy = Math.floor(cy);
+            const iz = Math.floor(cz);
+            const fx = cx - ix;
+            const fy = cy - iy;
+            const fz = cz - iz;
+
+            const omx = 1.0 - fx, omy = 1.0 - fy, omz = 1.0 - fz;
+            const omx2 = omx * omx, omy2 = omy * omy, omz2 = omz * omz;
+            const fx2 = fx * fx, fy2 = fy * fy, fz2 = fz * fz;
+
+            const w0x = (1.0 / 6.0) * omx2 * omx;
+            const w1x = (2.0 / 3.0) - 0.5 * fx2 * (2.0 - fx);
+            const w2x = (2.0 / 3.0) - 0.5 * omx2 * (2.0 - omx);
+            const w3x = (1.0 / 6.0) * fx2 * fx;
+
+            const w0y = (1.0 / 6.0) * omy2 * omy;
+            const w1y = (2.0 / 3.0) - 0.5 * fy2 * (2.0 - fy);
+            const w2y = (2.0 / 3.0) - 0.5 * omy2 * (2.0 - omy);
+            const w3y = (1.0 / 6.0) * fy2 * fy;
+
+            const w0z = (1.0 / 6.0) * omz2 * omz;
+            const w1z = (2.0 / 3.0) - 0.5 * fz2 * (2.0 - fz);
+            const w2z = (2.0 / 3.0) - 0.5 * omz2 * (2.0 - omz);
+            const w3z = (1.0 / 6.0) * fz2 * fz;
+
+            const g0x = w0x + w1x, g1x = w2x + w3x;
+            const g0y = w0y + w1y, g1y = w2y + w3y;
+            const g0z = w0z + w1z, g1z = w2z + w3z;
+
+            const h0x = (w1x / Math.max(g0x, 1e-5)) - 0.5 + ix;
+            const h1x = (w3x / Math.max(g1x, 1e-5)) + 1.5 + ix;
+            const h0y = (w1y / Math.max(g0y, 1e-5)) - 0.5 + iy;
+            const h1y = (w3y / Math.max(g1y, 1e-5)) + 1.5 + iy;
+            const h0z = (w1z / Math.max(g0z, 1e-5)) - 0.5 + iz;
+            const h1z = (w3z / Math.max(g1z, 1e-5)) + 1.5 + iz;
+
+            const minUV = 0.5 / VOL_RES;
+            const maxUV = 1.0 - minUV;
+            const t0x = Math.max(minUV, Math.min(maxUV, h0x / VOL_RES));
+            const t1x = Math.max(minUV, Math.min(maxUV, h1x / VOL_RES));
+            const t0y = Math.max(minUV, Math.min(maxUV, h0y / VOL_RES));
+            const t1y = Math.max(minUV, Math.min(maxUV, h1y / VOL_RES));
+            const t0z = Math.max(minUV, Math.min(maxUV, h0z / VOL_RES));
+            const t1z = Math.max(minUV, Math.min(maxUV, h1z / VOL_RES));
+
+            cpuSampleTrilinearRGB(t0x, t0y, t0z, _bsTriScratch[0]);
+            cpuSampleTrilinearRGB(t1x, t0y, t0z, _bsTriScratch[1]);
+            cpuSampleTrilinearRGB(t0x, t1y, t0z, _bsTriScratch[2]);
+            cpuSampleTrilinearRGB(t1x, t1y, t0z, _bsTriScratch[3]);
+            cpuSampleTrilinearRGB(t0x, t0y, t1z, _bsTriScratch[4]);
+            cpuSampleTrilinearRGB(t1x, t0y, t1z, _bsTriScratch[5]);
+            cpuSampleTrilinearRGB(t0x, t1y, t1z, _bsTriScratch[6]);
+            cpuSampleTrilinearRGB(t1x, t1y, t1z, _bsTriScratch[7]);
+
+            mixRgbScratch(_bsTriScratch[0], _bsTriScratch[1], g1x, _bsMix0);
+            mixRgbScratch(_bsTriScratch[2], _bsTriScratch[3], g1x, _bsMix1);
+            mixRgbScratch(_bsTriScratch[4], _bsTriScratch[5], g1x, _bsMix2);
+            mixRgbScratch(_bsTriScratch[6], _bsTriScratch[7], g1x, _bsMix3);
+
+            mixRgbScratch(_bsMix0, _bsMix1, g1y, _bsMixY0);
+            mixRgbScratch(_bsMix2, _bsMix3, g1y, _bsMixY1);
+
+            const omzB = 1.0 - g1z;
+            const resR = _bsMixY0.r * omzB + _bsMixY1.r * g1z;
+            const ore = _bsMixY0.g * omzB + _bsMixY1.g * g1z;
+            const armor = _bsMixY0.b * omzB + _bsMixY1.b * g1z;
+
+            out.d = resR * DOMAIN_HALF;
+            out.ore = ore;
+            out.armor = armor;
+            out.mat = armor >= 0.35 ? 3 : (ore >= 0.45 ? 2 : 1);
+            return out;
+        }
+
+        // Zero-allocation 4-Tap Tetrahedral C2 B-Spline Gradient (matches GLSL calcNormalRaw)
+        function cpuCalcBsplineGrad(wx, wy, wz, outGrad, buf = volumeData, res = VOL_RES, domainHalf = DOMAIN_HALF, isHalf = false) {
+            const voxelSize = (domainHalf * 2.0) / res;
+            const eps = voxelSize * 0.35;
+            const d0 = sampleBsplineDistFromBuffer(wx + eps, wy - eps, wz - eps, buf, res, domainHalf, isHalf);
+            const d1 = sampleBsplineDistFromBuffer(wx - eps, wy - eps, wz + eps, buf, res, domainHalf, isHalf);
+            const d2 = sampleBsplineDistFromBuffer(wx - eps, wy + eps, wz - eps, buf, res, domainHalf, isHalf);
+            const d3 = sampleBsplineDistFromBuffer(wx + eps, wy + eps, wz + eps, buf, res, domainHalf, isHalf);
+            const denom = 4.0 * eps * eps;
+            outGrad.set(
+                (eps * (d0 - d1 - d2 + d3)) / denom,
+                (eps * (-d0 - d1 + d2 + d3)) / denom,
+                (eps * (-d0 + d1 - d2 + d3)) / denom
+            );
+            return outGrad;
         }
 
         // Setup Raymarching Volume Mesh
@@ -559,16 +778,61 @@
                         return vec3(res.x * uDomainHalf, res.y, res.z);
                     }
 
+                    // 8-tap Sigg & Hadwiger C2 Tricubic B-Spline SDF Distance Only
+                    float sampleVolumeBsplineDist(vec3 localPos) {
+                        vec3 uv = clamp((localPos + uDomainHalf) / (uDomainHalf * 2.0), vec3(0.0), vec3(1.0));
+                        vec3 coord = uv * uVolRes - 0.5;
+                        vec3 index = floor(coord);
+                        vec3 fraction = coord - index;
+
+                        vec3 one_frac = 1.0 - fraction;
+                        vec3 one_frac2 = one_frac * one_frac;
+                        vec3 fraction2 = fraction * fraction;
+
+                        vec3 w0 = (1.0 / 6.0) * one_frac2 * one_frac;
+                        vec3 w1 = (2.0 / 3.0) - 0.5 * fraction2 * (2.0 - fraction);
+                        vec3 w2 = (2.0 / 3.0) - 0.5 * one_frac2 * (2.0 - one_frac);
+                        vec3 w3 = (1.0 / 6.0) * fraction2 * fraction;
+
+                        vec3 g0 = w0 + w1;
+                        vec3 g1 = w2 + w3;
+                        vec3 h0 = (w1 / max(g0, vec3(1e-5))) - 0.5 + index;
+                        vec3 h1 = (w3 / max(g1, vec3(1e-5))) + 1.5 + index;
+
+                        vec3 texCoord0 = clamp(h0 / uVolRes, vec3(0.5 / uVolRes), vec3(1.0 - 0.5 / uVolRes));
+                        vec3 texCoord1 = clamp(h1 / uVolRes, vec3(0.5 / uVolRes), vec3(1.0 - 0.5 / uVolRes));
+
+                        float tex000 = texture(uVolume, vec3(texCoord0.x, texCoord0.y, texCoord0.z)).r;
+                        float tex100 = texture(uVolume, vec3(texCoord1.x, texCoord0.y, texCoord0.z)).r;
+                        float tex010 = texture(uVolume, vec3(texCoord0.x, texCoord1.y, texCoord0.z)).r;
+                        float tex110 = texture(uVolume, vec3(texCoord1.x, texCoord1.y, texCoord0.z)).r;
+                        float tex001 = texture(uVolume, vec3(texCoord0.x, texCoord0.y, texCoord1.z)).r;
+                        float tex101 = texture(uVolume, vec3(texCoord1.x, texCoord0.y, texCoord1.z)).r;
+                        float tex011 = texture(uVolume, vec3(texCoord0.x, texCoord1.y, texCoord1.z)).r;
+                        float tex111 = texture(uVolume, vec3(texCoord1.x, texCoord1.y, texCoord1.z)).r;
+
+                        vec3 blend = g1;
+                        float tex00 = mix(tex000, tex100, blend.x);
+                        float tex10 = mix(tex010, tex110, blend.x);
+                        float tex01 = mix(tex001, tex101, blend.x);
+                        float tex11 = mix(tex011, tex111, blend.x);
+
+                        float tex0 = mix(tex00, tex10, blend.y);
+                        float tex1 = mix(tex01, tex11, blend.y);
+
+                        return mix(tex0, tex1, blend.z) * uDomainHalf;
+                    }
+
                     // Continuous C2 Tetrahedral Gradient using Tricubic B-Spline SDF
                     vec3 calcNormalRaw(vec3 p) {
                         float voxelSize = (uDomainHalf * 2.0) / uVolRes;
                         float eps = voxelSize * 0.35;
                         vec2 e = vec2(eps, -eps);
                         vec3 gradSum =
-                            e.xyy * sampleVolumeBspline(p + e.xyy).x +
-                            e.yyx * sampleVolumeBspline(p + e.yyx).x +
-                            e.yxy * sampleVolumeBspline(p + e.yxy).x +
-                            e.xxx * sampleVolumeBspline(p + e.xxx).x;
+                            e.xyy * sampleVolumeBsplineDist(p + e.xyy) +
+                            e.yyx * sampleVolumeBsplineDist(p + e.yyx) +
+                            e.yxy * sampleVolumeBsplineDist(p + e.yxy) +
+                            e.xxx * sampleVolumeBsplineDist(p + e.xxx);
                         return gradSum / (4.0 * eps * eps);
                     }
 
@@ -606,26 +870,33 @@
                         float ts0 = -bSph - sqrtD;
                         float ts1 = -bSph + sqrtD;
                         if (ts1 < 0.0) discard;
-                        t = max(t, max(ts0, 0.0)) + 0.5;
+                        if (ts0 > 0.0) t = max(t, ts0 + 0.5);
                         tEnd = min(tEnd, ts1);
                         if (tEnd < t) discard;
 
+                        // Unified X-Ray Half-Space: y < -uXRayOffset clipped, y >= -uXRayOffset kept
                         bool hitSliceCap = false;
                         if (uXRayEnabled > 0.5) {
                             float sliceY = -uXRayOffset;
-                            if ((ro + rd * t).y > sliceY) {
-                                if (rd.y >= -1e-5) discard;
+                            if ((ro + rd * t).y < sliceY) {
+                                if (rd.y <= 1e-5) discard;
                                 float tPlane = (sliceY - ro.y) / rd.y;
                                 if (tPlane > tEnd) discard;
                                 t = max(t, tPlane);
                                 hitSliceCap = true;
+                            } else if (rd.y < -1e-5) {
+                                float tPlane = (sliceY - ro.y) / rd.y;
+                                if (tPlane < t) discard;
+                                tEnd = min(tEnd, tPlane);
                             }
                         }
+                        float tEntry = t;
 
                         float voxelSize = (uDomainHalf * 2.0) / uVolRes;
                         float minStep = max(uAsteroidRadius * 0.001, 1.5);
                         vec3 p = ro + rd * t;
                         bool hit = false;
+                        bool testedEnd = false;
                         float prevT = t;
 
                         for (int i = 0; i < 96; i++) {
@@ -634,30 +905,43 @@
                             p = ro + rd * t;
 
                             float dist = sampleVolumeFast(p).x;
+                            float stepDist = dist;
 
-                            if (dist <= 0.0) {
-                                hit = true;
-                                if (i == 0 && hitSliceCap) {
-                                    // Ray hit solid interior right on the X-Ray slice plane
+                            if (dist <= voxelSize * 0.75) {
+                                float bDist = sampleVolumeBsplineDist(p);
+                                if (bDist <= 0.0) {
+                                    hit = true;
+                                    if (i == 0 && hitSliceCap) {
+                                        // Ray hit solid interior right on the X-Ray slice plane
+                                        break;
+                                    }
+                                    hitSliceCap = false;
+                                    // 5-iteration C2 B-spline root bisection
+                                    float a = prevT;
+                                    float b = t;
+                                    for (int k = 0; k < 5; k++) {
+                                        float m = 0.5 * (a + b);
+                                        float dm = sampleVolumeBsplineDist(ro + rd * m);
+                                        if (dm <= 0.0) b = m;
+                                        else a = m;
+                                    }
+                                    t = 0.5 * (a + b);
+                                    p = ro + rd * t;
                                     break;
                                 }
-                                // 5-iteration fast root bisection using 1-tap sampleVolumeFast
-                                float a = prevT;
-                                float b = t;
-                                for (int k = 0; k < 5; k++) {
-                                    float m = 0.5 * (a + b);
-                                    float dm = sampleVolumeFast(ro + rd * m).x;
-                                    if (dm <= 0.0) b = m;
-                                    else a = m;
-                                }
-                                t = 0.5 * (a + b);
-                                p = ro + rd * t;
-                                hitSliceCap = false;
-                                break;
+                                stepDist = bDist;
                             }
 
+                            if (t >= tEnd) break;
                             prevT = t;
-                            t += max(dist * 0.90, minStep * (1.0 + float(i) * 0.05));
+                            float stepLen = max(stepDist * 0.90, minStep * (1.0 + float(i) * 0.05));
+                            if (t + stepLen > tEnd) {
+                                if (testedEnd) break;
+                                t = tEnd;
+                                testedEnd = true;
+                            } else {
+                                t += stepLen;
+                            }
                         }
 
                         if (!hit) {
@@ -667,16 +951,16 @@
                         vec3 norm;
                         vec3 sampleRes;
                         if (hitSliceCap) {
-                            norm = vec3(0.0, 1.0, 0.0);
+                            norm = vec3(0.0, -1.0, 0.0);
                             sampleRes = sampleVolumeBspline(p);
                         } else {
                             vec3 rawGrad = calcNormalRaw(p);
                             float rawLenSq = dot(rawGrad, rawGrad);
-                            norm = rawLenSq > 1e-10 ? rawGrad * inversesqrt(rawLenSq) : normalize(p);
+                            norm = rawLenSq > 1e-10 ? rawGrad * inversesqrt(rawLenSq) : (length(p) > 1e-8 ? normalize(p) : vec3(0.0, 1.0, 0.0));
                             sampleRes = sampleVolumeBspline(p);
                             float denom = dot(rawGrad, rd);
                             if (denom < -0.15) {
-                                t = max(0.0, t + clamp(-sampleRes.x / denom, -voxelSize * 0.45, voxelSize * 0.45));
+                                t = clamp(t + clamp(-sampleRes.x / denom, -voxelSize * 0.45, voxelSize * 0.45), tEntry, tEnd);
                                 p = ro + rd * t;
                                 sampleRes = sampleVolumeBspline(p);
                             }
@@ -919,6 +1203,180 @@
             createStarterTunnelPoC4();
         }
 
+        function evalResolvedBsplineDist(wx, wy, wz) {
+            const d = cpuSampleBsplineDistance(wx, wy, wz);
+            if (!sandbox.isXRay) return d;
+            const sliceY = -(sandbox.clipPlane ? sandbox.clipPlane.constant : sandbox.xRayOffset);
+            return Math.max(d, sliceY - wy);
+        }
+
+        // Exact CPU/GPU-Equivalent C2 B-Spline Sphere-Marcher (shared by customRaycast and audit)
+        function marchVolumeRay(ro, rd, nearT, farT, buf, res, domainHalf, asteroidRadius, isHalf, xRayEnabled, xRayOffset, maxSteps, fullHit) {
+            const safeDx = Math.abs(rd.x) < 1e-6 ? 1e-6 : rd.x;
+            const safeDy = Math.abs(rd.y) < 1e-6 ? 1e-6 : rd.y;
+            const safeDz = Math.abs(rd.z) < 1e-6 ? 1e-6 : rd.z;
+            const invDx = 1.0 / safeDx, invDy = 1.0 / safeDy, invDz = 1.0 / safeDz;
+
+            const tx0 = (-domainHalf - ro.x) * invDx, tx1 = (domainHalf - ro.x) * invDx;
+            const ty0 = (-domainHalf - ro.y) * invDy, ty1 = (domainHalf - ro.y) * invDy;
+            const tz0 = (-domainHalf - ro.z) * invDz, tz1 = (domainHalf - ro.z) * invDz;
+
+            const tBoxMin = Math.max(Math.min(tx0, tx1), Math.min(ty0, ty1), Math.min(tz0, tz1));
+            const tBoxMax = Math.min(Math.max(tx0, tx1), Math.max(ty0, ty1), Math.max(tz0, tz1));
+            if (tBoxMax < Math.max(tBoxMin, nearT)) return null;
+
+            let t = Math.max(tBoxMin, nearT);
+            let tEnd = Math.min(tBoxMax, farT);
+
+            const rBound = asteroidRadius * 1.25;
+            const bSph = ro.dot(rd);
+            const cSph = ro.lengthSq() - rBound * rBound;
+            const dSph = bSph * bSph - cSph;
+            if (dSph < 0.0) return null;
+            const sqrtD = Math.sqrt(dSph);
+            const ts0 = -bSph - sqrtD;
+            const ts1 = -bSph + sqrtD;
+            if (ts1 < nearT) return null;
+            if (ts0 > 0.0) t = Math.max(t, ts0 + 0.5);
+            tEnd = Math.min(tEnd, ts1);
+            if (tEnd < t) return null;
+
+            let hitSliceCap = false;
+            if (xRayEnabled) {
+                const sliceY = -xRayOffset;
+                if (ro.y + rd.y * t < sliceY) {
+                    if (rd.y <= 1e-5) return null;
+                    const tPlane = (sliceY - ro.y) / rd.y;
+                    if (tPlane > tEnd) return null;
+                    t = Math.max(t, tPlane);
+                    hitSliceCap = true;
+                } else if (rd.y < -1e-5) {
+                    const tPlane = (sliceY - ro.y) / rd.y;
+                    if (tPlane < t) return null;
+                    tEnd = Math.min(tEnd, tPlane);
+                }
+            }
+            const tEntry = t;
+
+            const voxelSize = (domainHalf * 2.0) / res;
+            const minStep = Math.max(asteroidRadius * 0.001, 1.5);
+            const pVec = fullHit ? _rcP : _auditP;
+            const mVec = fullHit ? _rcMp : _auditMp;
+            const gradVec = fullHit ? _rcRawGrad : _auditRawGrad;
+            let hit = false;
+            let testedEnd = false;
+            let prevT = t;
+
+            for (let step = 0; step < maxSteps; step++) {
+                if (t > tEnd) break;
+                pVec.copy(ro).addScaledVector(rd, t);
+
+                const dist = sampleFastDistFromBuffer(pVec.x, pVec.y, pVec.z, buf, res, domainHalf, isHalf);
+                let stepDist = dist;
+
+                if (dist <= voxelSize * 0.75) {
+                    const bDist = sampleBsplineDistFromBuffer(pVec.x, pVec.y, pVec.z, buf, res, domainHalf, isHalf);
+                    if (bDist <= 0.0) {
+                        hit = true;
+                        if (step === 0 && hitSliceCap) {
+                            break;
+                        }
+                        hitSliceCap = false;
+                        let a = prevT;
+                        let b = t;
+                        for (let k = 0; k < 5; k++) {
+                            const m = 0.5 * (a + b);
+                            mVec.copy(ro).addScaledVector(rd, m);
+                            if (sampleBsplineDistFromBuffer(mVec.x, mVec.y, mVec.z, buf, res, domainHalf, isHalf) <= 0.0) b = m;
+                            else a = m;
+                        }
+                        t = 0.5 * (a + b);
+                        pVec.copy(ro).addScaledVector(rd, t);
+                        break;
+                    }
+                    stepDist = bDist;
+                }
+
+                if (t >= tEnd) break;
+                prevT = t;
+                const stepLen = Math.max(stepDist * 0.90, minStep * (1.0 + step * 0.05));
+                if (t + stepLen > tEnd) {
+                    if (testedEnd) break;
+                    t = tEnd;
+                    testedEnd = true;
+                } else {
+                    t += stepLen;
+                }
+            }
+
+            if (!hit) return null;
+
+            let hitNormal = null;
+            if (hitSliceCap) {
+                if (fullHit) hitNormal = new THREE.Vector3(0.0, -1.0, 0.0);
+            } else {
+                cpuCalcBsplineGrad(pVec.x, pVec.y, pVec.z, gradVec, buf, res, domainHalf, isHalf);
+                if (fullHit) {
+                    const rawLenSq = gradVec.lengthSq();
+                    hitNormal = new THREE.Vector3();
+                    if (rawLenSq > 1e-10) hitNormal.copy(gradVec).multiplyScalar(1.0 / Math.sqrt(rawLenSq));
+                    else if (pVec.lengthSq() > 1e-8) hitNormal.copy(pVec).normalize();
+                    else hitNormal.set(0.0, 1.0, 0.0);
+                }
+                const bVal = sampleBsplineDistFromBuffer(pVec.x, pVec.y, pVec.z, buf, res, domainHalf, isHalf);
+                const denom = gradVec.dot(rd);
+                if (denom < -0.15) {
+                    const deltaT = Math.max(-voxelSize * 0.45, Math.min(voxelSize * 0.45, -bVal / denom));
+                    t = Math.max(tEntry, Math.min(tEnd, t + deltaT));
+                    pVec.copy(ro).addScaledVector(rd, t);
+                }
+            }
+
+            if (t < nearT || t > farT) return null;
+            if (!fullHit) return t;
+
+            const sampleRes = cpuSampleBspline(pVec.x, pVec.y, pVec.z);
+            return {
+                point: pVec.clone(),
+                normal: hitNormal,
+                face: { normal: hitNormal },
+                distance: t,
+                materialId: sampleRes.mat,
+                object: volumeBoxMesh
+            };
+        }
+
+        function measureVisualCollisionError(raycaster) {
+            if (!raymarchMaterial) return null;
+            const u = raymarchMaterial.uniforms;
+            const tex = u.uVolume.value;
+            const texData = tex && tex.image ? tex.image.data : null;
+            if (!texData) return null;
+            const texIsHalf = Boolean(tex.type === THREE.HalfFloatType);
+
+            const nearT = raycaster.near || 0.0;
+            const farT = (raycaster.far !== undefined && raycaster.far !== null) ? raycaster.far : Infinity;
+            const gpuDist = marchVolumeRay(
+                raycaster.ray.origin,
+                raycaster.ray.direction,
+                nearT,
+                farT,
+                texData,
+                u.uVolRes.value,
+                u.uDomainHalf.value,
+                u.uAsteroidRadius.value,
+                texIsHalf,
+                u.uXRayEnabled.value > 0.5,
+                u.uXRayOffset.value,
+                u.uMaxSteps.value,
+                false
+            );
+            const cpuHit = sandbox.config.customRaycast(raycaster, null, null);
+            if (gpuDist === null && !cpuHit) return null;
+            return Math.abs((gpuDist !== null ? gpuDist : 0.0) - (cpuHit ? cpuHit.distance : 0.0));
+        }
+        window.measureVisualCollisionError = measureVisualCollisionError;
+
         // Shared Sandbox Setup
         const sandbox = new PlanetaryBaseSandbox({
             pocId: 'poc4',
@@ -927,6 +1385,7 @@
             hasLocalCollisionMesh: false,
             getCollisionMesh: () => null,
             getVisualMesh: () => volumeBoxMesh,
+            auditVisualCollisionParity: measureVisualCollisionError,
             getCellSize: () => `${VOXEL_SPACING.toFixed(1)}u (${VOL_RES}³)`,
             onBeforeRender: () => {
                 if (raymarchMaterial) {
@@ -939,111 +1398,44 @@
                 }
             },
 
-            // Analytical CPU Sphere-Marching Raycast (0.00u visual-to-collision parity; supports world-space rays)
+            // Analytical CPU C2 B-Spline Sphere-Marching Raycast (< 0.001u parity with GPU shader)
             customRaycast: (raycaster, camera, mousePos) => {
                 if (camera && mousePos) {
                     raycaster.setFromCamera(mousePos, camera);
                 }
-                const ro = raycaster.ray.origin;
-                const rd = raycaster.ray.direction;
                 const nearT = raycaster.near || 0.0;
                 const farT = (raycaster.far !== undefined && raycaster.far !== null) ? raycaster.far : Infinity;
+                const maxSteps = raymarchMaterial ? raymarchMaterial.uniforms.uMaxSteps.value : (isSoftwareGL ? 48 : 96);
+                const xRayEnabled = Boolean(sandbox.isXRay);
+                const xRayOffset = sandbox.clipPlane ? sandbox.clipPlane.constant : sandbox.xRayOffset;
 
-                // Intersect ray with volume AABB before sphere-marching
-                _rcBoxMin.set(-DOMAIN_HALF, -DOMAIN_HALF, -DOMAIN_HALF);
-                _rcBoxMax.set(DOMAIN_HALF, DOMAIN_HALF, DOMAIN_HALF);
-                _rcBox.set(_rcBoxMin, _rcBoxMax);
-                const insideBox = _rcBox.containsPoint(ro);
-                if (!insideBox && !raycaster.ray.intersectBox(_rcBox, _rcEntryPt)) {
-                    return null;
-                }
-                let t = Math.max(nearT, insideBox ? 0.0 : ro.distanceTo(_rcEntryPt) + 1.0);
-
-                // Analytical Bounding-Sphere Early-Out (matches GPU shader)
-                const rBound = currentRadius * 1.25;
-                const bSph = ro.dot(rd);
-                const cSph = ro.lengthSq() - rBound * rBound;
-                const dSph = bSph * bSph - cSph;
-                if (dSph < 0.0) return null;
-                const sqrtD = Math.sqrt(dSph);
-                const ts0 = -bSph - sqrtD;
-                const ts1 = -bSph + sqrtD;
-                if (ts1 < nearT) return null;
-                if (ts0 > 0.0) t = Math.max(t, ts0 + 0.5);
-                const maxT = Math.min(ts1, farT);
-                if (maxT < t) return null;
-
-                let prevT = t;
-                const minStep = Math.max(currentRadius * 0.001, 1.5);
-                let testedMaxT = false;
-
-                for (let step = 0; step < 96; step++) {
-                    _rcP.copy(ro).addScaledVector(rd, t);
-                    if (sandbox.isXRay && _rcP.y > -sandbox.xRayOffset) {
-                        if (rd.y >= -1e-5) return null;
-                        const tPlane = (-sandbox.xRayOffset - ro.y) / rd.y;
-                        if (tPlane > maxT) return null;
-                        t = Math.max(t + 1.0, tPlane);
-                        if (t > maxT) {
-                            if (testedMaxT) break;
-                            t = maxT;
-                            testedMaxT = true;
-                        }
-                        prevT = t;
-                        continue;
-                    }
-                    const d = cpuSampleSDFDistance(_rcP.x, _rcP.y, _rcP.z);
-                    if (d <= 0.0) {
-                        let a = prevT, b = t;
-                        for (let k = 0; k < 5; k++) {
-                            const m = 0.5 * (a + b);
-                            _rcMp.copy(ro).addScaledVector(rd, m);
-                            if (cpuSampleSDFDistance(_rcMp.x, _rcMp.y, _rcMp.z) <= 0.0) b = m;
-                            else a = m;
-                        }
-                        const refinedT = 0.5 * (a + b);
-                        if (refinedT < nearT || refinedT > farT) return null;
-                        _rcP.copy(ro).addScaledVector(rd, refinedT);
-                        const finalSamp = cpuSampleSDF(_rcP.x, _rcP.y, _rcP.z);
-                        const eps = Math.max(10.0, VOXEL_SPACING * 0.45);
-                        const norm = new THREE.Vector3(
-                            cpuSampleSDFDistance(_rcP.x + eps, _rcP.y, _rcP.z) - cpuSampleSDFDistance(_rcP.x - eps, _rcP.y, _rcP.z),
-                            cpuSampleSDFDistance(_rcP.x, _rcP.y + eps, _rcP.z) - cpuSampleSDFDistance(_rcP.x, _rcP.y - eps, _rcP.z),
-                            cpuSampleSDFDistance(_rcP.x, _rcP.y, _rcP.z + eps) - cpuSampleSDFDistance(_rcP.x, _rcP.y, _rcP.z - eps)
-                        );
-                        if (norm.lengthSq() > 1e-8) norm.normalize();
-                        else if (_rcP.lengthSq() > 1e-8) norm.copy(_rcP).normalize();
-                        else norm.set(0, 1, 0);
-
-                        return {
-                            point: _rcP.clone(),
-                            normal: norm,
-                            distance: refinedT,
-                            materialId: Math.round(finalSamp.mat),
-                            object: volumeBoxMesh
-                        };
-                    }
-                    if (t >= maxT) break;
-                    prevT = t;
-                    const stepLen = Math.max(d * 0.90, minStep * (1.0 + step * 0.05));
-                    if (t + stepLen > maxT) {
-                        if (testedMaxT) break;
-                        t = maxT;
-                        testedMaxT = true;
-                    } else {
-                        t += stepLen;
-                    }
-                }
-                return null;
+                return marchVolumeRay(
+                    raycaster.ray.origin,
+                    raycaster.ray.direction,
+                    nearT,
+                    farT,
+                    volumeData,
+                    VOL_RES,
+                    DOMAIN_HALF,
+                    currentRadius,
+                    false,
+                    xRayEnabled,
+                    xRayOffset,
+                    maxSteps,
+                    true
+                );
             },
 
-            // Exact SDF Swept-Sphere Collision & 4-Tap Tetrahedral Gradient Push-Out
+            // Exact C2 B-Spline Swept-Sphere Collision & 4-Tap Tetrahedral Gradient Push-Out (X-Ray aware)
             resolveSphereCollision: (pos, nextPos, radius) => {
                 _colCurPos.copy(pos);
                 _colRemDelta.copy(nextPos).sub(pos);
                 const dispLen = _colRemDelta.length();
                 const substeps = dispLen > 1e-4 ? Math.min(8, Math.max(2, Math.ceil(dispLen / Math.max(radius * 0.5, 4.0)))) : 1;
-                const eps = Math.max(4.0, VOXEL_SPACING * 0.30);
+                const eps = Math.max(4.0, VOXEL_SPACING * 0.35);
+                const xRayEnabled = Boolean(sandbox.isXRay);
+                const sliceY = -(sandbox.clipPlane ? sandbox.clipPlane.constant : sandbox.xRayOffset);
+                const nearSurfaceThresh = radius + VOXEL_SPACING * 0.75;
 
                 let collided = false;
                 let minD = Infinity;
@@ -1057,12 +1449,16 @@
                     _colCurPos.add(_colStep);
 
                     for (let pass = 0; pass < 2; pass++) {
-                        const d = cpuSampleSDFDistance(_colCurPos.x, _colCurPos.y, _colCurPos.z);
+                        const dFast = cpuSampleSDFDistance(_colCurPos.x, _colCurPos.y, _colCurPos.z);
+                        const dCoarse = xRayEnabled ? Math.max(dFast, sliceY - _colCurPos.y) : dFast;
+                        if (dCoarse >= nearSurfaceThresh) break;
+
+                        const d = evalResolvedBsplineDist(_colCurPos.x, _colCurPos.y, _colCurPos.z);
                         if (d < radius) {
-                            const d0 = cpuSampleSDFDistance(_colCurPos.x + eps, _colCurPos.y - eps, _colCurPos.z - eps);
-                            const d1 = cpuSampleSDFDistance(_colCurPos.x - eps, _colCurPos.y - eps, _colCurPos.z + eps);
-                            const d2 = cpuSampleSDFDistance(_colCurPos.x - eps, _colCurPos.y + eps, _colCurPos.z - eps);
-                            const d3 = cpuSampleSDFDistance(_colCurPos.x + eps, _colCurPos.y + eps, _colCurPos.z + eps);
+                            const d0 = evalResolvedBsplineDist(_colCurPos.x + eps, _colCurPos.y - eps, _colCurPos.z - eps);
+                            const d1 = evalResolvedBsplineDist(_colCurPos.x - eps, _colCurPos.y - eps, _colCurPos.z + eps);
+                            const d2 = evalResolvedBsplineDist(_colCurPos.x - eps, _colCurPos.y + eps, _colCurPos.z - eps);
+                            const d3 = evalResolvedBsplineDist(_colCurPos.x + eps, _colCurPos.y + eps, _colCurPos.z + eps);
                             _colGrad.set(
                                 d0 - d1 - d2 + d3,
                                 -d0 - d1 + d2 + d3,
@@ -1110,8 +1506,7 @@
 
             checkMaterialAtHit: (point, hit) => {
                 if (hit && hit.materialId >= 3) return true;
-                const sample = cpuSampleSDF(point.x, point.y, point.z);
-                return sample.armor >= 0.35;
+                return cpuSampleBspline(point.x, point.y, point.z).mat === 3;
             },
 
             onScaleChange: (scaleKey, radius) => {

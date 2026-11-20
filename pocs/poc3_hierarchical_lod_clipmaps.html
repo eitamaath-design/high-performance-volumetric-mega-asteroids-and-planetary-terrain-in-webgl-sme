@@ -135,6 +135,40 @@
             macroCrustMaterial.userData.shaderUniforms.uPortalDomainHalf.value = currentRadius * 1.30;
         }
 
+        function isPointInsideClusteredPortalCPU(worldPos) {
+            const domainHalf = macroCrustMaterial.userData.shaderUniforms.uPortalDomainHalf.value;
+            const domainSize = domainHalf * 2.0;
+            const u = (worldPos.x + domainHalf) / domainSize;
+            const v = (worldPos.y + domainHalf) / domainSize;
+            const w = (worldPos.z + domainHalf) / domainSize;
+            if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0 || w < 0.0 || w > 1.0) return false;
+
+            const cx = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(u * PORTAL_GRID_RES)));
+            const cy = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(v * PORTAL_GRID_RES)));
+            const cz = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(w * PORTAL_GRID_RES)));
+            const baseX = ((cz % 8) * PORTAL_GRID_RES + cx) * 4;
+            const baseY = Math.floor(cz / 8) * PORTAL_GRID_RES + cy;
+            const cellBaseIdx = (baseY * 1024 + baseX) * 4;
+
+            for (let s = 0; s < 16; s++) {
+                const id = portalGridData[cellBaseIdx + s];
+                if (id <= 0.0) return false;
+                const slot = Math.round(id) - 1;
+                if (slot < 0 || slot >= MAX_PORTALS) continue;
+                const listBase = slot * 4;
+                const pr = portalListData[listBase + 3];
+                if (pr > 0.0) {
+                    const dx = worldPos.x - portalListData[listBase];
+                    const dy = worldPos.y - portalListData[listBase + 1];
+                    const dz = worldPos.z - portalListData[listBase + 2];
+                    if (Math.sqrt(dx * dx + dy * dy + dz * dz) < pr) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         function registerPortalHole(point, brushRadius) {
             const cutRadius = brushRadius * 0.88;
             const distFromSurface = Math.abs(point.length() - evalMacroRadiusAt(point.x, point.y, point.z));
@@ -846,6 +880,24 @@
                 if (planetaryMacroShell) list.push(planetaryMacroShell);
                 list.push(...activeSubterraneanMeshes);
                 return list;
+            },
+            auditVisualCollisionParity: (raycaster) => {
+                const visTargets = [];
+                if (planetaryMacroShell) visTargets.push(planetaryMacroShell);
+                visTargets.push(...activeSubterraneanMeshes);
+                const visHits = visTargets.length > 0 ? raycaster.intersectObjects(visTargets, false) : [];
+                let visHit = null;
+                for (let i = 0; i < visHits.length; i++) {
+                    const h = visHits[i];
+                    if (h.object === planetaryMacroShell && isPointInsideClusteredPortalCPU(h.point)) {
+                        continue;
+                    }
+                    visHit = h;
+                    break;
+                }
+                const colHit = sandbox.config.customRaycast(raycaster, null, null);
+                if (!visHit && !colHit) return null;
+                return Math.abs((visHit ? visHit.distance : 0) - (colHit ? colHit.distance : 0));
             },
             getCellSize: () => `${SUBTERRANEAN_CELL_SIZE.toFixed(1)}u (${macroSegments}seg / ${SUBTERRANEAN_CHUNK_RES}³)`,
 

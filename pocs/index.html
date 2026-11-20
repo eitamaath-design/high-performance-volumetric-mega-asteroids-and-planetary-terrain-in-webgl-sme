@@ -158,7 +158,7 @@
         <button id="btn-poc4" class="btn-poc" onclick="switchPoC('poc4')">
           <div>
             <div style="font-weight:bold; color:#c084fc;">Option 4: 3D GPU SDF Raymarcher</div>
-            <div style="font-size:10px; color:#94a3b8;">Data3DTexture + Shared CPU Trilinear</div>
+            <div style="font-size:10px; color:#94a3b8;">Data3DTexture + Shared CPU C² B-Spline</div>
           </div>
           <span style="font-size:11px; color:var(--green-glow); font-family:monospace;">0.00u</span>
         </button>
@@ -352,8 +352,8 @@
               </tr>
               <tr id="row-poc4">
                 <td style="padding:8px; border:1px solid #1e293b; color:#c084fc; font-weight:bold;">Option 4: 3D GPU SDF Raymarcher</td>
-                <td id="cell-poc4-ext" style="padding:8px; border:1px solid #1e293b;">Continuous Trilinear</td>
-                <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">0.00u (Trilinear Match)</td>
+                <td id="cell-poc4-ext" style="padding:8px; border:1px solid #1e293b;">Continuous C² B-Spline</td>
+                <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">0.00u (C² B-Spline Match)</td>
                 <td id="cell-poc4-carve" style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">< 0.05 ms (Texture)</td>
                 <td style="padding:8px; border:1px solid #1e293b;">Dual-Channel Texture Armor</td>
                 <td style="padding:8px; border:1px solid #1e293b;">Medium (VRAM Texture Limits)</td>
@@ -596,7 +596,9 @@
       document.getElementById('hdr-ft').innerText = conf.ft;
       document.getElementById('hdr-tris').innerText = conf.tris;
       document.getElementById('hdr-carve').innerText = conf.carve;
-      document.getElementById('hdr-err').innerText = conf.err;
+      const errEl = document.getElementById('hdr-err');
+      errEl.innerText = conf.err;
+      errEl.style.color = (String(conf.err).includes('>') || (typeof conf.errNumeric === 'number' && conf.errNumeric >= 0.005)) ? 'var(--red-glow)' : 'var(--green-glow)';
       document.getElementById('hdr-heap').innerText = conf.heap;
     }
 
@@ -623,6 +625,7 @@
               : `${entry.avgCarveLatency.toFixed(2)}ms`;
           }
           if (entry.visualCollisionError) conf.err = entry.visualCollisionError;
+          if (typeof entry.visualCollisionErrorNumeric === 'number') conf.errNumeric = entry.visualCollisionErrorNumeric;
           if (typeof entry.heapMemoryMB === 'number') conf.heap = `${entry.heapMemoryMB.toFixed(2)} MB`;
 
           const extEl = document.getElementById(`cell-${id}-ext`);
@@ -655,6 +658,8 @@
         ? `<div style="font-size:10px; color:#94a3b8;">CPU Work: ${res.avgMainThreadWorkMs.toFixed(2)} ms${typeof res.p99MainThreadWorkMs === 'number' ? ` / P99 ${res.p99MainThreadWorkMs.toFixed(2)} ms` : ''}</div>`
         : '';
 
+      const errColor = (typeof res.visualCollisionErrorNumeric === 'number' && res.visualCollisionErrorNumeric >= 0.005) ? '#ef4444' : '#10b981';
+
       const row = document.createElement('tr');
       row.innerHTML = `
         <td style="padding:8px; border:1px solid #1e293b; color:${color}; font-weight:bold;">${conf ? conf.title : res.poc}</td>
@@ -664,7 +669,7 @@
         <td style="padding:8px; border:1px solid #1e293b; color:#fbbf24; font-weight:bold;">${carvePrimary}${carveSub}</td>
         <td style="padding:8px; border:1px solid #1e293b;">${res.triangles.toLocaleString()} / ${res.drawCalls}</td>
         <td style="padding:8px; border:1px solid #1e293b;">${res.heapMemoryMB.toFixed(2)} MB</td>
-        <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">${res.visualCollisionError || '0.00u'}</td>
+        <td style="padding:8px; border:1px solid #1e293b; color:${errColor}; font-weight:bold;">${res.visualCollisionError || '0.00u'}</td>
       `;
       tbody.appendChild(row);
 
@@ -741,7 +746,9 @@
         document.getElementById('hdr-ft').innerText = `${d.frameTime.toFixed(1)}ms`;
         document.getElementById('hdr-tris').innerText = d.triangles.toLocaleString();
         document.getElementById('hdr-carve').innerText = `${d.carveDur.toFixed(2)}ms`;
-        document.getElementById('hdr-err').innerText = d.visualCollisionError || '0.00u';
+        const errEl = document.getElementById('hdr-err');
+        errEl.innerText = d.visualCollisionError || '0.00u';
+        errEl.style.color = (typeof d.visualCollisionErrorNumeric === 'number' && d.visualCollisionErrorNumeric >= 0.005) ? 'var(--red-glow)' : 'var(--green-glow)';
         document.getElementById('hdr-heap').innerText = `${d.heap.toFixed(1)} MB`;
 
         if (!isRunningBenchmark && (performance.now() - lastParamChangeTime > 2500) && (d.scale || d.quality)) {

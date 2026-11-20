@@ -325,6 +325,14 @@ const SPHERE_PROBE_DIRS = [
     new THREE.Vector3(-_DIAG_INV, -_DIAG_INV, -_DIAG_INV)
 ];
 
+const AUDIT_NDC_PROBES = [
+    [0, 0],
+    [-0.12, 0.10],
+    [0.12, -0.10],
+    [-0.10, -0.12],
+    [0.10, 0.12]
+];
+
 export class PlanetaryBaseSandbox {
     constructor(config = {}) {
         this.config = Object.assign({
@@ -346,6 +354,7 @@ export class PlanetaryBaseSandbox {
             getCollisionMesh: null,
             getVisualMesh: null,
             customRaycast: null,
+            auditVisualCollisionParity: null,
             resolveSphereCollision: null,
             checkMaterialAtHit: null
         }, config);
@@ -406,6 +415,9 @@ export class PlanetaryBaseSandbox {
         this._colHitPt = new THREE.Vector3();
         this._colTmpVec = new THREE.Vector3();
         this._currentCamArmDist = 52.5;
+        this._auditRaycaster = new THREE.Raycaster();
+        this._auditNdc = new THREE.Vector2();
+        this._auditDir = new THREE.Vector3();
 
         // Telemetry
         this.fps = 60;
@@ -421,7 +433,8 @@ export class PlanetaryBaseSandbox {
         this.triangles = 0;
         this.lastCarveLatency = 0.0;
         this.lastMainThreadCarveMs = 0.0;
-        this.visualCollisionError = 0.0;
+        this.visualCollisionErrorNumeric = 0.0;
+        this.visualCollisionError = '0.00u';
         this.frameCount = 0;
         this._pendingBenchmarkCarves = 0;
         this._benchmarkExtraWaitFrames = 0;
@@ -1528,6 +1541,88 @@ export class PlanetaryBaseSandbox {
         this.sparkPoints.visible = true;
     }
 
+    /**
+     * Measure visual-vs-collision hit distance discrepancy along a single world ray.
+     */
+    _measureAuditRayError(raycaster) {
+        if (this.config.auditVisualCollisionParity) {
+            return this.config.auditVisualCollisionParity(raycaster);
+        }
+
+        const visMesh = this.config.getVisualMesh ? this.config.getVisualMesh() : null;
+        const colMesh = this.config.getCollisionMesh ? this.config.getCollisionMesh() : null;
+        const visTargets = visMesh ? (Array.isArray(visMesh) ? visMesh : [visMesh]) : [];
+        const visHit = visTargets.length > 0 ? (raycaster.intersectObjects(visTargets, true)[0] || null) : null;
+
+        let colHit = null;
+        if (this.config.customRaycast) {
+            colHit = this.config.customRaycast(raycaster, null, null);
+        } else if (colMesh) {
+            const colTargets = Array.isArray(colMesh) ? colMesh : [colMesh];
+            if (colTargets.length > 0) {
+                colHit = raycaster.intersectObjects(colTargets, true)[0] || null;
+            }
+        }
+
+        if (!visHit && !colHit) return null;
+        return Math.abs((visHit ? visHit.distance : 0) - (colHit ? colHit.distance : 0));
+    }
+
+    /**
+     * Probe camera NDC rays (with center fallback) to compute live visual-to-collision error.
+     */
+    auditVisualCollisionError() {
+        this.camera.updateMatrixWorld();
+        this._auditRaycaster.near = 0.0;
+        this._auditRaycaster.far = Infinity;
+
+        let validRays = 0;
+        let maxErr = 0.0;
+
+        for (let i = 0; i < AUDIT_NDC_PROBES.length; i++) {
+            const probe = AUDIT_NDC_PROBES[i];
+            this._auditNdc.set(probe[0], probe[1]);
+            this._auditRaycaster.setFromCamera(this._auditNdc, this.camera);
+            const rayErr = this._measureAuditRayError(this._auditRaycaster);
+            if (rayErr !== null) {
+                validRays++;
+                if (rayErr > maxErr) maxErr = rayErr;
+            }
+        }
+
+        if (validRays === 0) {
+            this._auditDir.set(0, 0, 0).sub(this.camera.position);
+            if (this._auditDir.lengthSq() > 1e-12) {
+                this._auditDir.normalize();
+                this._auditRaycaster.near = 0.0;
+                this._auditRaycaster.far = Infinity;
+                this._auditRaycaster.set(this.camera.position, this._auditDir);
+                const fallbackErr = this._measureAuditRayError(this._auditRaycaster);
+                if (fallbackErr !== null) {
+                    validRays++;
+                    if (fallbackErr > maxErr) maxErr = fallbackErr;
+                }
+            }
+        }
+
+        const err = validRays > 0 ? maxErr : 0.0;
+        const formatted = err < 0.005 ? `${err.toFixed(2)}u` : `${parseFloat(err.toFixed(4))}u`;
+        this.visualCollisionErrorNumeric = parseFloat(err.toFixed(6));
+        this.visualCollisionError = formatted;
+
+        const errEl = this.hud ? this.hud.querySelector('#tel-collision-err') : null;
+        if (errEl) {
+            if (err < 0.005) {
+                errEl.style.color = '#00ffff';
+                errEl.innerText = `${formatted} (Exact)`;
+            } else {
+                errEl.style.color = '#ff4444';
+                errEl.innerText = `${formatted} (Drift!)`;
+            }
+        }
+        return this.visualCollisionErrorNumeric;
+    }
+
     updateAlignmentOverlay(hitPoint, hitNormal) {
         if (!this.showCollisionOverlay) {
             this.alignmentMarker.visible = false;
@@ -1543,11 +1638,7 @@ export class PlanetaryBaseSandbox {
         this.normalLine.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), hitNormal);
         this.normalLine.visible = true;
 
-        // Visual-Collision Discrepancy Measurement:
-        // In this unified architecture, because the physics collider is extracted directly from the
-        // identical visual geometry (or shared analytic SDF), discrepancy is mathematically 0.00u.
-        this.visualCollisionError = 0.00;
-        this.hud.querySelector('#tel-collision-err').innerText = `0.00u (Exact)`;
+        this.auditVisualCollisionError();
     }
 
     updateShipPhysics(dt) {
@@ -1746,7 +1837,8 @@ export class PlanetaryBaseSandbox {
             triangles: 0,
             drawCalls: 0,
             heapMemoryMB: 0,
-            visualCollisionError: '0.00u'
+            visualCollisionError: this.visualCollisionError || '0.00u',
+            visualCollisionErrorNumeric: this.visualCollisionErrorNumeric ?? 0.0
         };
         this.carveLatencies = [];
         this.mainThreadCarveLatencies = [];
@@ -1816,6 +1908,8 @@ export class PlanetaryBaseSandbox {
                 heap = window.performance.memory.usedJSHeapSize / (1024 * 1024);
             }
 
+            this.auditVisualCollisionError();
+
             this.benchmarkResults = {
                 poc: this.config.pocId,
                 scale: this.currentScaleKey,
@@ -1833,7 +1927,8 @@ export class PlanetaryBaseSandbox {
                 triangles: this.triangles,
                 drawCalls: this.drawCalls,
                 heapMemoryMB: parseFloat(heap.toFixed(2)),
-                visualCollisionError: '0.00u'
+                visualCollisionError: this.visualCollisionError,
+                visualCollisionErrorNumeric: this.visualCollisionErrorNumeric
             };
 
             window.__BENCHMARK_RESULTS__ = this.benchmarkResults;
@@ -1923,6 +2018,10 @@ export class PlanetaryBaseSandbox {
         this.renderer.render(this.scene, this.camera);
         const frameWorkMs = performance.now() - frameWorkStart;
 
+        if (this.frameCount === 1 || this.frameCount % 30 === 0) {
+            this.auditVisualCollisionError();
+        }
+
         // Extract Render Telemetry
         this.drawCalls = this.renderer.info.render.calls;
         this.triangles = this.renderer.info.render.triangles;
@@ -1943,7 +2042,8 @@ export class PlanetaryBaseSandbox {
                     triangles: this.triangles,
                     drawCalls: this.drawCalls,
                     carveDur: parseFloat(this.lastCarveLatency.toFixed(2)),
-                    visualCollisionError: '0.00u',
+                    visualCollisionError: this.visualCollisionError,
+                    visualCollisionErrorNumeric: this.visualCollisionErrorNumeric,
                     heap: (window.performance && window.performance.memory) ?
                         parseFloat((window.performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(2)) : 9.54,
                     scale: this.currentScaleKey,

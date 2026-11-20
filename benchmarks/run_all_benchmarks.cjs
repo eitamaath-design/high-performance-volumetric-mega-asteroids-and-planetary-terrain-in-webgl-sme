@@ -102,7 +102,8 @@ function normalizeResult(key, raw) {
             triangles: raw.trianglesCount ?? raw.triangles ?? 0,
             drawCalls: raw.drawCalls ?? 0,
             heapMemoryMB: raw.heapMemoryMb ?? raw.heapMemoryMB ?? 0,
-            visualCollisionError: raw.visualCollisionError || '> 30.00u'
+            visualCollisionError: raw.visualCollisionError || '> 30.00u',
+            visualCollisionErrorNumeric: typeof raw.visualCollisionErrorNumeric === 'number' ? raw.visualCollisionErrorNumeric : null
         };
     }
 
@@ -123,7 +124,8 @@ function normalizeResult(key, raw) {
         triangles: raw.triangles ?? 0,
         drawCalls: raw.drawCalls ?? 0,
         heapMemoryMB: raw.heapMemoryMB ?? 0,
-        visualCollisionError: raw.visualCollisionError || '0.00u'
+        visualCollisionError: raw.visualCollisionError || '0.00u',
+        visualCollisionErrorNumeric: typeof raw.visualCollisionErrorNumeric === 'number' ? raw.visualCollisionErrorNumeric : 0
     };
 }
 

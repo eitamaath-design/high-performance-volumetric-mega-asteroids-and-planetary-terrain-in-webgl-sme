@@ -7,13 +7,14 @@
   "avgFps": 60,
   "avgFrameTime": 16.67,
   "p99FrameTime": 16.8,
-  "avgMainThreadWorkMs": 0.3,
-  "p99MainThreadWorkMs": 1.6,
-  "avgCarveLatency": 3.07,
-  "avgMainThreadCarveMs": 3.07,
+  "avgMainThreadWorkMs": 0.32,
+  "p99MainThreadWorkMs": 2.3,
+  "avgCarveLatency": 4.17,
+  "avgMainThreadCarveMs": 4.17,
   "sampledFrames": 421,
-  "triangles": 36716,
+  "triangles": 36700,
   "drawCalls": 95,
-  "heapMemoryMB": 17.36,
-  "visualCollisionError": "0.00u"
+  "heapMemoryMB": 19.55,
+  "visualCollisionError": "0.00u",
+  "visualCollisionErrorNumeric": 0
 }
