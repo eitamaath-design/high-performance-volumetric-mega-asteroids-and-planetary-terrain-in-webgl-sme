@@ -126,6 +126,9 @@
 
             initVoxels() {
                 const pRes = CHUNK_RES + 5;
+                const minCrustR = currentRadius * 0.85;
+                const maxCrustR = currentRadius * 1.18;
+                const oreFreq = 0.0055 * (2800.0 / currentRadius);
                 let idx = 0;
                 for (let pz = 0; pz < pRes; pz++) {
                     const wz = this.minBounds.z + (pz - 2) * CELL_SIZE;
@@ -133,10 +136,10 @@
                         const wy = this.minBounds.y + (py - 2) * CELL_SIZE;
                         for (let px = 0; px < pRes; px++) {
                             const wx = this.minBounds.x + (px - 2) * CELL_SIZE;
-                            const d = evalDensityPoC1(wx, wy, wz);
+                            const rDist = Math.sqrt(wx * wx + wy * wy + wz * wz);
+                            const d = (rDist < minCrustR || rDist > maxCrustR) ? (rDist - currentRadius) : evalDensityPoC1(wx, wy, wz);
                             this.voxelData[idx] = d;
 
-                            const oreFreq = 0.0055 * (2800.0 / currentRadius);
                             if (d < -CELL_SIZE && Math.sin(wx * oreFreq + wy * oreFreq * 0.36) * Math.cos(wz * oreFreq) > 0.78) {
                                 this.materialData[idx] = 2; // Ore vein
                             } else {
@@ -263,7 +266,11 @@
 
         async function carveSpherePoC1(hitPoint, brushRadius) {
             const pRes = CHUNK_RES + 5;
+            const pRes2 = pRes * pRes;
+            const pad = brushRadius + CELL_SIZE * 2.5;
+            const padSq = pad * pad;
             const effPad = brushRadius + CELL_SIZE * 3.5;
+            const invCell = 1.0 / CELL_SIZE;
             const minCX = Math.floor((hitPoint.x - effPad) / CHUNK_SIZE);
             const maxCX = Math.floor((hitPoint.x + effPad) / CHUNK_SIZE);
             const minCY = Math.floor((hitPoint.y - effPad) / CHUNK_SIZE);
@@ -273,26 +280,50 @@
 
             const rebuilds = [];
             for (let cz = minCZ; cz <= maxCZ; cz++) {
+                const cMinZ = cz * CHUNK_SIZE - 2 * CELL_SIZE;
+                const cMaxZ = cz * CHUNK_SIZE + (CHUNK_RES + 2) * CELL_SIZE;
+                const dz = hitPoint.z < cMinZ ? cMinZ - hitPoint.z : (hitPoint.z > cMaxZ ? hitPoint.z - cMaxZ : 0);
+                const dz2 = dz * dz;
+                if (dz2 > padSq) continue;
                 for (let cy = minCY; cy <= maxCY; cy++) {
+                    const cMinY = cy * CHUNK_SIZE - 2 * CELL_SIZE;
+                    const cMaxY = cy * CHUNK_SIZE + (CHUNK_RES + 2) * CELL_SIZE;
+                    const dy = hitPoint.y < cMinY ? cMinY - hitPoint.y : (hitPoint.y > cMaxY ? hitPoint.y - cMaxY : 0);
+                    const dyz2 = dz2 + dy * dy;
+                    if (dyz2 > padSq) continue;
                     for (let cx = minCX; cx <= maxCX; cx++) {
+                        const cMinX = cx * CHUNK_SIZE - 2 * CELL_SIZE;
+                        const cMaxX = cx * CHUNK_SIZE + (CHUNK_RES + 2) * CELL_SIZE;
+                        const dx = hitPoint.x < cMinX ? cMinX - hitPoint.x : (hitPoint.x > cMaxX ? hitPoint.x - cMaxX : 0);
+                        if (dx * dx + dyz2 > padSq) continue;
+
                         const chunk = getOrCreateChunk(cx, cy, cz);
-                        let idx = 0;
+                        const minPX = Math.max(0, Math.floor((hitPoint.x - pad - chunk.minBounds.x) * invCell + 2));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + pad - chunk.minBounds.x) * invCell + 2));
+                        const minPY = Math.max(0, Math.floor((hitPoint.y - pad - chunk.minBounds.y) * invCell + 2));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + pad - chunk.minBounds.y) * invCell + 2));
+                        const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 2));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 2));
+                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+
                         let modified = false;
-                        for (let pz = 0; pz < pRes; pz++) {
+                        for (let pz = minPZ; pz <= maxPZ; pz++) {
                             const wz = chunk.minBounds.z + (pz - 2) * CELL_SIZE;
-                            for (let py = 0; py < pRes; py++) {
+                            const zOff = pz * pRes2;
+                            for (let py = minPY; py <= maxPY; py++) {
                                 const wy = chunk.minBounds.y + (py - 2) * CELL_SIZE;
-                                for (let px = 0; px < pRes; px++) {
+                                const yzOff = zOff + py * pRes;
+                                for (let px = minPX; px <= maxPX; px++) {
                                     const wx = chunk.minBounds.x + (px - 2) * CELL_SIZE;
                                     const distToCenter = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
-                                    if (distToCenter <= brushRadius + CELL_SIZE * 2.5) {
+                                    if (distToCenter <= pad) {
                                         const carveD = brushRadius - distToCenter;
+                                        const idx = yzOff + px;
                                         if (carveD > chunk.voxelData[idx]) {
                                             chunk.voxelData[idx] = carveD;
                                             modified = true;
                                         }
                                     }
-                                    idx++;
                                 }
                             }
                         }
@@ -307,7 +338,9 @@
 
         async function reinforceSpherePoC1(hitPoint, brushRadius) {
             const pRes = CHUNK_RES + 5;
+            const pRes2 = pRes * pRes;
             const effPad = brushRadius + CELL_SIZE * 3.5;
+            const invCell = 1.0 / CELL_SIZE;
             const minCX = Math.floor((hitPoint.x - effPad) / CHUNK_SIZE);
             const maxCX = Math.floor((hitPoint.x + effPad) / CHUNK_SIZE);
             const minCY = Math.floor((hitPoint.y - effPad) / CHUNK_SIZE);
@@ -323,20 +356,29 @@
                         const chunk = chunkMap.get(key);
                         if (!chunk) continue;
 
-                        let idx = 0;
+                        const minPX = Math.max(0, Math.floor((hitPoint.x - brushRadius - chunk.minBounds.x) * invCell + 2));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + brushRadius - chunk.minBounds.x) * invCell + 2));
+                        const minPY = Math.max(0, Math.floor((hitPoint.y - brushRadius - chunk.minBounds.y) * invCell + 2));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + brushRadius - chunk.minBounds.y) * invCell + 2));
+                        const minPZ = Math.max(0, Math.floor((hitPoint.z - brushRadius - chunk.minBounds.z) * invCell + 2));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + brushRadius - chunk.minBounds.z) * invCell + 2));
+                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+
                         let modified = false;
-                        for (let pz = 0; pz < pRes; pz++) {
+                        for (let pz = minPZ; pz <= maxPZ; pz++) {
                             const wz = chunk.minBounds.z + (pz - 2) * CELL_SIZE;
-                            for (let py = 0; py < pRes; py++) {
+                            const zOff = pz * pRes2;
+                            for (let py = minPY; py <= maxPY; py++) {
                                 const wy = chunk.minBounds.y + (py - 2) * CELL_SIZE;
-                                for (let px = 0; px < pRes; px++) {
+                                const yzOff = zOff + py * pRes;
+                                for (let px = minPX; px <= maxPX; px++) {
                                     const wx = chunk.minBounds.x + (px - 2) * CELL_SIZE;
                                     const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                                    const idx = yzOff + px;
                                     if (dist <= brushRadius && chunk.voxelData[idx] < 0) {
                                         chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
                                         modified = true;
                                     }
-                                    idx++;
                                 }
                             }
                         }

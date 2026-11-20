@@ -361,6 +361,9 @@ export class PlanetaryBaseSandbox {
         this.raycaster = new THREE.Raycaster();
         this.lastCarveTick = 0;
         this.carveTickInterval = 50; // 20Hz continuous carving tick
+        this._brushDirty = true;
+        this._isExecutingTool = false;
+        this.isSoftwareGL = false;
 
         // Telemetry
         this.fps = 60;
@@ -413,8 +416,16 @@ export class PlanetaryBaseSandbox {
         this.camera.position.set(0, this.currentRadius * 0.7, initCamZ);
 
         this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+        const gl = this.renderer.getContext();
+        if (gl) {
+            const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+            const rendererStr = dbg
+                ? (gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || gl.getParameter(gl.RENDERER) || '')
+                : (gl.getParameter(gl.RENDERER) || '');
+            this.isSoftwareGL = /SwiftShader|llvmpipe|Software/i.test(String(rendererStr));
+        }
+        this.renderer.setPixelRatio(this.isSoftwareGL ? 1 : Math.min(window.devicePixelRatio, 2));
         this.renderer.setSize(window.innerWidth, window.innerHeight);
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
         this.renderer.localClippingEnabled = true;
         this.container.appendChild(this.renderer.domElement);
 
@@ -862,6 +873,10 @@ export class PlanetaryBaseSandbox {
         sliderRadius.addEventListener('input', (e) => {
             this.brushRadius = parseFloat(e.target.value);
             hud.querySelector('#lbl-radius').innerText = `${this.brushRadius}u`;
+            if (this.brushCursorMesh && this.brushCursorMesh.visible) {
+                this.brushCursorMesh.scale.setScalar(this.brushRadius);
+            }
+            this._brushDirty = true;
         });
 
         // Scale Buttons
@@ -1074,17 +1089,23 @@ export class PlanetaryBaseSandbox {
         // Mouse strictly handles camera orbit/pan/zoom & aim tracking (never fires laser)
         dom.addEventListener('pointerdown', (e) => {
             this.updateMousePos(e);
+            this._brushDirty = true;
         });
 
         dom.addEventListener('pointermove', (e) => {
             this.updateMousePos(e);
             if (!this.isFlightMode && !this.isBenchmarkMode) {
-                this.updateBrushPreview();
+                this._brushDirty = true;
             }
         });
 
         dom.addEventListener('pointerleave', () => {
+            this._brushDirty = false;
             if (this.brushCursorMesh) this.brushCursorMesh.visible = false;
+        });
+
+        this.controls.addEventListener('change', () => {
+            this._brushDirty = true;
         });
     }
 
@@ -1158,65 +1179,82 @@ export class PlanetaryBaseSandbox {
     }
 
     async executeActiveTool(forcedHit = null) {
-        const hit = forcedHit || this.performRaycast();
-        if (!hit) {
-            this.laserBeam.visible = false;
-            this.sparkPoints.visible = false;
-            this.alignmentMarker.visible = false;
-            this.normalLine.visible = false;
-            return;
-        }
-
-        const hitPoint = hit.point;
-        const hitNormal = hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) :
-            (hit.normal ? hit.normal.clone() : hitPoint.clone().normalize());
-
-        // Update Visual-to-Collision Alignment Overlay
-        this.updateAlignmentOverlay(hitPoint, hitNormal);
-
-        // Render Laser Beam
-        const origin = this.isFlightMode ? this.shipGroup.position : this.camera.position.clone().add(new THREE.Vector3(0, -20, 0));
-        this.renderLaserBeam(origin, hitPoint);
-        this.spawnSparks(hitPoint, hitNormal);
-
-        this.lastCarveTick = performance.now();
-
-        // Check if hitting reinforced titanium bulkhead
-        let isReinforced = false;
-        if (this.config.checkMaterialAtHit) {
-            isReinforced = this.config.checkMaterialAtHit(hitPoint, hit);
-        } else if (hit.materialId === 2 || hit.materialId === 3 || (hit.object && hit.object.userData && hit.object.userData.isReinforced)) {
-            isReinforced = true;
-        }
-
-        if (this.activeTool === 'raider' && isReinforced) {
-            // Blocked by reinforced bulkhead!
-            this.flashRaiderAlert();
-            return;
-        }
-
-        const t0 = performance.now();
-
-        if (this.activeTool === 'carve' || (this.activeTool === 'raider' && !isReinforced)) {
-            if (this.config.onCarve) {
-                await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'carve');
+        if (this._isExecutingTool) return;
+        this._isExecutingTool = true;
+        try {
+            const hit = forcedHit || this.performRaycast();
+            if (!hit) {
+                this.laserBeam.visible = false;
+                this.sparkPoints.visible = false;
+                this.alignmentMarker.visible = false;
+                this.normalLine.visible = false;
+                if (this.brushCursorMesh && !forcedHit) {
+                    this.brushCursorMesh.visible = false;
+                    this._brushDirty = false;
+                }
+                return;
             }
-        } else if (this.activeTool === 'reinforce') {
-            if (this.config.onReinforce) {
-                await this.config.onReinforce(hitPoint, hitNormal, this.brushRadius);
-            }
-        } else if (this.activeTool === 'breach') {
-            if (this.config.onBreach) {
-                await this.config.onBreach(hitPoint, hitNormal, this.brushRadius);
-            } else if (this.config.onCarve) {
-                await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'breach');
-            }
-        } else if (this.activeTool === 'machinery') {
-            this.placeMachineryAt(hitPoint, hitNormal);
-        }
 
-        this.lastCarveLatency = performance.now() - t0;
-        this.hud.querySelector('#tel-carve-dur').innerText = `${this.lastCarveLatency.toFixed(2)} ms`;
+            if (this.brushCursorMesh && !this.isFlightMode && !this.isBenchmarkMode && hit.point) {
+                this.brushCursorMesh.position.copy(hit.point);
+                this.brushCursorMesh.scale.setScalar(this.brushRadius);
+                this.brushCursorMesh.visible = true;
+                this._brushDirty = false;
+            }
+
+            const hitPoint = hit.point;
+            const hitNormal = hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) :
+                (hit.normal ? hit.normal.clone() : hitPoint.clone().normalize());
+
+            // Update Visual-to-Collision Alignment Overlay
+            this.updateAlignmentOverlay(hitPoint, hitNormal);
+
+            // Render Laser Beam
+            const origin = this.isFlightMode ? this.shipGroup.position : this.camera.position.clone().add(new THREE.Vector3(0, -20, 0));
+            this.renderLaserBeam(origin, hitPoint);
+            this.spawnSparks(hitPoint, hitNormal);
+
+            this.lastCarveTick = performance.now();
+
+            // Check if hitting reinforced titanium bulkhead
+            let isReinforced = false;
+            if (this.config.checkMaterialAtHit) {
+                isReinforced = this.config.checkMaterialAtHit(hitPoint, hit);
+            } else if (hit.materialId === 2 || hit.materialId === 3 || (hit.object && hit.object.userData && hit.object.userData.isReinforced)) {
+                isReinforced = true;
+            }
+
+            if (this.activeTool === 'raider' && isReinforced) {
+                // Blocked by reinforced bulkhead!
+                this.flashRaiderAlert();
+                return;
+            }
+
+            const t0 = performance.now();
+
+            if (this.activeTool === 'carve' || (this.activeTool === 'raider' && !isReinforced)) {
+                if (this.config.onCarve) {
+                    await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'carve');
+                }
+            } else if (this.activeTool === 'reinforce') {
+                if (this.config.onReinforce) {
+                    await this.config.onReinforce(hitPoint, hitNormal, this.brushRadius);
+                }
+            } else if (this.activeTool === 'breach') {
+                if (this.config.onBreach) {
+                    await this.config.onBreach(hitPoint, hitNormal, this.brushRadius);
+                } else if (this.config.onCarve) {
+                    await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'breach');
+                }
+            } else if (this.activeTool === 'machinery') {
+                this.placeMachineryAt(hitPoint, hitNormal);
+            }
+
+            this.lastCarveLatency = performance.now() - t0;
+            this.hud.querySelector('#tel-carve-dur').innerText = `${this.lastCarveLatency.toFixed(2)} ms`;
+        } finally {
+            this._isExecutingTool = false;
+        }
     }
 
     placeMachineryAt(point, normal) {
@@ -1553,13 +1591,16 @@ export class PlanetaryBaseSandbox {
         if (!this.isFlightMode) {
             if (!this.isBenchmarkMode) {
                 const moved = this.updateCameraWASD(dt);
-                if (moved) {
-                    this.updateBrushPreview();
-                }
-                if (this.isSpaceDown && this.activeTool !== 'machinery') {
+                let toolRaycastUpdatedCursor = false;
+                if (this.isSpaceDown && this.activeTool !== 'machinery' && !this._isExecutingTool) {
                     if (now - this.lastCarveTick >= this.carveTickInterval) {
                         this.executeActiveTool();
+                        toolRaycastUpdatedCursor = true;
                     }
+                }
+                if ((this._brushDirty || moved) && !toolRaycastUpdatedCursor) {
+                    this.updateBrushPreview();
+                    this._brushDirty = false;
                 }
             }
             this.controls.update();

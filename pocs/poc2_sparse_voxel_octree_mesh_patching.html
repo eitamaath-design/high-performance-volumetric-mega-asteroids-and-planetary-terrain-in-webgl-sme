@@ -71,6 +71,10 @@
             [0, 4], [1, 5], [2, 6], [3, 7]  // parallel to Z
         ];
 
+        // Preallocated zero-GC scratch buffers for Dual Contouring QEF edge extraction
+        const edgePts = new Float32Array(36);
+        const edgeNorms = new Float32Array(36);
+
         class SVOLeafNode {
             constructor(lx, ly, lz) {
                 this.lx = lx;
@@ -97,6 +101,9 @@
 
             initField() {
                 const pRes = this.pRes;
+                const minCrustR = currentRadius * 0.87;
+                const maxCrustR = currentRadius * 1.16;
+                const oreFreq = 0.007 * (2800.0 / currentRadius);
                 let idx = 0;
                 for (let pz = 0; pz < pRes; pz++) {
                     const wz = this.minZ + (pz - 2) * this.cellSize;
@@ -104,10 +111,10 @@
                         const wy = this.minY + (py - 2) * this.cellSize;
                         for (let px = 0; px < pRes; px++) {
                             const wx = this.minX + (px - 2) * this.cellSize;
-                            const d = evalDensityPoC2(wx, wy, wz);
+                            const rDist = Math.sqrt(wx * wx + wy * wy + wz * wz);
+                            const d = (rDist < minCrustR || rDist > maxCrustR) ? (rDist - currentRadius) : evalDensityPoC2(wx, wy, wz);
                             this.density[idx] = d;
 
-                            const oreFreq = 0.007 * (2800.0 / currentRadius);
                             if (d < -this.cellSize && Math.sin(wx * oreFreq) * Math.cos(wy * oreFreq) > 0.78) {
                                 this.material[idx] = 2; // Ore vein
                             } else {
@@ -141,11 +148,6 @@
                 const cellKey = (cx, cy, cz) => cx + cy * cellCount + cz * cellCount2;
 
                 const cVals = new Float32Array(8);
-                const massPoint = new THREE.Vector3();
-                const qefPos = new THREE.Vector3();
-                const avgNorm = new THREE.Vector3();
-                const grad = new THREE.Vector3();
-                const diff = new THREE.Vector3();
 
                 // Step 1: Solve regularized QEF for each dual cell [1 .. LEAF_RES + 1]
                 for (let cz = 1; cz <= LEAF_RES + 1; cz++) {
@@ -173,9 +175,8 @@
 
                             if (mask === 0 || mask === 255) continue;
 
-                            const points = [];
-                            const pNorms = [];
-                            massPoint.set(0, 0, 0);
+                            let edgeCount = 0;
+                            let mx = 0, my = 0, mz = 0;
 
                             for (let e = 0; e < 12; e++) {
                                 const c1 = cellEdges[e][0];
@@ -192,47 +193,61 @@
                                     const iy = cy + p1[1] + t * (p2[1] - p1[1]);
                                     const iz = cz + p1[2] + t * (p2[2] - p1[2]);
 
-                                    const pt = new THREE.Vector3(
-                                        this.minX + (ix - 2) * this.cellSize,
-                                        this.minY + (iy - 2) * this.cellSize,
-                                        this.minZ + (iz - 2) * this.cellSize
-                                    );
-                                    points.push(pt);
-                                    massPoint.add(pt);
+                                    const px = this.minX + (ix - 2) * this.cellSize;
+                                    const py = this.minY + (iy - 2) * this.cellSize;
+                                    const pz = this.minZ + (iz - 2) * this.cellSize;
+                                    const off = edgeCount * 3;
+                                    edgePts[off] = px;
+                                    edgePts[off + 1] = py;
+                                    edgePts[off + 2] = pz;
+                                    mx += px; my += py; mz += pz;
 
                                     const gpx = Math.max(1, Math.min(pRes - 2, Math.round(ix)));
                                     const gpy = Math.max(1, Math.min(pRes - 2, Math.round(iy)));
                                     const gpz = Math.max(1, Math.min(pRes - 2, Math.round(iz)));
-                                    const nx = this.getD(gpx + 1, gpy, gpz) - this.getD(gpx - 1, gpy, gpz);
-                                    const ny = this.getD(gpx, gpy + 1, gpz) - this.getD(gpx, gpy - 1, gpz);
-                                    const nz = this.getD(gpx, gpy, gpz + 1) - this.getD(gpx, gpy, gpz - 1);
-                                    const nVec = new THREE.Vector3(nx, ny, nz);
-                                    if (nVec.lengthSq() > 1e-10) nVec.normalize();
-                                    else nVec.set(0, 1, 0);
-                                    pNorms.push(nVec);
+                                    let nx = this.getD(gpx + 1, gpy, gpz) - this.getD(gpx - 1, gpy, gpz);
+                                    let ny = this.getD(gpx, gpy + 1, gpz) - this.getD(gpx, gpy - 1, gpz);
+                                    let nz = this.getD(gpx, gpy, gpz + 1) - this.getD(gpx, gpy, gpz - 1);
+                                    const nLenSq = nx * nx + ny * ny + nz * nz;
+                                    if (nLenSq > 1e-10) {
+                                        const invLen = 1.0 / Math.sqrt(nLenSq);
+                                        nx *= invLen; ny *= invLen; nz *= invLen;
+                                    } else {
+                                        nx = 0; ny = 1; nz = 0;
+                                    }
+                                    edgeNorms[off] = nx;
+                                    edgeNorms[off + 1] = ny;
+                                    edgeNorms[off + 2] = nz;
+                                    edgeCount++;
                                 }
                             }
 
-                            if (points.length === 0) continue;
-                            massPoint.divideScalar(points.length);
+                            if (edgeCount === 0) continue;
+                            const invN = 1.0 / edgeCount;
+                            mx *= invN; my *= invN; mz *= invN;
 
-                            // Stable regularized QEF gradient descent (normalized by crossing count)
-                            qefPos.copy(massPoint);
+                            // Stable regularized QEF gradient descent (zero-allocation scalar math)
+                            let qx = mx, qy = my, qz = mz;
                             const lambda = 0.12;
                             const stepSize = 0.25;
-                            const invN = 1.0 / points.length;
 
                             for (let iter = 0; iter < 8; iter++) {
-                                grad.set(0, 0, 0);
-                                for (let p = 0; p < points.length; p++) {
-                                    const norm = pNorms[p];
-                                    diff.subVectors(qefPos, points[p]);
-                                    const dot = norm.dot(diff);
-                                    grad.addScaledVector(norm, dot * invN);
+                                let gx = 0, gy = 0, gz = 0;
+                                for (let p = 0; p < edgeCount; p++) {
+                                    const off = p * 3;
+                                    const nx = edgeNorms[off], ny = edgeNorms[off + 1], nz = edgeNorms[off + 2];
+                                    const dx = qx - edgePts[off], dy = qy - edgePts[off + 1], dz = qz - edgePts[off + 2];
+                                    const dotVal = (nx * dx + ny * dy + nz * dz) * invN;
+                                    gx += nx * dotVal;
+                                    gy += ny * dotVal;
+                                    gz += nz * dotVal;
                                 }
-                                diff.subVectors(qefPos, massPoint);
-                                grad.addScaledVector(diff, lambda);
-                                qefPos.addScaledVector(grad, -stepSize);
+                                gx += (qx - mx) * lambda;
+                                gy += (qy - my) * lambda;
+                                gz += (qz - mz) * lambda;
+                                qx -= gx * stepSize;
+                                qy -= gy * stepSize;
+                                qz -= gz * stepSize;
                             }
 
                             // Clamp QEF vertex strictly inside world bounds of cell (cx, cy, cz)
@@ -241,14 +256,27 @@
                             const cellMinZ = this.minZ + (cz - 2) * this.cellSize;
                             const pad = this.cellSize * 0.02;
 
-                            qefPos.x = THREE.MathUtils.clamp(qefPos.x, cellMinX + pad, cellMinX + this.cellSize - pad);
-                            qefPos.y = THREE.MathUtils.clamp(qefPos.y, cellMinY + pad, cellMinY + this.cellSize - pad);
-                            qefPos.z = THREE.MathUtils.clamp(qefPos.z, cellMinZ + pad, cellMinZ + this.cellSize - pad);
+                            if (qx < cellMinX + pad) qx = cellMinX + pad;
+                            else if (qx > cellMinX + this.cellSize - pad) qx = cellMinX + this.cellSize - pad;
+                            if (qy < cellMinY + pad) qy = cellMinY + pad;
+                            else if (qy > cellMinY + this.cellSize - pad) qy = cellMinY + this.cellSize - pad;
+                            if (qz < cellMinZ + pad) qz = cellMinZ + pad;
+                            else if (qz > cellMinZ + this.cellSize - pad) qz = cellMinZ + this.cellSize - pad;
 
-                            avgNorm.set(0, 0, 0);
-                            for (let p = 0; p < pNorms.length; p++) avgNorm.add(pNorms[p]);
-                            if (avgNorm.lengthSq() > 1e-10) avgNorm.normalize();
-                            else avgNorm.set(0, 1, 0);
+                            let anx = 0, any = 0, anz = 0;
+                            for (let p = 0; p < edgeCount; p++) {
+                                const off = p * 3;
+                                anx += edgeNorms[off];
+                                any += edgeNorms[off + 1];
+                                anz += edgeNorms[off + 2];
+                            }
+                            const aLenSq = anx * anx + any * any + anz * anz;
+                            if (aLenSq > 1e-10) {
+                                const invALen = 1.0 / Math.sqrt(aLenSq);
+                                anx *= invALen; any *= invALen; anz *= invALen;
+                            } else {
+                                anx = 0; any = 1; anz = 0;
+                            }
 
                             let domMat = 1;
                             if (oreCount > rockCount && oreCount >= armorCount) domMat = 2;
@@ -260,7 +288,7 @@
                             } else if (domMat === 2) {
                                 rCol = 0.95; gCol = 0.70; bCol = 0.15;
                             } else {
-                                const strata = 0.5 + 0.5 * Math.sin(qefPos.y * 0.02);
+                                const strata = 0.5 + 0.5 * Math.sin(qy * 0.02);
                                 rCol = 0.44 + 0.08 * strata;
                                 gCol = 0.46 + 0.06 * strata;
                                 bCol = 0.50 + 0.10 * strata;
@@ -269,8 +297,8 @@
                             const vIdx = vertices.length / 3;
                             cellVertMap[cellKey(cx, cy, cz)] = vIdx;
 
-                            vertices.push(qefPos.x, qefPos.y, qefPos.z);
-                            normals.push(avgNorm.x, avgNorm.y, avgNorm.z);
+                            vertices.push(qx, qy, qz);
+                            normals.push(anx, any, anz);
                             colors.push(rCol, gCol, bCol);
                         }
                     }
@@ -432,6 +460,8 @@
 
         function carveSpherePoC2(hitPoint, brushRadius) {
             const effPad = brushRadius + CELL_SIZE * 3.5;
+            const pad = brushRadius + CELL_SIZE * 2.5;
+            const padSq = pad * pad;
             const minLX = Math.floor((hitPoint.x - effPad) / LEAF_SIZE);
             const maxLX = Math.floor((hitPoint.x + effPad) / LEAF_SIZE);
             const minLY = Math.floor((hitPoint.y - effPad) / LEAF_SIZE);
@@ -440,27 +470,54 @@
             const maxLZ = Math.floor((hitPoint.z + effPad) / LEAF_SIZE);
 
             for (let lz = minLZ; lz <= maxLZ; lz++) {
+                const lMinZ = lz * LEAF_SIZE - 2 * CELL_SIZE;
+                const lMaxZ = lz * LEAF_SIZE + (LEAF_RES + 2) * CELL_SIZE;
+                const dz = hitPoint.z < lMinZ ? lMinZ - hitPoint.z : (hitPoint.z > lMaxZ ? hitPoint.z - lMaxZ : 0);
+                const dz2 = dz * dz;
+                if (dz2 > padSq) continue;
                 for (let ly = minLY; ly <= maxLY; ly++) {
+                    const lMinY = ly * LEAF_SIZE - 2 * CELL_SIZE;
+                    const lMaxY = ly * LEAF_SIZE + (LEAF_RES + 2) * CELL_SIZE;
+                    const dy = hitPoint.y < lMinY ? lMinY - hitPoint.y : (hitPoint.y > lMaxY ? hitPoint.y - lMaxY : 0);
+                    const dyz2 = dz2 + dy * dy;
+                    if (dyz2 > padSq) continue;
                     for (let lx = minLX; lx <= maxLX; lx++) {
+                        const lMinX = lx * LEAF_SIZE - 2 * CELL_SIZE;
+                        const lMaxX = lx * LEAF_SIZE + (LEAF_RES + 2) * CELL_SIZE;
+                        const dx = hitPoint.x < lMinX ? lMinX - hitPoint.x : (hitPoint.x > lMaxX ? hitPoint.x - lMaxX : 0);
+                        if (dx * dx + dyz2 > padSq) continue;
+
                         const leaf = getOrCreateLeaf(lx, ly, lz);
-                        let modified = false;
                         const pRes = leaf.pRes;
-                        let idx = 0;
-                        for (let z = 0; z < pRes; z++) {
+                        const pRes2 = leaf.pRes2;
+                        const leafPad = brushRadius + leaf.cellSize * 2.5;
+                        const invCell = 1.0 / leaf.cellSize;
+                        const minPX = Math.max(0, Math.floor((hitPoint.x - leafPad - leaf.minX) * invCell + 2));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + leafPad - leaf.minX) * invCell + 2));
+                        const minPY = Math.max(0, Math.floor((hitPoint.y - leafPad - leaf.minY) * invCell + 2));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + leafPad - leaf.minY) * invCell + 2));
+                        const minPZ = Math.max(0, Math.floor((hitPoint.z - leafPad - leaf.minZ) * invCell + 2));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + leafPad - leaf.minZ) * invCell + 2));
+                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+
+                        let modified = false;
+                        for (let z = minPZ; z <= maxPZ; z++) {
                             const wz = leaf.minZ + (z - 2) * leaf.cellSize;
-                            for (let y = 0; y < pRes; y++) {
+                            const zOff = z * pRes2;
+                            for (let y = minPY; y <= maxPY; y++) {
                                 const wy = leaf.minY + (y - 2) * leaf.cellSize;
-                                for (let x = 0; x < pRes; x++) {
+                                const yzOff = zOff + y * pRes;
+                                for (let x = minPX; x <= maxPX; x++) {
                                     const wx = leaf.minX + (x - 2) * leaf.cellSize;
                                     const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
-                                    if (dist <= brushRadius + leaf.cellSize * 2.5) {
+                                    if (dist <= leafPad) {
                                         const carveD = brushRadius - dist;
+                                        const idx = yzOff + x;
                                         if (carveD > leaf.density[idx]) {
                                             leaf.density[idx] = carveD;
                                             modified = true;
                                         }
                                     }
-                                    idx++;
                                 }
                             }
                         }
@@ -486,21 +543,33 @@
                     for (let lx = minLX; lx <= maxLX; lx++) {
                         const leaf = svoLeafMap.get(`${lx},${ly},${lz}`);
                         if (!leaf) continue;
-                        let modified = false;
+
                         const pRes = leaf.pRes;
-                        let idx = 0;
-                        for (let z = 0; z < pRes; z++) {
+                        const pRes2 = leaf.pRes2;
+                        const invCell = 1.0 / leaf.cellSize;
+                        const minPX = Math.max(0, Math.floor((hitPoint.x - brushRadius - leaf.minX) * invCell + 2));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + brushRadius - leaf.minX) * invCell + 2));
+                        const minPY = Math.max(0, Math.floor((hitPoint.y - brushRadius - leaf.minY) * invCell + 2));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + brushRadius - leaf.minY) * invCell + 2));
+                        const minPZ = Math.max(0, Math.floor((hitPoint.z - brushRadius - leaf.minZ) * invCell + 2));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + brushRadius - leaf.minZ) * invCell + 2));
+                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+
+                        let modified = false;
+                        for (let z = minPZ; z <= maxPZ; z++) {
                             const wz = leaf.minZ + (z - 2) * leaf.cellSize;
-                            for (let y = 0; y < pRes; y++) {
+                            const zOff = z * pRes2;
+                            for (let y = minPY; y <= maxPY; y++) {
                                 const wy = leaf.minY + (y - 2) * leaf.cellSize;
-                                for (let x = 0; x < pRes; x++) {
+                                const yzOff = zOff + y * pRes;
+                                for (let x = minPX; x <= maxPX; x++) {
                                     const wx = leaf.minX + (x - 2) * leaf.cellSize;
                                     const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                                    const idx = yzOff + x;
                                     if (dist <= brushRadius && leaf.density[idx] < 0) {
                                         leaf.material[idx] = 3; // Reinforced Titanium Bulkhead
                                         modified = true;
                                     }
-                                    idx++;
                                 }
                             }
                         }

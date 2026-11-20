@@ -7,9 +7,9 @@
   "avgFps": 60,
   "avgFrameTime": 16.67,
   "p99FrameTime": 16.8,
-  "avgCarveLatency": 6.95,
-  "triangles": 33520,
-  "drawCalls": 28,
-  "heapMemoryMB": 17.36,
+  "avgCarveLatency": 4.9,
+  "triangles": 33344,
+  "drawCalls": 29,
+  "heapMemoryMB": 16.31,
   "visualCollisionError": "0.00u"
 }

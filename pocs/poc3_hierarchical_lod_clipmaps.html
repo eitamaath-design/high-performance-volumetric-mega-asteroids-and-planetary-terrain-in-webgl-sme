@@ -49,8 +49,20 @@
 
         let currentRadius = 2800;
         let planetaryMacroShell = null;
+        const MACRO_GRID_RES = 4;
+        let macroRaycastGrid = null;
+        let macroRayStamp = 1;
+        const _rcCellHit = new THREE.Vector3();
+        const _rcTriA = new THREE.Vector3();
+        const _rcTriB = new THREE.Vector3();
+        const _rcTriC = new THREE.Vector3();
+        const _rcTriHit = new THREE.Vector3();
+        const _rcTriNorm = new THREE.Vector3();
+        const _rcTriHelper = new THREE.Triangle();
+        const _rcHitCells = [];
+        const _poc3CoarseGrid = new Float32Array(9 * 9 * 9);
         const MAX_PORTALS = 4096;
-        const portalHoles = []; // Array of { point: Vector3, radius: number }
+        const portalHoles = []; // Array of { point: Vector3, radius: number, radiusSq: number }
         let nextPortalIndex = 0;
 
         // Clustered 3D Spatial Grid (32x32x32 cells x 16 portal IDs/cell in 1024x128 RGBA Float)
@@ -137,7 +149,7 @@
 
             const portalSlot = nextPortalIndex % MAX_PORTALS;
             nextPortalIndex++;
-            const portalObj = { point: point.clone(), radius: cutRadius };
+            const portalObj = { point: point.clone(), radius: cutRadius, radiusSq: cutRadius * cutRadius };
             if (portalHoles.length < MAX_PORTALS) {
                 portalHoles.push(portalObj);
             } else {
@@ -161,11 +173,15 @@
             const minCZ = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.z - cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
             const maxCZ = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.z + cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
 
+            let minTileRow = 128;
+            let maxTileRow = -1;
             for (let cz = minCZ; cz <= maxCZ; cz++) {
                 const tileX = cz % 8;
                 const tileY = Math.floor(cz / 8);
                 for (let cy = minCY; cy <= maxCY; cy++) {
                     const baseY = tileY * 32 + cy;
+                    if (baseY < minTileRow) minTileRow = baseY;
+                    if (baseY > maxTileRow) maxTileRow = baseY;
                     for (let cx = minCX; cx <= maxCX; cx++) {
                         const baseX = (tileX * 32 + cx) * 4;
                         const cellBaseIdx = (baseY * 1024 + baseX) * 4;
@@ -186,7 +202,28 @@
                     }
                 }
             }
-            portalGridTex.needsUpdate = true;
+
+            if (minTileRow <= maxTileRow) {
+                const gl = sandbox && sandbox.renderer ? sandbox.renderer.getContext() : null;
+                const gridTexProps = sandbox && sandbox.renderer ? sandbox.renderer.properties.get(portalGridTex) : null;
+                const glGridTex = gridTexProps ? gridTexProps.__webglTexture : null;
+                if (gl && glGridTex) {
+                    const rowCount = maxTileRow - minTileRow + 1;
+                    const subView = portalGridData.subarray(minTileRow * 1024 * 4, (maxTileRow + 1) * 1024 * 4);
+                    const prevTex = gl.getParameter(gl.TEXTURE_BINDING_2D);
+                    const prevAlign = gl.getParameter(gl.UNPACK_ALIGNMENT);
+                    const prevFlipY = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL);
+                    gl.bindTexture(gl.TEXTURE_2D, glGridTex);
+                    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+                    if (prevFlipY) gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+                    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, minTileRow, 1024, rowCount, gl.RGBA, gl.FLOAT, subView);
+                    if (prevFlipY) gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, prevFlipY);
+                    gl.pixelStorei(gl.UNPACK_ALIGNMENT, prevAlign);
+                    gl.bindTexture(gl.TEXTURE_2D, prevTex);
+                } else {
+                    portalGridTex.needsUpdate = true;
+                }
+            }
         }
 
         // High-Resolution Smooth Macro Planetary Shell
@@ -196,6 +233,7 @@
                 planetaryMacroShell.geometry.dispose();
                 planetaryMacroShell = null;
             }
+            macroRaycastGrid = null;
 
             const geo = new THREE.SphereGeometry(currentRadius, macroSegments, macroSegments);
             const pos = geo.attributes.position;
@@ -209,6 +247,70 @@
                 pos.setXYZ(i, vx * scale, vy * scale, vz * scale);
             }
             geo.computeVertexNormals();
+            geo.computeBoundingBox();
+
+            // Build 4x4x4 spatial triangle grid for fast portal-aware customRaycast
+            const bbox = geo.boundingBox;
+            const gMinX = bbox.min.x - 1.0, gMinY = bbox.min.y - 1.0, gMinZ = bbox.min.z - 1.0;
+            const gMaxX = bbox.max.x + 1.0, gMaxY = bbox.max.y + 1.0, gMaxZ = bbox.max.z + 1.0;
+            const cellW = (gMaxX - gMinX) / MACRO_GRID_RES;
+            const cellH = (gMaxY - gMinY) / MACRO_GRID_RES;
+            const cellD = (gMaxZ - gMinZ) / MACRO_GRID_RES;
+            const invW = MACRO_GRID_RES / (gMaxX - gMinX);
+            const invH = MACRO_GRID_RES / (gMaxY - gMinY);
+            const invD = MACRO_GRID_RES / (gMaxZ - gMinZ);
+
+            const gridCells = [];
+            for (let gz = 0; gz < MACRO_GRID_RES; gz++) {
+                for (let gy = 0; gy < MACRO_GRID_RES; gy++) {
+                    for (let gx = 0; gx < MACRO_GRID_RES; gx++) {
+                        gridCells.push({
+                            box: new THREE.Box3(
+                                new THREE.Vector3(gMinX + gx * cellW, gMinY + gy * cellH, gMinZ + gz * cellD),
+                                new THREE.Vector3(gMinX + (gx + 1) * cellW, gMinY + (gy + 1) * cellH, gMinZ + (gz + 1) * cellD)
+                            ),
+                            tris: []
+                        });
+                    }
+                }
+            }
+
+            const idxAttr = geo.index;
+            const triCount = idxAttr ? (idxAttr.count / 3) : (pos.count / 3);
+            for (let t = 0; t < triCount; t++) {
+                const i0 = idxAttr ? idxAttr.getX(t * 3) : t * 3;
+                const i1 = idxAttr ? idxAttr.getX(t * 3 + 1) : t * 3 + 1;
+                const i2 = idxAttr ? idxAttr.getX(t * 3 + 2) : t * 3 + 2;
+                const ax = pos.getX(i0), ay = pos.getY(i0), az = pos.getZ(i0);
+                const bx = pos.getX(i1), by = pos.getY(i1), bz = pos.getZ(i1);
+                const cx = pos.getX(i2), cy = pos.getY(i2), cz = pos.getZ(i2);
+
+                const tMinX = Math.min(ax, bx, cx), tMaxX = Math.max(ax, bx, cx);
+                const tMinY = Math.min(ay, by, cy), tMaxY = Math.max(ay, by, cy);
+                const tMinZ = Math.min(az, bz, cz), tMaxZ = Math.max(az, bz, cz);
+
+                const cMinX = Math.max(0, Math.min(MACRO_GRID_RES - 1, Math.floor((tMinX - gMinX) * invW)));
+                const cMaxX = Math.max(0, Math.min(MACRO_GRID_RES - 1, Math.floor((tMaxX - gMinX) * invW)));
+                const cMinY = Math.max(0, Math.min(MACRO_GRID_RES - 1, Math.floor((tMinY - gMinY) * invH)));
+                const cMaxY = Math.max(0, Math.min(MACRO_GRID_RES - 1, Math.floor((tMaxY - gMinY) * invH)));
+                const cMinZ = Math.max(0, Math.min(MACRO_GRID_RES - 1, Math.floor((tMinZ - gMinZ) * invD)));
+                const cMaxZ = Math.max(0, Math.min(MACRO_GRID_RES - 1, Math.floor((tMaxZ - gMinZ) * invD)));
+
+                for (let gz = cMinZ; gz <= cMaxZ; gz++) {
+                    for (let gy = cMinY; gy <= cMaxY; gy++) {
+                        for (let gx = cMinX; gx <= cMaxX; gx++) {
+                            gridCells[gx + gy * MACRO_GRID_RES + gz * MACRO_GRID_RES * MACRO_GRID_RES].tris.push(t);
+                        }
+                    }
+                }
+            }
+
+            macroRaycastGrid = {
+                cells: gridCells.filter(c => c.tris.length > 0),
+                posAttr: pos,
+                indexAttr: idxAttr,
+                testedStamp: new Uint32Array(triCount)
+            };
 
             planetaryMacroShell = new THREE.Mesh(geo, macroCrustMaterial);
             planetaryMacroShell.userData = { isMacroShell: true };
@@ -237,19 +339,82 @@
 
             initField() {
                 const pRes = SUBTERRANEAN_CHUNK_RES + 3;
+                const minR = currentRadius * 0.85;
+                const maxR = currentRadius * 1.18;
+                const oreFreq = 0.008 * (2800.0 / currentRadius);
+
+                const halfSpan = (pRes - 1) * SUBTERRANEAN_CELL_SIZE * 0.5;
+                const ccx = this.minBounds.x - SUBTERRANEAN_CELL_SIZE + halfSpan;
+                const ccy = this.minBounds.y - SUBTERRANEAN_CELL_SIZE + halfSpan;
+                const ccz = this.minBounds.z - SUBTERRANEAN_CELL_SIZE + halfSpan;
+                const cDist = Math.sqrt(ccx * ccx + ccy * ccy + ccz * ccz);
+                const halfDiag = halfSpan * 1.732051;
+                const touchesCrust = (cDist + halfDiag >= minR) && (cDist - halfDiag <= maxR);
+
+                const GRID = 9;
+                const GRID2 = GRID * GRID;
+                const span = pRes - 1;
+                if (touchesCrust) {
+                    let gIdx = 0;
+                    for (let gz = 0; gz < GRID; gz++) {
+                        const wz = this.minBounds.z + ((gz / 8.0) * span - 1) * SUBTERRANEAN_CELL_SIZE;
+                        for (let gy = 0; gy < GRID; gy++) {
+                            const wy = this.minBounds.y + ((gy / 8.0) * span - 1) * SUBTERRANEAN_CELL_SIZE;
+                            for (let gx = 0; gx < GRID; gx++) {
+                                const wx = this.minBounds.x + ((gx / 8.0) * span - 1) * SUBTERRANEAN_CELL_SIZE;
+                                _poc3CoarseGrid[gIdx++] = evalMacroRadiusAt(wx, wy, wz);
+                            }
+                        }
+                    }
+                }
+
+                const invSpan8 = 8.0 / span;
+                const defaultCarve = -SUBTERRANEAN_CELL_SIZE * 4.0;
                 let idx = 0;
                 for (let pz = 0; pz < pRes; pz++) {
                     const wz = this.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE;
+                    let iz0 = 0, tz = 0.0;
+                    if (touchesCrust) {
+                        const fz = pz * invSpan8;
+                        iz0 = Math.min(7, Math.floor(fz));
+                        tz = fz - iz0;
+                    }
                     for (let py = 0; py < pRes; py++) {
                         const wy = this.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE;
+                        let iy0 = 0, ty = 0.0;
+                        if (touchesCrust) {
+                            const fy = py * invSpan8;
+                            iy0 = Math.min(7, Math.floor(fy));
+                            ty = fy - iy0;
+                        }
                         for (let px = 0; px < pRes; px++) {
                             const wx = this.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
                             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-                            const surfaceD = dist - (evalMacroRadiusAt(wx, wy, wz) - 4.0);
-
+                            let macroR = currentRadius;
+                            if (touchesCrust && dist >= minR && dist <= maxR) {
+                                const fx = px * invSpan8;
+                                const ix0 = Math.min(7, Math.floor(fx));
+                                const tx = fx - ix0;
+                                const base = ix0 + iy0 * GRID + iz0 * GRID2;
+                                const c000 = _poc3CoarseGrid[base];
+                                const c100 = _poc3CoarseGrid[base + 1];
+                                const c010 = _poc3CoarseGrid[base + GRID];
+                                const c110 = _poc3CoarseGrid[base + GRID + 1];
+                                const c001 = _poc3CoarseGrid[base + GRID2];
+                                const c101 = _poc3CoarseGrid[base + GRID2 + 1];
+                                const c011 = _poc3CoarseGrid[base + GRID2 + GRID];
+                                const c111 = _poc3CoarseGrid[base + GRID2 + GRID + 1];
+                                const x00 = c000 + (c100 - c000) * tx;
+                                const x10 = c010 + (c110 - c010) * tx;
+                                const x01 = c001 + (c101 - c001) * tx;
+                                const x11 = c011 + (c111 - c011) * tx;
+                                const y0 = x00 + (x10 - x00) * ty;
+                                const y1 = x01 + (x11 - x01) * ty;
+                                macroR = y0 + (y1 - y0) * tz;
+                            }
+                            const surfaceD = dist - (macroR - 4.0);
                             this.voxelData[idx] = surfaceD;
-                            this.carveField[idx] = -SUBTERRANEAN_CELL_SIZE * 4.0;
-                            const oreFreq = 0.008 * (2800.0 / currentRadius);
+                            this.carveField[idx] = defaultCarve;
                             this.materialData[idx] = (surfaceD < -SUBTERRANEAN_CELL_SIZE && Math.sin(wx * oreFreq) * Math.cos(wy * oreFreq) > 0.78) ? 2 : 1;
                             idx++;
                         }
@@ -482,6 +647,8 @@
 
         function ensureSubterraneanChunksAround(point, radius) {
             const pad = radius + SUBTERRANEAN_CELL_SIZE * 3.0;
+            const maxDist = radius + SUBTERRANEAN_CELL_SIZE * 2.5;
+            const maxDistSq = maxDist * maxDist;
             const minCX = Math.floor((point.x - pad) / SUBTERRANEAN_CHUNK_SIZE);
             const maxCX = Math.floor((point.x + pad) / SUBTERRANEAN_CHUNK_SIZE);
             const minCY = Math.floor((point.y - pad) / SUBTERRANEAN_CHUNK_SIZE);
@@ -491,8 +658,23 @@
 
             const touched = [];
             for (let cz = minCZ; cz <= maxCZ; cz++) {
+                const minZ = cz * SUBTERRANEAN_CHUNK_SIZE;
+                const maxZ = minZ + SUBTERRANEAN_CHUNK_SIZE;
+                const dz = point.z < minZ ? minZ - point.z : (point.z > maxZ ? point.z - maxZ : 0);
+                const dz2 = dz * dz;
+                if (dz2 > maxDistSq) continue;
                 for (let cy = minCY; cy <= maxCY; cy++) {
+                    const minY = cy * SUBTERRANEAN_CHUNK_SIZE;
+                    const maxY = minY + SUBTERRANEAN_CHUNK_SIZE;
+                    const dy = point.y < minY ? minY - point.y : (point.y > maxY ? point.y - maxY : 0);
+                    const dyz2 = dz2 + dy * dy;
+                    if (dyz2 > maxDistSq) continue;
                     for (let cx = minCX; cx <= maxCX; cx++) {
+                        const minX = cx * SUBTERRANEAN_CHUNK_SIZE;
+                        const maxX = minX + SUBTERRANEAN_CHUNK_SIZE;
+                        const dx = point.x < minX ? minX - point.x : (point.x > maxX ? point.x - maxX : 0);
+                        if (dx * dx + dyz2 > maxDistSq) continue;
+
                         const key = `${cx},${cy},${cz}`;
                         let chunk = subterraneanChunks.get(key);
                         if (!chunk) {
@@ -511,18 +693,32 @@
 
             const affected = ensureSubterraneanChunksAround(hitPoint, brushRadius);
             const pRes = SUBTERRANEAN_CHUNK_RES + 3;
+            const pRes2 = pRes * pRes;
+            const pad = brushRadius + SUBTERRANEAN_CELL_SIZE * 4.0;
+            const invCell = 1.0 / SUBTERRANEAN_CELL_SIZE;
 
-            affected.forEach(chunk => {
+            for (let i = 0; i < affected.length; i++) {
+                const chunk = affected[i];
+                const minPX = Math.max(0, Math.floor((hitPoint.x - pad - chunk.minBounds.x) * invCell + 1));
+                const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + pad - chunk.minBounds.x) * invCell + 1));
+                const minPY = Math.max(0, Math.floor((hitPoint.y - pad - chunk.minBounds.y) * invCell + 1));
+                const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + pad - chunk.minBounds.y) * invCell + 1));
+                const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 1));
+                const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 1));
+                if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+
                 let modified = false;
-                let idx = 0;
-                for (let pz = 0; pz < pRes; pz++) {
+                for (let pz = minPZ; pz <= maxPZ; pz++) {
                     const wz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE;
-                    for (let py = 0; py < pRes; py++) {
+                    const zOff = pz * pRes2;
+                    for (let py = minPY; py <= maxPY; py++) {
                         const wy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE;
-                        for (let px = 0; px < pRes; px++) {
+                        const yzOff = zOff + py * pRes;
+                        for (let px = minPX; px <= maxPX; px++) {
                             const wx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
                             const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
                             const carveD = brushRadius - dist;
+                            const idx = yzOff + px;
                             if (carveD > chunk.carveField[idx]) {
                                 chunk.carveField[idx] = carveD;
                             }
@@ -532,42 +728,65 @@
                                     modified = true;
                                 }
                             }
-                            idx++;
                         }
                     }
                 }
                 if (modified) {
                     chunk.rebuild(sandbox.scene);
                 }
-            });
+            }
         }
 
         function reinforceSpherePoC3(hitPoint, brushRadius) {
-            const affected = ensureSubterraneanChunksAround(hitPoint, brushRadius);
             const pRes = SUBTERRANEAN_CHUNK_RES + 3;
+            const pRes2 = pRes * pRes;
+            const pad = brushRadius + SUBTERRANEAN_CELL_SIZE;
+            const invCell = 1.0 / SUBTERRANEAN_CELL_SIZE;
+            const minCX = Math.floor((hitPoint.x - pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const maxCX = Math.floor((hitPoint.x + pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const minCY = Math.floor((hitPoint.y - pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const maxCY = Math.floor((hitPoint.y + pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const minCZ = Math.floor((hitPoint.z - pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const maxCZ = Math.floor((hitPoint.z + pad) / SUBTERRANEAN_CHUNK_SIZE);
 
-            affected.forEach(chunk => {
-                let modified = false;
-                let idx = 0;
-                for (let pz = 0; pz < pRes; pz++) {
-                    const wz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE;
-                    for (let py = 0; py < pRes; py++) {
-                        const wy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE;
-                        for (let px = 0; px < pRes; px++) {
-                            const wx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
-                            const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
-                            if (dist <= brushRadius && chunk.voxelData[idx] < 0) {
-                                chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
-                                modified = true;
+            for (let cz = minCZ; cz <= maxCZ; cz++) {
+                for (let cy = minCY; cy <= maxCY; cy++) {
+                    for (let cx = minCX; cx <= maxCX; cx++) {
+                        const chunk = subterraneanChunks.get(`${cx},${cy},${cz}`);
+                        if (!chunk) continue;
+
+                        const minPX = Math.max(0, Math.floor((hitPoint.x - pad - chunk.minBounds.x) * invCell + 1));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + pad - chunk.minBounds.x) * invCell + 1));
+                        const minPY = Math.max(0, Math.floor((hitPoint.y - pad - chunk.minBounds.y) * invCell + 1));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + pad - chunk.minBounds.y) * invCell + 1));
+                        const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 1));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 1));
+                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+
+                        let modified = false;
+                        for (let pz = minPZ; pz <= maxPZ; pz++) {
+                            const wz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE;
+                            const zOff = pz * pRes2;
+                            for (let py = minPY; py <= maxPY; py++) {
+                                const wy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE;
+                                const yzOff = zOff + py * pRes;
+                                for (let px = minPX; px <= maxPX; px++) {
+                                    const wx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
+                                    const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                                    const idx = yzOff + px;
+                                    if (dist <= brushRadius && chunk.voxelData[idx] < 0) {
+                                        chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
+                                        modified = true;
+                                    }
+                                }
                             }
-                            idx++;
+                        }
+                        if (modified) {
+                            chunk.rebuild(sandbox.scene);
                         }
                     }
                 }
-                if (modified) {
-                    chunk.rebuild(sandbox.scene);
-                }
-            });
+            }
         }
 
         function applyQualityConfigPoC3(qualityKey) {
@@ -630,9 +849,95 @@
             },
             getCellSize: () => `${SUBTERRANEAN_CELL_SIZE.toFixed(1)}u (${macroSegments}seg / ${SUBTERRANEAN_CHUNK_RES}³)`,
 
-            // Portal-aware raycast so mining beam passes straight through shader-clipped portal openings
+            // Portal-aware raycast accelerated by 4x4x4 spatial triangle grid
             customRaycast: (raycaster, camera, mousePos) => {
                 raycaster.setFromCamera(mousePos, camera);
+
+                let bestSubHit = null;
+                if (activeSubterraneanMeshes.length > 0) {
+                    const subHits = raycaster.intersectObjects(activeSubterraneanMeshes, false);
+                    if (subHits.length > 0) bestSubHit = subHits[0];
+                }
+
+                if (planetaryMacroShell && macroRaycastGrid) {
+                    const ray = raycaster.ray;
+                    const ro = ray.origin;
+                    const cells = macroRaycastGrid.cells;
+                    _rcHitCells.length = 0;
+
+                    for (let c = 0; c < cells.length; c++) {
+                        const cell = cells[c];
+                        if (cell.box.containsPoint(ro)) {
+                            _rcHitCells.push({ cell, dist: 0 });
+                        } else if (ray.intersectBox(cell.box, _rcCellHit)) {
+                            _rcHitCells.push({ cell, dist: ro.distanceTo(_rcCellHit) });
+                        }
+                    }
+                    if (_rcHitCells.length > 1) {
+                        _rcHitCells.sort((a, b) => a.dist - b.dist);
+                    }
+
+                    if (++macroRayStamp === 0xffffffff) {
+                        macroRaycastGrid.testedStamp.fill(0);
+                        macroRayStamp = 1;
+                    }
+                    const stamp = macroRayStamp;
+                    const tested = macroRaycastGrid.testedStamp;
+                    const posAttr = macroRaycastGrid.posAttr;
+                    const idxAttr = macroRaycastGrid.indexAttr;
+
+                    let bestDist = bestSubHit ? bestSubHit.distance : Infinity;
+                    let bestMacroHit = null;
+
+                    for (let i = 0; i < _rcHitCells.length; i++) {
+                        const entry = _rcHitCells[i];
+                        if (entry.dist > bestDist) break;
+                        const tris = entry.cell.tris;
+                        for (let k = 0; k < tris.length; k++) {
+                            const t = tris[k];
+                            if (tested[t] === stamp) continue;
+                            tested[t] = stamp;
+
+                            const i0 = idxAttr ? idxAttr.getX(t * 3) : t * 3;
+                            const i1 = idxAttr ? idxAttr.getX(t * 3 + 1) : t * 3 + 1;
+                            const i2 = idxAttr ? idxAttr.getX(t * 3 + 2) : t * 3 + 2;
+
+                            _rcTriA.fromBufferAttribute(posAttr, i0);
+                            _rcTriB.fromBufferAttribute(posAttr, i1);
+                            _rcTriC.fromBufferAttribute(posAttr, i2);
+
+                            const hitPt = ray.intersectTriangle(_rcTriA, _rcTriB, _rcTriC, false, _rcTriHit);
+                            if (!hitPt) continue;
+
+                            const dist = ro.distanceTo(hitPt);
+                            if (dist < raycaster.near || dist > raycaster.far || dist >= bestDist) continue;
+
+                            let insideCutout = false;
+                            for (let p = 0; p < portalHoles.length; p++) {
+                                if (hitPt.distanceToSquared(portalHoles[p].point) < portalHoles[p].radiusSq) {
+                                    insideCutout = true;
+                                    break;
+                                }
+                            }
+                            if (insideCutout) continue;
+
+                            _rcTriHelper.set(_rcTriA, _rcTriB, _rcTriC);
+                            _rcTriHelper.getNormal(_rcTriNorm);
+
+                            bestDist = dist;
+                            bestMacroHit = {
+                                distance: dist,
+                                point: hitPt.clone(),
+                                face: { a: i0, b: i1, c: i2, normal: _rcTriNorm.clone(), materialIndex: 0 },
+                                object: planetaryMacroShell
+                            };
+                        }
+                    }
+
+                    return bestMacroHit || bestSubHit;
+                }
+
+                // Fallback when macroRaycastGrid is absent
                 const targets = [...activeSubterraneanMeshes];
                 if (planetaryMacroShell) targets.push(planetaryMacroShell);
                 const hits = raycaster.intersectObjects(targets, false);
@@ -640,7 +945,7 @@
                 for (let i = 0; i < hits.length; i++) {
                     const h = hits[i];
                     if (h.object === planetaryMacroShell) {
-                        const insideCutout = portalHoles.some(p => h.point.distanceTo(p.point) < p.radius);
+                        const insideCutout = portalHoles.some(p => h.point.distanceToSquared(p.point) < p.radiusSq);
                         if (insideCutout) continue; // Ignore discarded portal pixels
                     }
                     return h;

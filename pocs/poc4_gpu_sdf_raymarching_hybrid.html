@@ -59,10 +59,21 @@
         // B = Reinforced Titanium Armor mask [0, 1]
         // A = Reserved padding (1.0)
         let volumeData = new Float32Array(VOL_RES * VOL_RES * VOL_RES * 4);
+        let volumeUploadData = null;
+        let subScratchU16 = null;
+        let subScratchF32 = null;
+        let isSoftwareGL = false;
+        let useHalfFloat = true;
         let volumeTexture = null;
         let volumeBoxMesh = null;
         let raymarchMaterial = null;
         const viewProjMatrix = new THREE.Matrix4();
+        const _rcBox = new THREE.Box3();
+        const _rcBoxMin = new THREE.Vector3();
+        const _rcBoxMax = new THREE.Vector3();
+        const _rcEntryPt = new THREE.Vector3();
+        const _rcP = new THREE.Vector3();
+        const _rcMp = new THREE.Vector3();
 
         function evalDensityPoC4(wx, wy, wz) {
             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
@@ -81,7 +92,10 @@
                 volumeData = new Float32Array(neededLen);
             }
 
+            const outerSkipR = currentRadius * 1.18;
+            const outerBiasR = currentRadius * 1.10;
             const oreFreq = 0.006 * (2800.0 / currentRadius);
+            const oreThreshold = -VOXEL_SPACING * 2.1;
             let idx = 0;
             for (let z = 0; z < VOL_RES; z++) {
                 const wz = -DOMAIN_HALF + (z + 0.5) * VOXEL_SPACING;
@@ -89,13 +103,14 @@
                     const wy = -DOMAIN_HALF + (y + 0.5) * VOXEL_SPACING;
                     for (let x = 0; x < VOL_RES; x++) {
                         const wx = -DOMAIN_HALF + (x + 0.5) * VOXEL_SPACING;
-                        const d = evalDensityPoC4(wx, wy, wz);
+                        const rDist = Math.sqrt(wx * wx + wy * wy + wz * wz);
+                        const d = rDist > outerSkipR ? (rDist - outerBiasR) : evalDensityPoC4(wx, wy, wz);
 
                         const idx4 = idx * 4;
                         volumeData[idx4 + 0] = d / DOMAIN_HALF;
                         // Organic subterranean gold ore veins (> 2.1 voxels deep so 4-tap B-spline never bleeds onto untouched exterior crust)
                         let isOre = 0.0;
-                        if (d < -VOXEL_SPACING * 2.1) {
+                        if (d < oreThreshold) {
                             const v1 = noise.fbm(wx * oreFreq * 0.45 + 11.3, wy * oreFreq * 0.45 + 7.1, wz * oreFreq * 0.45 - 3.7, 2);
                             const v2 = noise.noise(wx * oreFreq * 0.9 - 5.2, wy * oreFreq * 0.9 + 19.4, wz * oreFreq * 0.9 + 8.1);
                             if (v1 > 0.58 && v2 > 0.52) isOre = 1.0;
@@ -112,9 +127,22 @@
                 volumeTexture.dispose();
             }
 
-            volumeTexture = new THREE.Data3DTexture(volumeData, VOL_RES, VOL_RES, VOL_RES);
+            let texBackingData = volumeData;
+            if (useHalfFloat) {
+                if (!volumeUploadData || volumeUploadData.length !== neededLen) {
+                    volumeUploadData = new Uint16Array(neededLen);
+                }
+                for (let i = 0; i < neededLen; i++) {
+                    volumeUploadData[i] = THREE.DataUtils.toHalfFloat(volumeData[i]);
+                }
+                texBackingData = volumeUploadData;
+            } else {
+                volumeUploadData = null;
+            }
+
+            volumeTexture = new THREE.Data3DTexture(texBackingData, VOL_RES, VOL_RES, VOL_RES);
             volumeTexture.format = THREE.RGBAFormat;
-            volumeTexture.type = THREE.FloatType;
+            volumeTexture.type = useHalfFloat ? THREE.HalfFloatType : THREE.FloatType;
             volumeTexture.minFilter = THREE.LinearFilter;
             volumeTexture.magFilter = THREE.LinearFilter;
             volumeTexture.wrapS = THREE.ClampToEdgeWrapping;
@@ -122,6 +150,103 @@
             volumeTexture.wrapR = THREE.ClampToEdgeWrapping;
             volumeTexture.unpackAlignment = 1;
             volumeTexture.needsUpdate = true;
+            if (sandbox && sandbox.renderer) {
+                sandbox.renderer.initTexture(volumeTexture);
+            }
+        }
+
+        // Dirty-AABB WebGL2 sub-volume texture upload (avoids full 3D volume re-upload per carve tick)
+        function uploadVolumeSubBox(minX, maxX, minY, maxY, minZ, maxZ) {
+            if (!volumeTexture) return;
+            minX = Math.max(0, minX); maxX = Math.min(VOL_RES - 1, maxX);
+            minY = Math.max(0, minY); maxY = Math.min(VOL_RES - 1, maxY);
+            minZ = Math.max(0, minZ); maxZ = Math.min(VOL_RES - 1, maxZ);
+            if (minX > maxX || minY > maxY || minZ > maxZ) return;
+
+            const w = maxX - minX + 1;
+            const h = maxY - minY + 1;
+            const d = maxZ - minZ + 1;
+            const volRes2 = VOL_RES * VOL_RES;
+
+            const gl = sandbox && sandbox.renderer ? sandbox.renderer.getContext() : null;
+            const texProps = sandbox && sandbox.renderer ? sandbox.renderer.properties.get(volumeTexture) : null;
+            const glTex = texProps ? texProps.__webglTexture : null;
+
+            if (!gl || !glTex) {
+                if (useHalfFloat && volumeTexture.image && volumeTexture.image.data) {
+                    const mirror = volumeTexture.image.data;
+                    for (let z = minZ; z <= maxZ; z++) {
+                        const zBase = z * volRes2;
+                        for (let y = minY; y <= maxY; y++) {
+                            const rowBase = (zBase + y * VOL_RES + minX) * 4;
+                            const rowLen = w * 4;
+                            for (let i = 0; i < rowLen; i++) {
+                                mirror[rowBase + i] = THREE.DataUtils.toHalfFloat(volumeData[rowBase + i]);
+                            }
+                        }
+                    }
+                }
+                volumeTexture.needsUpdate = true;
+                return;
+            }
+
+            const needed = w * h * d * 4;
+            let subBuf;
+            if (useHalfFloat) {
+                if (!subScratchU16 || subScratchU16.length < needed) {
+                    subScratchU16 = new Uint16Array(needed);
+                }
+                subBuf = subScratchU16.subarray(0, needed);
+                const mirror = volumeTexture.image && volumeTexture.image.data ? volumeTexture.image.data : null;
+                let dst = 0;
+                for (let z = minZ; z <= maxZ; z++) {
+                    const zBase = z * volRes2;
+                    for (let y = minY; y <= maxY; y++) {
+                        const rowBase = (zBase + y * VOL_RES + minX) * 4;
+                        const rowLen = w * 4;
+                        for (let i = 0; i < rowLen; i++) {
+                            const srcIdx = rowBase + i;
+                            const hf = THREE.DataUtils.toHalfFloat(volumeData[srcIdx]);
+                            subBuf[dst++] = hf;
+                            if (mirror) mirror[srcIdx] = hf;
+                        }
+                    }
+                }
+            } else {
+                if (!subScratchF32 || subScratchF32.length < needed) {
+                    subScratchF32 = new Float32Array(needed);
+                }
+                subBuf = subScratchF32.subarray(0, needed);
+                let dst = 0;
+                for (let z = minZ; z <= maxZ; z++) {
+                    const zBase = z * volRes2;
+                    for (let y = minY; y <= maxY; y++) {
+                        const rowBase = (zBase + y * VOL_RES + minX) * 4;
+                        const rowLen = w * 4;
+                        subBuf.set(volumeData.subarray(rowBase, rowBase + rowLen), dst);
+                        dst += rowLen;
+                    }
+                }
+            }
+
+            const prevTex = gl.getParameter(gl.TEXTURE_BINDING_3D);
+            const prevAlign = gl.getParameter(gl.UNPACK_ALIGNMENT);
+            const prevFlipY = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL);
+            gl.bindTexture(gl.TEXTURE_3D, glTex);
+            gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+            if (prevFlipY) gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+            gl.texSubImage3D(
+                gl.TEXTURE_3D,
+                0,
+                minX, minY, minZ,
+                w, h, d,
+                gl.RGBA,
+                useHalfFloat ? gl.HALF_FLOAT : gl.FLOAT,
+                subBuf
+            );
+            if (prevFlipY) gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, prevFlipY);
+            gl.pixelStorei(gl.UNPACK_ALIGNMENT, prevAlign);
+            gl.bindTexture(gl.TEXTURE_3D, prevTex);
         }
 
         // CPU Trilinear Interpolation Sampling (Exact match with GPU sampler3D texel centers)
@@ -205,8 +330,16 @@
                 const gl = sandbox.renderer.getContext();
                 if (gl) {
                     gl.getExtension('OES_texture_float_linear');
+                    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                    const rendererStr = dbg
+                        ? (gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || gl.getParameter(gl.RENDERER) || '')
+                        : (gl.getParameter(gl.RENDERER) || '');
+                    isSoftwareGL = /SwiftShader|llvmpipe|Software/i.test(String(rendererStr));
+                } else {
+                    isSoftwareGL = Boolean(sandbox.isSoftwareGL);
                 }
             }
+            useHalfFloat = !isSoftwareGL;
 
             initVolumeField();
 
@@ -224,7 +357,8 @@
                     uViewProjMatrix: { value: new THREE.Matrix4() },
                     uWireframe: { value: 0.0 },
                     uXRayEnabled: { value: 0.0 },
-                    uXRayOffset: { value: 0.0 }
+                    uXRayOffset: { value: 0.0 },
+                    uMaxSteps: { value: isSoftwareGL ? 48 : 96 }
                 },
                 vertexShader: `
                     out vec3 vWorldPos;
@@ -251,6 +385,7 @@
                     uniform float uWireframe;
                     uniform float uXRayEnabled;
                     uniform float uXRayOffset;
+                    uniform int uMaxSteps;
 
                     float rmHash3(vec3 p) {
                         p = fract(p * 0.3183099 + 0.1);
@@ -380,17 +515,17 @@
                         return vec3(res.x * uDomainHalf, res.y, res.z);
                     }
 
-                    // Continuous C2 Tetrahedral Normal using Tricubic B-Spline SDF
-                    vec3 calcNormal(vec3 p) {
+                    // Continuous C2 Tetrahedral Gradient using Tricubic B-Spline SDF
+                    vec3 calcNormalRaw(vec3 p) {
                         float voxelSize = (uDomainHalf * 2.0) / uVolRes;
                         float eps = voxelSize * 0.35;
                         vec2 e = vec2(eps, -eps);
-                        return normalize(
+                        vec3 gradSum =
                             e.xyy * sampleVolumeBspline(p + e.xyy).x +
                             e.yyx * sampleVolumeBspline(p + e.yyx).x +
                             e.yxy * sampleVolumeBspline(p + e.yxy).x +
-                            e.xxx * sampleVolumeBspline(p + e.xxx).x
-                        );
+                            e.xxx * sampleVolumeBspline(p + e.xxx).x;
+                        return gradSum / (4.0 * eps * eps);
                     }
 
                     // 4-Tap SDF Cavity Ambient Occlusion along outward normal
@@ -448,19 +583,13 @@
                         vec3 p = ro + rd * t;
                         bool hit = false;
                         float prevT = t;
-                        vec3 sampleRes = vec3(1000.0, 0.0, 0.0);
 
-                        for (int i = 0; i < 160; i++) {
+                        for (int i = 0; i < 96; i++) {
+                            if (i >= uMaxSteps) break;
                             if (t > tEnd) break;
                             p = ro + rd * t;
 
-                            vec3 fastRes = sampleVolumeFast(p);
-                            float dist = fastRes.x;
-
-                            if (dist <= voxelSize * 0.75) {
-                                sampleRes = sampleVolumeBspline(p);
-                                dist = sampleRes.x;
-                            }
+                            float dist = sampleVolumeFast(p).x;
 
                             if (dist <= 0.0) {
                                 hit = true;
@@ -468,32 +597,45 @@
                                     // Ray hit solid interior right on the X-Ray slice plane
                                     break;
                                 }
-                                // 6-iteration root bisection using C² B-Spline
+                                // 5-iteration fast root bisection using 1-tap sampleVolumeFast
                                 float a = prevT;
                                 float b = t;
-                                for (int k = 0; k < 6; k++) {
+                                for (int k = 0; k < 5; k++) {
                                     float m = 0.5 * (a + b);
-                                    float dm = sampleVolumeBspline(ro + rd * m).x;
+                                    float dm = sampleVolumeFast(ro + rd * m).x;
                                     if (dm <= 0.0) b = m;
                                     else a = m;
                                 }
                                 t = 0.5 * (a + b);
                                 p = ro + rd * t;
-                                sampleRes = sampleVolumeBspline(p);
                                 hitSliceCap = false;
                                 break;
                             }
 
                             prevT = t;
-                            if (fastRes.x <= voxelSize * 0.75) {
-                                t += max(dist * 0.75, minStep);
-                            } else {
-                                t += max(dist * 0.85, clamp(dist * 0.5, minStep, 6.0));
-                            }
+                            t += max(dist * 0.90, minStep * (1.0 + float(i) * 0.05));
                         }
 
                         if (!hit) {
                             discard;
+                        }
+
+                        vec3 norm;
+                        vec3 sampleRes;
+                        if (hitSliceCap) {
+                            norm = vec3(0.0, 1.0, 0.0);
+                            sampleRes = sampleVolumeBspline(p);
+                        } else {
+                            vec3 rawGrad = calcNormalRaw(p);
+                            float rawLenSq = dot(rawGrad, rawGrad);
+                            norm = rawLenSq > 1e-10 ? rawGrad * inversesqrt(rawLenSq) : normalize(p);
+                            sampleRes = sampleVolumeBspline(p);
+                            float denom = dot(rawGrad, rd);
+                            if (denom < -0.15) {
+                                t = max(0.0, t + clamp(-sampleRes.x / denom, -voxelSize * 0.45, voxelSize * 0.45));
+                                p = ro + rd * t;
+                                sampleRes = sampleVolumeBspline(p);
+                            }
                         }
 
                         float camDist = length(p - ro);
@@ -505,26 +647,23 @@
                         float fbmMicro = rmFbm(sp * 0.032);
                         float fbmGrit = rmNoise3(sp * 0.088);
 
-                        vec3 finalVol = hitSliceCap ? sampleVolumeBspline(p) : sampleRes;
+                        vec3 finalVol = sampleRes;
                         float oreWeight = clamp(finalVol.y, 0.0, 1.0);
                         float armorWeight = smoothstep(0.32, 0.68, finalVol.z);
 
-                        vec3 norm = hitSliceCap ? vec3(0.0, 1.0, 0.0) : calcNormal(p);
-
-                        // Crisp procedural rocky micro-bump perturbation matching Options 1–3
+                        // Lightweight 3-tap single-octave procedural bump (zero dFdx silhouette artifacts)
                         float distAtten = clamp((uAsteroidRadius * 1.95) / max(camDist, uAsteroidRadius * 0.3), 0.35, 1.0);
                         if (!hitSliceCap && armorWeight < 0.35) {
                             float epsB = clamp((camDist * invScale) * 0.00055, 0.45, 1.9);
-                            float hCenter = fbmMicro * 0.55 + fbmGrit * 0.30 + fbmMed * 0.15;
-                            vec3 spx = sp + vec3(epsB, 0.0, 0.0);
-                            vec3 spy = sp + vec3(0.0, epsB, 0.0);
-                            vec3 spz = sp + vec3(0.0, 0.0, epsB);
-                            float hx = (rmFbm(spx * 0.032) * 0.55 + rmNoise3(spx * 0.088) * 0.30 + rmFbm(spx * 0.015) * 0.15) - hCenter;
-                            float hy = (rmFbm(spy * 0.032) * 0.55 + rmNoise3(spy * 0.088) * 0.30 + rmFbm(spy * 0.015) * 0.15) - hCenter;
-                            float hz = (rmFbm(spz * 0.032) * 0.55 + rmNoise3(spz * 0.088) * 0.30 + rmFbm(spz * 0.015) * 0.15) - hCenter;
+                            vec3 spB = sp * 0.045;
+                            float dEpsB = epsB * 0.045;
+                            float bumpC = rmNoise3(spB);
+                            float hx = rmNoise3(spB + vec3(dEpsB, 0.0, 0.0)) - bumpC;
+                            float hy = rmNoise3(spB + vec3(0.0, dEpsB, 0.0)) - bumpC;
+                            float hz = rmNoise3(spB + vec3(0.0, 0.0, dEpsB)) - bumpC;
                             vec3 bumpGrad = vec3(hx, hy, hz) / epsB;
                             bumpGrad -= norm * dot(bumpGrad, norm);
-                            norm = normalize(norm - bumpGrad * (11.5 * distAtten * (1.0 - armorWeight)));
+                            norm = normalize(norm - bumpGrad * (9.5 * distAtten * (1.0 - armorWeight)));
                         }
 
                         // Cavity Ambient Occlusion
@@ -603,6 +742,7 @@
             const minZ = Math.max(0, Math.floor(((hitPoint.z - pad) + DOMAIN_HALF) / VOXEL_SPACING));
             const maxZ = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.z + pad) + DOMAIN_HALF) / VOXEL_SPACING));
 
+            let dMinX = maxX, dMaxX = minX, dMinY = maxY, dMaxY = minY, dMinZ = maxZ, dMaxZ = minZ;
             const volRes2 = VOL_RES * VOL_RES;
             for (let z = minZ; z <= maxZ; z++) {
                 const wz = -DOMAIN_HALF + (z + 0.5) * VOXEL_SPACING;
@@ -614,12 +754,13 @@
                         const wx = -DOMAIN_HALF + (x + 0.5) * VOXEL_SPACING;
                         const distToHit = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
                         const idx4 = (x + yzOff) * 4;
+                        let cellModified = false;
 
                         // Heavy Breach Mode clears armor plating
                         if (mode === 'breach' && distToHit <= brushRadius + VOXEL_SPACING * 0.85) {
                             if (volumeData[idx4 + 2] > 0.0) {
                                 volumeData[idx4 + 2] = 0.0;
-                                modified = true;
+                                cellModified = true;
                             }
                         }
 
@@ -628,22 +769,32 @@
                             const carveD = brushRadius - distToHit;
                             if (carveD > curD) {
                                 volumeData[idx4] = carveD / DOMAIN_HALF;
-                                modified = true;
+                                cellModified = true;
                             }
                             // Deep interior void clears residual armor and ore masks
                             if (carveD > VOXEL_SPACING * 1.85) {
                                 if (volumeData[idx4 + 1] !== 0.0 || volumeData[idx4 + 2] !== 0.0) {
                                     volumeData[idx4 + 1] = 0.0;
                                     volumeData[idx4 + 2] = 0.0;
-                                    modified = true;
+                                    cellModified = true;
                                 }
                             }
+                        }
+
+                        if (cellModified) {
+                            modified = true;
+                            if (x < dMinX) dMinX = x;
+                            if (x > dMaxX) dMaxX = x;
+                            if (y < dMinY) dMinY = y;
+                            if (y > dMaxY) dMaxY = y;
+                            if (z < dMinZ) dMinZ = z;
+                            if (z > dMaxZ) dMaxZ = z;
                         }
                     }
                 }
             }
             if (modified && volumeTexture) {
-                volumeTexture.needsUpdate = true;
+                uploadVolumeSubBox(dMinX, dMaxX, dMinY, dMaxY, dMinZ, dMaxZ);
             }
         }
 
@@ -658,6 +809,7 @@
             const minZ = Math.max(0, Math.floor(((hitPoint.z - pad) + DOMAIN_HALF) / VOXEL_SPACING));
             const maxZ = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.z + pad) + DOMAIN_HALF) / VOXEL_SPACING));
 
+            let dMinX = maxX, dMaxX = minX, dMinY = maxY, dMaxY = minY, dMinZ = maxZ, dMaxZ = minZ;
             const volRes2 = VOL_RES * VOL_RES;
             for (let z = minZ; z <= maxZ; z++) {
                 const wz = -DOMAIN_HALF + (z + 0.5) * VOXEL_SPACING;
@@ -677,6 +829,12 @@
                                     volumeData[idx4 + 2] = 1.0;
                                     volumeData[idx4 + 1] = 0.0;
                                     modified = true;
+                                    if (x < dMinX) dMinX = x;
+                                    if (x > dMaxX) dMaxX = x;
+                                    if (y < dMinY) dMinY = y;
+                                    if (y > dMaxY) dMaxY = y;
+                                    if (z < dMinZ) dMinZ = z;
+                                    if (z > dMaxZ) dMaxZ = z;
                                 }
                             }
                         }
@@ -684,7 +842,7 @@
                 }
             }
             if (modified && volumeTexture) {
-                volumeTexture.needsUpdate = true;
+                uploadVolumeSubBox(dMinX, dMaxX, dMinY, dMaxY, dMinZ, dMaxZ);
             }
         }
 
@@ -743,52 +901,65 @@
                 const rd = raycaster.ray.direction;
 
                 // Intersect ray with volume AABB before sphere-marching
-                const box = new THREE.Box3(
-                    new THREE.Vector3(-DOMAIN_HALF, -DOMAIN_HALF, -DOMAIN_HALF),
-                    new THREE.Vector3(DOMAIN_HALF, DOMAIN_HALF, DOMAIN_HALF)
-                );
-                const entryPt = new THREE.Vector3();
-                if (!box.containsPoint(ro) && !raycaster.ray.intersectBox(box, entryPt)) {
+                _rcBoxMin.set(-DOMAIN_HALF, -DOMAIN_HALF, -DOMAIN_HALF);
+                _rcBoxMax.set(DOMAIN_HALF, DOMAIN_HALF, DOMAIN_HALF);
+                _rcBox.set(_rcBoxMin, _rcBoxMax);
+                const insideBox = _rcBox.containsPoint(ro);
+                if (!insideBox && !raycaster.ray.intersectBox(_rcBox, _rcEntryPt)) {
                     return null;
                 }
-                let t = box.containsPoint(ro) ? 0 : ro.distanceTo(entryPt) + 1.0;
+                let t = insideBox ? 0 : ro.distanceTo(_rcEntryPt) + 1.0;
+
+                // Analytical Bounding-Sphere Early-Out (matches GPU shader)
+                const rBound = currentRadius * 1.25;
+                const bSph = ro.dot(rd);
+                const cSph = ro.lengthSq() - rBound * rBound;
+                const dSph = bSph * bSph - cSph;
+                if (dSph < 0.0) return null;
+                const sqrtD = Math.sqrt(dSph);
+                const ts0 = -bSph - sqrtD;
+                const ts1 = -bSph + sqrtD;
+                if (ts1 < 0.0) return null;
+                if (ts0 > 0.0) t = Math.max(t, ts0 + 0.5);
+                const maxT = ts1;
+                if (maxT < t) return null;
+
                 let prevT = t;
-                const maxT = t + DOMAIN_HALF * 4.0;
-                const p = new THREE.Vector3();
                 const minStep = Math.max(currentRadius * 0.001, 1.5);
 
-                for (let step = 0; step < 160 && t <= maxT; step++) {
-                    p.copy(ro).addScaledVector(rd, t);
-                    if (sandbox.isXRay && p.y > -sandbox.xRayOffset) {
+                for (let step = 0; step < 96 && t <= maxT; step++) {
+                    _rcP.copy(ro).addScaledVector(rd, t);
+                    if (sandbox.isXRay && _rcP.y > -sandbox.xRayOffset) {
                         if (rd.y >= -1e-5) return null;
                         const tPlane = (-sandbox.xRayOffset - ro.y) / rd.y;
+                        if (tPlane > maxT) return null;
                         t = Math.max(t + 1.0, tPlane);
                         prevT = t;
                         continue;
                     }
-                    const res = cpuSampleSDF(p.x, p.y, p.z);
+                    const res = cpuSampleSDF(_rcP.x, _rcP.y, _rcP.z);
                     if (res.d <= 0.0) {
                         let a = prevT, b = t;
-                        for (let k = 0; k < 6; k++) {
+                        for (let k = 0; k < 5; k++) {
                             const m = 0.5 * (a + b);
-                            const mp = ro.clone().addScaledVector(rd, m);
-                            if (cpuSampleSDF(mp.x, mp.y, mp.z).d <= 0.0) b = m;
+                            _rcMp.copy(ro).addScaledVector(rd, m);
+                            if (cpuSampleSDF(_rcMp.x, _rcMp.y, _rcMp.z).d <= 0.0) b = m;
                             else a = m;
                         }
                         const refinedT = 0.5 * (a + b);
-                        p.copy(ro).addScaledVector(rd, refinedT);
-                        const finalSamp = cpuSampleSDF(p.x, p.y, p.z);
+                        _rcP.copy(ro).addScaledVector(rd, refinedT);
+                        const finalSamp = cpuSampleSDF(_rcP.x, _rcP.y, _rcP.z);
                         const eps = Math.max(10.0, VOXEL_SPACING * 0.45);
                         const norm = new THREE.Vector3(
-                            cpuSampleSDF(p.x + eps, p.y, p.z).d - cpuSampleSDF(p.x - eps, p.y, p.z).d,
-                            cpuSampleSDF(p.x, p.y + eps, p.z).d - cpuSampleSDF(p.x, p.y - eps, p.z).d,
-                            cpuSampleSDF(p.x, p.y, p.z + eps).d - cpuSampleSDF(p.x, p.y, p.z - eps).d
+                            cpuSampleSDF(_rcP.x + eps, _rcP.y, _rcP.z).d - cpuSampleSDF(_rcP.x - eps, _rcP.y, _rcP.z).d,
+                            cpuSampleSDF(_rcP.x, _rcP.y + eps, _rcP.z).d - cpuSampleSDF(_rcP.x, _rcP.y - eps, _rcP.z).d,
+                            cpuSampleSDF(_rcP.x, _rcP.y, _rcP.z + eps).d - cpuSampleSDF(_rcP.x, _rcP.y, _rcP.z - eps).d
                         );
                         if (norm.lengthSq() > 1e-8) norm.normalize();
-                        else norm.copy(p).normalize();
+                        else norm.copy(_rcP).normalize();
 
                         return {
-                            point: p.clone(),
+                            point: _rcP.clone(),
                             normal: norm,
                             distance: refinedT,
                             materialId: Math.round(finalSamp.mat),
@@ -796,7 +967,7 @@
                         };
                     }
                     prevT = t;
-                    t += Math.max(res.d * 0.88, Math.min(6.0, Math.max(minStep, res.d * 0.5)));
+                    t += Math.max(res.d * 0.90, minStep * (1.0 + step * 0.05));
                 }
                 return null;
             },
