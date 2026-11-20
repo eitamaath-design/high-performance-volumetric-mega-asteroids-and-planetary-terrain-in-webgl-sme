@@ -450,6 +450,7 @@ export class PlanetaryBaseSandbox {
         this.initFX();
         this.initShip();
         this.initOrbitalResourceNodes();
+        this._hudEls = null;
         this.initHUD();
         this.initControls();
         this.initPostMessageBridge();
@@ -869,6 +870,30 @@ export class PlanetaryBaseSandbox {
         `;
         document.body.appendChild(this.hud);
 
+        // Cache all HUD DOM references once to eliminate per-frame/per-event querySelector lookups
+        this._hudEls = {
+            status: this.hud.querySelector('#hud-status'),
+            fps: this.hud.querySelector('#tel-fps'),
+            tris: this.hud.querySelector('#tel-tris'),
+            collisionErr: this.hud.querySelector('#tel-collision-err'),
+            carve: this.hud.querySelector('#tel-carve-dur'),
+            cellSize: this.hud.querySelector('#tel-cell-size'),
+            machineryCount: this.hud.querySelector('#tel-machinery-count'),
+            raiderAlert: this.hud.querySelector('#raider-alert'),
+            sliderRadius: this.hud.querySelector('#slider-radius'),
+            lblRadius: this.hud.querySelector('#lbl-radius'),
+            sliderXray: this.hud.querySelector('#slider-xray'),
+            lblXrayVal: this.hud.querySelector('#lbl-xray-val'),
+            containerXraySlider: this.hud.querySelector('#container-xray-slider'),
+            lblMachinery: this.hud.querySelector('#lbl-machinery'),
+            btnToggleFlight: this.hud.querySelector('#btn-toggle-flight'),
+            btnToggleWireframe: this.hud.querySelector('#btn-toggle-wireframe'),
+            btnToggleXray: this.hud.querySelector('#btn-toggle-xray'),
+            toolBtns: Array.from(this.hud.querySelectorAll('.hud-btn[data-tool]')),
+            scaleBtns: Array.from(this.hud.querySelectorAll('.hud-scale-btn')),
+            qualityBtns: Array.from(this.hud.querySelectorAll('.hud-quality-btn'))
+        };
+
         // Sync initial active button highlights for scale & quality
         this.syncScaleButtons();
         this.syncQualityButtons();
@@ -879,8 +904,8 @@ export class PlanetaryBaseSandbox {
     }
 
     syncScaleButtons() {
-        if (!this.hud) return;
-        const scaleBtns = this.hud.querySelectorAll('.hud-scale-btn');
+        const scaleBtns = this._hudEls?.scaleBtns;
+        if (!scaleBtns) return;
         scaleBtns.forEach(b => {
             const isMatch = b.getAttribute('data-scale') === this.currentScaleKey;
             b.style.border = isMatch ? '1px solid #00f0ff' : '1px solid #445566';
@@ -890,8 +915,8 @@ export class PlanetaryBaseSandbox {
     }
 
     syncQualityButtons() {
-        if (!this.hud) return;
-        const qualityBtns = this.hud.querySelectorAll('.hud-quality-btn');
+        const qualityBtns = this._hudEls?.qualityBtns;
+        if (!qualityBtns) return;
         qualityBtns.forEach(b => {
             const isMatch = b.getAttribute('data-quality') === this.currentQuality;
             b.style.border = isMatch ? '1px solid #10b981' : '1px solid #445566';
@@ -901,8 +926,7 @@ export class PlanetaryBaseSandbox {
     }
 
     updateCellSizeLabel() {
-        if (!this.hud) return;
-        const el = this.hud.querySelector('#tel-cell-size');
+        const el = this._hudEls?.cellSize;
         if (!el) return;
         if (this.config.getCellSize) {
             el.innerText = `${this.config.getCellSize()} [${this.currentQuality.toUpperCase()}]`;
@@ -912,11 +936,10 @@ export class PlanetaryBaseSandbox {
     }
 
     bindHUDEvents() {
-        const hud = this.hud;
+        const els = this._hudEls || {};
 
         // Tool buttons
-        const toolBtns = hud.querySelectorAll('.hud-btn[data-tool]');
-        toolBtns.forEach(btn => {
+        (els.toolBtns || []).forEach(btn => {
             btn.addEventListener('click', () => {
                 const tool = btn.getAttribute('data-tool');
                 if (tool === 'machinery' && this.activeTool === 'machinery') {
@@ -925,26 +948,26 @@ export class PlanetaryBaseSandbox {
                     const nextIdx = (types.indexOf(this.selectedMachinery) + 1) % types.length;
                     this.selectedMachinery = types[nextIdx];
                     const names = { weapons: 'Weapons Lab', shield: 'Shield Dome', foundry: 'Foundry', refinery: 'Refinery' };
-                    hud.querySelector('#lbl-machinery').innerText = names[this.selectedMachinery];
+                    if (els.lblMachinery) els.lblMachinery.innerText = names[this.selectedMachinery];
                 }
                 this.setActiveTool(tool);
             });
         });
 
         // Radius Slider
-        const sliderRadius = hud.querySelector('#slider-radius');
-        sliderRadius.addEventListener('input', (e) => {
-            this.brushRadius = parseFloat(e.target.value);
-            hud.querySelector('#lbl-radius').innerText = `${this.brushRadius}u`;
-            if (this.brushCursorMesh && this.brushCursorMesh.visible) {
-                this.brushCursorMesh.scale.setScalar(this.brushRadius);
-            }
-            this._brushDirty = true;
-        });
+        if (els.sliderRadius) {
+            els.sliderRadius.addEventListener('input', (e) => {
+                this.brushRadius = parseFloat(e.target.value);
+                if (els.lblRadius) els.lblRadius.innerText = `${this.brushRadius}u`;
+                if (this.brushCursorMesh && this.brushCursorMesh.visible) {
+                    this.brushCursorMesh.scale.setScalar(this.brushRadius);
+                }
+                this._brushDirty = true;
+            });
+        }
 
         // Scale Buttons
-        const scaleBtns = hud.querySelectorAll('.hud-scale-btn');
-        scaleBtns.forEach(btn => {
+        (els.scaleBtns || []).forEach(btn => {
             btn.addEventListener('click', () => {
                 const scale = btn.getAttribute('data-scale');
                 this.setScale(scale);
@@ -952,8 +975,7 @@ export class PlanetaryBaseSandbox {
         });
 
         // Quality Buttons
-        const qualityBtns = hud.querySelectorAll('.hud-quality-btn');
-        qualityBtns.forEach(btn => {
+        (els.qualityBtns || []).forEach(btn => {
             btn.addEventListener('click', () => {
                 const quality = btn.getAttribute('data-quality');
                 this.setQuality(quality);
@@ -961,18 +983,19 @@ export class PlanetaryBaseSandbox {
         });
 
         // Mode Toggles
-        hud.querySelector('#btn-toggle-flight').addEventListener('click', () => this.toggleFlightMode());
-        hud.querySelector('#btn-toggle-wireframe').addEventListener('click', () => this.toggleWireframe());
-        hud.querySelector('#btn-toggle-xray').addEventListener('click', () => this.toggleXRay());
+        if (els.btnToggleFlight) els.btnToggleFlight.addEventListener('click', () => this.toggleFlightMode());
+        if (els.btnToggleWireframe) els.btnToggleWireframe.addEventListener('click', () => this.toggleWireframe());
+        if (els.btnToggleXray) els.btnToggleXray.addEventListener('click', () => this.toggleXRay());
 
         // X-Ray Slider
-        const sliderXRay = hud.querySelector('#slider-xray');
-        sliderXRay.addEventListener('input', (e) => {
-            this.xRayOffset = parseFloat(e.target.value);
-            this.clipPlane.constant = this.xRayOffset;
-            hud.querySelector('#lbl-xray-val').innerText = `${Math.round(this.xRayOffset)}u`;
-            if (this.config.onToggleXRay) this.config.onToggleXRay(this.isXRay, this.clipPlane);
-        });
+        if (els.sliderXray) {
+            els.sliderXray.addEventListener('input', (e) => {
+                this.xRayOffset = parseFloat(e.target.value);
+                this.clipPlane.constant = this.xRayOffset;
+                if (els.lblXrayVal) els.lblXrayVal.innerText = `${Math.round(this.xRayOffset)}u`;
+                if (this.config.onToggleXRay) this.config.onToggleXRay(this.isXRay, this.clipPlane);
+            });
+        }
 
         // Keyboard Shortcuts (Decoupled: Spacebar fires laser, WASD moves camera, V toggles wireframe)
         window.addEventListener('keydown', (e) => {
@@ -1021,7 +1044,7 @@ export class PlanetaryBaseSandbox {
 
     setActiveTool(tool) {
         this.activeTool = tool;
-        const toolBtns = this.hud.querySelectorAll('.hud-btn[data-tool]');
+        const toolBtns = this._hudEls?.toolBtns || [];
         toolBtns.forEach(b => {
             const isMatch = b.getAttribute('data-tool') === tool;
             b.style.border = isMatch ? '1px solid #00f0ff' : '1px solid #445566';
@@ -1068,9 +1091,11 @@ export class PlanetaryBaseSandbox {
         this.syncScaleButtons();
 
         // Update X-Ray Slider range
-        const sliderXRay = this.hud.querySelector('#slider-xray');
-        sliderXRay.min = -this.currentRadius;
-        sliderXRay.max = this.currentRadius;
+        const sliderXRay = this._hudEls?.sliderXray;
+        if (sliderXRay) {
+            sliderXRay.min = -this.currentRadius;
+            sliderXRay.max = this.currentRadius;
+        }
 
         // Reposition camera if in orbit mode
         if (!this.isFlightMode) {
@@ -1094,11 +1119,13 @@ export class PlanetaryBaseSandbox {
 
     toggleFlightMode() {
         this.isFlightMode = !this.isFlightMode;
-        const btn = this.hud.querySelector('#btn-toggle-flight');
+        const btn = this._hudEls?.btnToggleFlight;
         if (this.isFlightMode) {
-            btn.style.background = '#2563eb';
-            btn.style.color = '#ffffff';
-            btn.innerText = 'Exit Flight [F]';
+            if (btn) {
+                btn.style.background = '#2563eb';
+                btn.style.color = '#ffffff';
+                btn.innerText = 'Exit Flight [F]';
+            }
             this.controls.enabled = false;
             this.shipGroup.visible = true;
 
@@ -1122,9 +1149,11 @@ export class PlanetaryBaseSandbox {
             if (this.alignmentMarker) this.alignmentMarker.visible = false;
             if (this.normalLine) this.normalLine.visible = false;
         } else {
-            btn.style.background = '#1e293b';
-            btn.style.color = '#93c5fd';
-            btn.innerText = 'Fly Ship [F]';
+            if (btn) {
+                btn.style.background = '#1e293b';
+                btn.style.color = '#93c5fd';
+                btn.innerText = 'Fly Ship [F]';
+            }
             this.controls.enabled = true;
             this.shipGroup.visible = false;
             this.camera.up.set(0, 1, 0);
@@ -1140,9 +1169,11 @@ export class PlanetaryBaseSandbox {
 
     toggleWireframe() {
         this.isWireframe = !this.isWireframe;
-        const btn = this.hud.querySelector('#btn-toggle-wireframe');
-        btn.style.background = this.isWireframe ? '#0284c7' : '#1e293b';
-        btn.style.color = this.isWireframe ? '#ffffff' : '#94a3b8';
+        const btn = this._hudEls?.btnToggleWireframe;
+        if (btn) {
+            btn.style.background = this.isWireframe ? '#0284c7' : '#1e293b';
+            btn.style.color = this.isWireframe ? '#ffffff' : '#94a3b8';
+        }
         if (this.config.onToggleWireframe) {
             this.config.onToggleWireframe(this.isWireframe);
         }
@@ -1150,11 +1181,15 @@ export class PlanetaryBaseSandbox {
 
     toggleXRay() {
         this.isXRay = !this.isXRay;
-        const btn = this.hud.querySelector('#btn-toggle-xray');
-        const container = this.hud.querySelector('#container-xray-slider');
-        btn.style.background = this.isXRay ? '#059669' : '#1e293b';
-        btn.style.color = this.isXRay ? '#ffffff' : '#94a3b8';
-        container.style.display = this.isXRay ? 'block' : 'none';
+        const btn = this._hudEls?.btnToggleXray;
+        const container = this._hudEls?.containerXraySlider;
+        if (btn) {
+            btn.style.background = this.isXRay ? '#059669' : '#1e293b';
+            btn.style.color = this.isXRay ? '#ffffff' : '#94a3b8';
+        }
+        if (container) {
+            container.style.display = this.isXRay ? 'block' : 'none';
+        }
 
         if (this.isXRay) {
             this.renderer.clippingPlanes = [this.clipPlane];
@@ -1467,7 +1502,9 @@ export class PlanetaryBaseSandbox {
                 : elapsed;
             this.lastCarveLatency = elapsed;
             this.lastMainThreadCarveMs = mainThreadMs;
-            this.hud.querySelector('#tel-carve-dur').innerText = `${this.lastCarveLatency.toFixed(2)} ms`;
+            if (this._hudEls?.carve) {
+                this._hudEls.carve.innerText = `${this.lastCarveLatency.toFixed(2)} ms`;
+            }
 
             if (recordBenchmark && !this.benchmarkDone) {
                 this.carveLatencies.push(elapsed);
@@ -1492,14 +1529,17 @@ export class PlanetaryBaseSandbox {
 
         this.scene.add(mesh);
         this.placedMachinery.push(mesh);
-        this.hud.querySelector('#tel-machinery-count').innerText = `${this.placedMachinery.length} installed`;
+        if (this._hudEls?.machineryCount) {
+            this._hudEls.machineryCount.innerText = `${this.placedMachinery.length} installed`;
+        }
 
         // Small placement spark burst
         this.spawnSparks(point, normal, 50);
     }
 
     flashRaiderAlert() {
-        const alertBox = this.hud.querySelector('#raider-alert');
+        const alertBox = this._hudEls?.raiderAlert;
+        if (!alertBox) return;
         alertBox.style.display = 'block';
         clearTimeout(this._raiderTimer);
         this._raiderTimer = setTimeout(() => {
@@ -1610,7 +1650,7 @@ export class PlanetaryBaseSandbox {
         this.visualCollisionErrorNumeric = parseFloat(err.toFixed(6));
         this.visualCollisionError = formatted;
 
-        const errEl = this.hud ? this.hud.querySelector('#tel-collision-err') : null;
+        const errEl = this._hudEls?.collisionErr || null;
         if (errEl) {
             if (err < 0.005) {
                 errEl.style.color = '#00ffff';
@@ -1753,8 +1793,12 @@ export class PlanetaryBaseSandbox {
                     break;
                 case 'SET_RADIUS':
                     this.brushRadius = data.radius;
-                    this.hud.querySelector('#slider-radius').value = data.radius;
-                    this.hud.querySelector('#lbl-radius').innerText = `${data.radius}u`;
+                    if (this._hudEls?.sliderRadius) this._hudEls.sliderRadius.value = data.radius;
+                    if (this._hudEls?.lblRadius) this._hudEls.lblRadius.innerText = `${data.radius}u`;
+                    if (this.brushCursorMesh && this.brushCursorMesh.visible) {
+                        this.brushCursorMesh.scale.setScalar(this.brushRadius);
+                    }
+                    this._brushDirty = true;
                     break;
                 case 'SET_SCALE':
                     this.setScale(data.scale);
@@ -2028,8 +2072,8 @@ export class PlanetaryBaseSandbox {
 
         // Update HUD
         if (this.frameCount % 10 === 0) {
-            this.hud.querySelector('#tel-fps').innerText = `${this.fps.toFixed(1)} / ${this.frameTime.toFixed(1)}ms`;
-            this.hud.querySelector('#tel-tris').innerText = `${this.triangles.toLocaleString()} / ${this.drawCalls}`;
+            if (this._hudEls?.fps) this._hudEls.fps.innerText = `${this.fps.toFixed(1)} / ${this.frameTime.toFixed(1)}ms`;
+            if (this._hudEls?.tris) this._hudEls.tris.innerText = `${this.triangles.toLocaleString()} / ${this.drawCalls}`;
             this.updateCellSizeLabel();
 
             // Emit Telemetry to parent gallery via postMessage

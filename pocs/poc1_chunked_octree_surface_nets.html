@@ -12,6 +12,7 @@
     <script type="module">
         import * as THREE from './vendor/three.module.js';
         import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint } from './shared/planetary_base_sandbox.js';
+        import { MeshingWorkerPool } from './shared/meshing_worker_pool.js';
 
         // --- Fast 3D Simplex-Style Noise for Procedural Asteroid Form ---
         class FastNoise3D {
@@ -59,45 +60,10 @@
         const chunkMap = new Map(); // key 'cx,cy,cz' => VoxelChunk
         const activeChunkMeshes = [];
 
-        // Request-ID Keyed Worker Pool
-        const WORKER_COUNT = 3;
-        const workerPool = [];
-        const pendingCallbacks = new Map();
-        let nextRequestId = 1;
-
-        for (let i = 0; i < WORKER_COUNT; i++) {
-            const worker = new Worker(new URL('workers/surface_nets_worker.js', window.location.href).href);
-            worker.activeJobs = 0;
-            worker.onmessage = (e) => {
-                worker.activeJobs = Math.max(0, worker.activeJobs - 1);
-                const cb = pendingCallbacks.get(e.data.requestId);
-                if (cb) {
-                    pendingCallbacks.delete(e.data.requestId);
-                    cb(e.data);
-                }
-            };
-            worker.onerror = (err) => {
-                console.error('[PoC1 Worker Error]', err);
-            };
-            workerPool.push(worker);
-        }
-
-        function dispatchWorkerJob(payload, transferables) {
-            // Pick least loaded worker
-            let chosen = workerPool[0];
-            for (let i = 1; i < workerPool.length; i++) {
-                if (workerPool[i].activeJobs < chosen.activeJobs) {
-                    chosen = workerPool[i];
-                }
-            }
-            const requestId = nextRequestId++;
-            chosen.activeJobs++;
-            payload.requestId = requestId;
-            return new Promise((resolve) => {
-                pendingCallbacks.set(requestId, resolve);
-                chosen.postMessage(payload, transferables);
-            });
-        }
+        // Bounded ESM Worker Pool (2..4 workers, epoch cancellation, crash recovery)
+        const workerPool = new MeshingWorkerPool(new URL('workers/surface_nets_worker.js', window.location.href).href);
+        window.__POC1_WORKER_POOL__ = workerPool;
+        window.__POC1_CHUNKS__ = chunkMap;
 
         // Procedural 3D Triplanar Rock + Ore + Hex Titanium Bulkhead Material
         const chunkMaterial = createTriplanarAsteroidMaterial({ vertexColors: true, radius: currentRadius });
@@ -108,11 +74,13 @@
                 this.cy = cy;
                 this.cz = cz;
                 this.epoch = epoch;
+                this.res = CHUNK_RES;
+                this.cellSize = CELL_SIZE;
                 this.key = `${cx},${cy},${cz}`;
                 this.minBounds = new THREE.Vector3(cx * CHUNK_SIZE, cy * CHUNK_SIZE, cz * CHUNK_SIZE);
                 this.maxBounds = this.minBounds.clone().addScalar(CHUNK_SIZE);
 
-                const pRes = CHUNK_RES + 5;
+                const pRes = this.res + 5;
                 const totalVoxels = pRes * pRes * pRes;
                 this.voxelData = new Float32Array(totalVoxels);
                 this.materialData = new Uint8Array(totalVoxels);
@@ -125,22 +93,22 @@
             }
 
             initVoxels() {
-                const pRes = CHUNK_RES + 5;
+                const pRes = this.res + 5;
                 const minCrustR = currentRadius * 0.85;
                 const maxCrustR = currentRadius * 1.18;
                 const oreFreq = 0.0055 * (2800.0 / currentRadius);
                 let idx = 0;
                 for (let pz = 0; pz < pRes; pz++) {
-                    const wz = this.minBounds.z + (pz - 2) * CELL_SIZE;
+                    const wz = this.minBounds.z + (pz - 2) * this.cellSize;
                     for (let py = 0; py < pRes; py++) {
-                        const wy = this.minBounds.y + (py - 2) * CELL_SIZE;
+                        const wy = this.minBounds.y + (py - 2) * this.cellSize;
                         for (let px = 0; px < pRes; px++) {
-                            const wx = this.minBounds.x + (px - 2) * CELL_SIZE;
+                            const wx = this.minBounds.x + (px - 2) * this.cellSize;
                             const rDist = Math.sqrt(wx * wx + wy * wy + wz * wz);
                             const d = (rDist < minCrustR || rDist > maxCrustR) ? (rDist - currentRadius) : evalDensityPoC1(wx, wy, wz);
                             this.voxelData[idx] = d;
 
-                            if (d < -CELL_SIZE && Math.sin(wx * oreFreq + wy * oreFreq * 0.36) * Math.cos(wz * oreFreq) > 0.78) {
+                            if (d < -this.cellSize && Math.sin(wx * oreFreq + wy * oreFreq * 0.36) * Math.cos(wz * oreFreq) > 0.78) {
                                 this.materialData[idx] = 2; // Ore vein
                             } else {
                                 this.materialData[idx] = 1; // Native rock
@@ -154,27 +122,48 @@
             async rebuildMesh(scene) {
                 if (this.isGenerating) {
                     this.needsRebuild = true;
-                    return;
+                    return null;
+                }
+                if (this.epoch !== worldEpoch) {
+                    this.needsRebuild = false;
+                    return { cancelled: true };
                 }
                 this.isGenerating = true;
                 this.needsRebuild = false;
 
-                const voxelCopy = new Float32Array(this.voxelData);
-                const matCopy = new Uint8Array(this.materialData);
+                let result = null;
+                let failed = false;
+                try {
+                    result = await workerPool.enqueue({
+                        epoch: this.epoch,
+                        buildPayload: () => {
+                            const voxelCopy = new Float32Array(this.voxelData);
+                            const matCopy = new Uint8Array(this.materialData);
+                            return {
+                                payload: {
+                                    chunkId: this.key,
+                                    res: this.res,
+                                    voxelData: voxelCopy,
+                                    materialData: matCopy,
+                                    minBounds: [this.minBounds.x, this.minBounds.y, this.minBounds.z],
+                                    cellSize: this.cellSize
+                                },
+                                transferables: [voxelCopy.buffer, matCopy.buffer]
+                            };
+                        }
+                    });
+                } catch (err) {
+                    failed = true;
+                    console.warn(`[PoC1] Chunk ${this.key} meshing failed:`, err);
+                } finally {
+                    this.isGenerating = false;
+                }
 
-                const result = await dispatchWorkerJob({
-                    chunkId: this.key,
-                    res: CHUNK_RES,
-                    voxelData: voxelCopy,
-                    materialData: matCopy,
-                    minBounds: [this.minBounds.x, this.minBounds.y, this.minBounds.z],
-                    cellSize: CELL_SIZE
-                }, [voxelCopy.buffer, matCopy.buffer]);
-
-                this.isGenerating = false;
-
-                // Discard stale results from previous planetary scale
-                if (this.epoch !== worldEpoch) return;
+                // Discard failed, cancelled, or stale results from previous epochs
+                if (failed || !result || result.cancelled || this.epoch !== worldEpoch) {
+                    this.needsRebuild = false;
+                    return result || { cancelled: true };
+                }
 
                 const { positions, normals, colors, indices } = result;
 
@@ -213,8 +202,9 @@
                 }
 
                 if (this.needsRebuild && this.epoch === worldEpoch) {
-                    this.rebuildMesh(scene);
+                    return await this.rebuildMesh(scene);
                 }
+                return result;
             }
         }
 
@@ -231,6 +221,7 @@
         // Initialize Chunks intersecting asteroid surface shell
         async function initAsteroidChunks(scene) {
             worldEpoch++;
+            workerPool.setEpoch(worldEpoch);
             activeChunkMeshes.forEach(m => {
                 scene.remove(m);
                 m.geometry.dispose();
@@ -261,7 +252,7 @@
                     }
                 }
             }
-            await Promise.all(initialRebuilds);
+            await Promise.allSettled(initialRebuilds);
         }
 
         async function carveSpherePoC1(hitPoint, brushRadius) {
@@ -335,7 +326,7 @@
                 }
             }
             const mainThreadMs = performance.now() - syncStart;
-            await Promise.all(rebuilds);
+            await Promise.allSettled(rebuilds);
             return { mainThreadMs };
         }
 
@@ -393,7 +384,7 @@
                 }
             }
             const mainThreadMs = performance.now() - syncStart;
-            await Promise.all(rebuilds);
+            await Promise.allSettled(rebuilds);
             return { mainThreadMs };
         }
 
