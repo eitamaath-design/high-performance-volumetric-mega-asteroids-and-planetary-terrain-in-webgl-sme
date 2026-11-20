@@ -265,6 +265,7 @@
         }
 
         async function carveSpherePoC1(hitPoint, brushRadius) {
+            const syncStart = performance.now();
             const pRes = CHUNK_RES + 5;
             const pRes2 = pRes * pRes;
             const pad = brushRadius + CELL_SIZE * 2.5;
@@ -333,10 +334,13 @@
                     }
                 }
             }
+            const mainThreadMs = performance.now() - syncStart;
             await Promise.all(rebuilds);
+            return { mainThreadMs };
         }
 
         async function reinforceSpherePoC1(hitPoint, brushRadius) {
+            const syncStart = performance.now();
             const pRes = CHUNK_RES + 5;
             const pRes2 = pRes * pRes;
             const effPad = brushRadius + CELL_SIZE * 3.5;
@@ -388,7 +392,9 @@
                     }
                 }
             }
+            const mainThreadMs = performance.now() - syncStart;
             await Promise.all(rebuilds);
+            return { mainThreadMs };
         }
 
         function applyQualityPoC1(qualityKey) {
@@ -421,11 +427,11 @@
             getCellSize: () => `${CELL_SIZE.toFixed(1)}u (${CHUNK_RES}³)`,
 
             onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
-                await carveSpherePoC1(hitPoint, brushRadius);
+                return await carveSpherePoC1(hitPoint, brushRadius);
             },
 
             onReinforce: async (hitPoint, hitNormal, brushRadius) => {
-                await reinforceSpherePoC1(hitPoint, brushRadius);
+                return await reinforceSpherePoC1(hitPoint, brushRadius);
             },
 
             checkMaterialAtHit: (point, hit) => {

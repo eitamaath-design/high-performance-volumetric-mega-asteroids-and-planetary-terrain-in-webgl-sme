@@ -117,7 +117,7 @@ Subterranean caves support structural reinforcement and tactical defense:
 #### Option 1 (`poc1_chunked_octree_surface_nets.html`): Sparse Chunked Dual-Grid Surface Nets + Exact Triangle BVH Collider + Async Web Workers
 - **Voxel Representation:** Sparse chunk map indexed by spatial hash `cx,cy,cz`. Each chunk represents $12^3\text{--}30^3$ voxels (`CHUNK_RES` per quality tier, default $24^3$ interactive / $18^3$ benchmark) with a 2-voxel overlap halo ($res+5$) ensuring zero inter-chunk seams, identical finite-difference boundary gradients, and zero cracks. `initVoxels()` uses a radial crust early-out to skip 3-octave FBM evaluation outside `[0.85 * R, 1.18 * R]`, and `carveSpherePoC1` / `reinforceSpherePoC1` clamp voxel modification loops to the local brush AABB.
 - **Meshing Algorithm:** True Dual-Grid Surface Nets. Identifies sign changes along edges, generates one relaxed dual vertex per sign-changing cell, and emits watertight quads across sign-changing interior edges.
-- **Threading Model:** Dedicated worker pool (2–4 Web Workers) receives dirty chunk voxel buffers via zero-copy `Transferable` `ArrayBuffer` objects, returning generated position, normal, color, and index buffers without stalling the main UI thread.
+- **Threading Model:** Dedicated worker pool (2–4 Web Workers) receives dirty chunk voxel buffers via zero-copy `Transferable` `ArrayBuffer` objects, returning generated position, normal, color, and index buffers without stalling the main UI thread. `carveSpherePoC1` and `reinforceSpherePoC1` capture synchronous voxel-edit and Web Worker dispatch blocking (`avgMainThreadCarveMs`) separately from full async worker completion latency (`avgCarveLatency`) by returning `{ mainThreadMs }` from `onCarve` and `onReinforce`.
 - **Collision:** Main thread builds a local `THREE.Raycaster` and triangle BVH collider directly from `activeChunkMeshes`. Visual-collision parity is absolute (`0.00u`), and Flight Mode (`[F]`) uses the shared `defaultResolveSphereCollision` multi-direction swept-sphere resolver directly over `activeChunkMeshes` (`0.00u` parity).
 
 #### Option 2 (`poc2_sparse_voxel_octree_mesh_patching.html`): Adaptive QEF Dual Contouring Sparse Voxel Octree (SVO) + Dirty AABB Mesh Patching
@@ -160,9 +160,10 @@ Subterranean caves support structural reinforcement and tactical defense:
 | **Visual-to-Collision Error** | $> 30.00\text{u}$ (Fatal mismatch) | **$0.00\text{u}$ (Identical Mesh BVH)** | **$0.00\text{u}$ (Identical Mesh BVH)** | **$0.00\text{u}$ (Identical Mesh BVH)** | **$0.00\text{u}$ (Shared Trilinear SDF)** |
 | **Base Wall Reinforcement** | Single-material only | Multi-material vertex color & mask | Multi-material QEF sharp corners | Multi-material subterranean chunks | Orthogonal 4-Channel RGBA Volume (R: SDF, G: Ore, B: Armor) |
 | **Scalability (20–30+ Players)** | Unscalable (Bandwidth/CPU blowup) | High (Independent spatial chunks) | High (Sparse tree branches) | **Maximum (Planetary $R=8000\text{u}+$ scale)** | Medium (VRAM texture limits) |
-| **Carve Latency (Execution)** | $1.72\text{ ms}$ (Coarse sync) | **$0.45\text{ ms}$ (Worker async)** | **$0.18\text{ ms}$ (Leaf patch)** | $22.52\text{ ms}$ (Chunk init) | **$1.65\text{ ms}$ (Texture update)** |
-| **Average Frame Rate** | $58.7\text{ FPS}$ | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
-| **JS Heap Memory** | $28.04\text{ MB}$ (Wasteful static heap) | **$10.11\text{ MB}$** | **$9.54\text{ MB}$** | **$9.54\text{ MB}$** | **$11.35\text{ MB}$** |
+| **Carve Latency (Main-Thread / Async)** | $1.57\text{ ms}$ (Coarse sync) | **$0.45\text{ ms}$ sync** / $5.68\text{ ms}$ worker | **$3.07\text{ ms}$ (Leaf patch)** | $5.67\text{ ms}$ (Chunk init/carve) | **$1.25\text{ ms}$ (Sub-box upload)** |
+| **Main-Thread Frame Work (Avg)** | N/A (Legacy harness) | **$0.39\text{ ms}$** ($1.10\text{ ms}$ P99) | **$0.30\text{ ms}$** ($1.60\text{ ms}$ P99) | **$0.26\text{ ms}$** ($3.70\text{ ms}$ P99) | **$0.16\text{ ms}$** ($0.30\text{ ms}$ P99) |
+| **Average Frame Rate** | $58.8\text{ FPS}$ | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
+| **JS Heap Memory** | $28.04\text{ MB}$ (Wasteful static heap) | $26.32\text{ MB}$ | $17.36\text{ MB}$ | **$16.31\text{ MB}$** | $28.04\text{ MB}$ |
 | **License & Dependencies** | MIT / Three.js MarchingCubes | MIT / Pure Three.js r170 | MIT / Pure Three.js r170 | MIT / Pure Three.js r170 | MIT / Pure Three.js r170 |
 
 ### 3.2 Decision Summary & Rockets Implementation Blueprint
@@ -204,34 +205,62 @@ Subterranean caves support structural reinforcement and tactical defense:
 
 ### 5.1 Verification Gates & Invariants
 1. **Visual-Collision Alignment Gate:** Live measured distance between rendered visual mesh surface and physical raycast hit point must equal `0.00u` ($\pm 0.001\text{u}$ tolerance).
-2. **Continuous Carving Latency Gate:** Main thread hitch duration during active laser carving must remain $< 16.6\text{ms}$ to sustain steady 60 FPS.
+2. **Continuous Carving Latency Gate:** Main thread hitch duration during active laser carving (`avgMainThreadCarveMs` and `avgMainThreadWorkMs`) must remain $< 16.6\text{ms}$ to sustain steady 60 FPS. Benchmark telemetry must record synchronous main-thread carve blocking (`avgMainThreadCarveMs`) separately from total async worker completion latency (`avgCarveLatency`).
 3. **Multi-Material Base Reinforcement Gate:** Wall reinforcement must transition voxels to `materialId = 3`, visually rendering cyan metallic bulkheads that reject standard raider laser attacks.
 4. **Static Asset Zero-404 Gate:** All internal scripts, workers, import maps, and vendor assets must return HTTP 200 without network failures.
 5. **Headless Execution Compatibility Gate:** Automated benchmark harnesses must execute cleanly under Playwright headless SwiftShader.
 6. **SDF Visual Continuity & Material Isolation Gate:** GPU SDF rendering must maintain continuous $C^2$ surface normals across voxel boundaries without grid quilting or derivative creases, and orthogonal RGBA material channels must preserve zero material crosstalk during trilinear and tricubic interpolation.
-7. **Interactive `high`-Preset GPU & Upload Performance Gate:** Interactive `high` quality across PoCs 1–4 must sustain $< 16.6\text{ms}$ steady-state and post-carve frame times on hardware GPUs (sub-volume `texSubImage3D` / dirty-row `texSubImage2D` uploads, brush-AABB voxel updates, rAF-throttled hover raycasting), while software renderers enforce the 48-step raymarch cap (`uMaxSteps = 48`) and `dpr = 1` pixel-ratio cap.
+7. **Interactive `high`-Preset GPU & Upload Performance Gate:** Interactive `high` quality across PoCs 1–4 must sustain $< 16.6\text{ms}$ steady-state and post-carve frame times on hardware GPUs (sub-volume `texSubImage3D` / dirty-row `texSubImage2D` uploads, brush-AABB voxel updates, rAF-throttled hover raycasting), while software renderers enforce the 48-step raymarch cap (`uMaxSteps = 48`) and `dpr = 1` pixel-ratio cap. Benchmark telemetry must record all post-warmup frames (`benchmarkFrames >= Math.min(30, Math.floor(benchmarkMaxFrames * 0.1))` through `benchmarkMaxFrames`, exporting `sampledFrames`) into unbounded `benchmarkFrameTimes` and `benchmarkMainThreadWorkMs` arrays (never relying on the 90-frame HUD `frameHistory` ring buffer), and measure `frameWorkMs` (`performance.now()` from top of `animate()` to immediately after `renderer.render(...)`) to capture true CPU+dispatch work below the $16.67\text{ ms}$ VSync ceiling (`avgMainThreadWorkMs`, `p99MainThreadWorkMs`).
 8. **Flight-Mode Swept-Sphere Collision & Chase-Camera Spring-Arm Gate:** Across PoCs 1–4, entering Flight Mode (`[F]`) must spawn safely clear of terrain at `(0, 0.16*R, 1.22*R)` without `NaN` positions or zero-velocity lockups; grazing and direct wall impacts must slide smoothly along the collision tangent plane without stuttery freezing; PoC 3 must allow ships to fly unimpeded through carved `portalHoles` while colliding with solid macro crust and subterranean cavern walls; PoC 4 must bypass `volumeBoxMesh` (`getCollisionMesh() === null`) and slide smoothly along the exact `cpuSampleSDFDistance` isosurface; Spacebar nose-mounted lasers must raycast along ship forward via `performRaycastFromOrigin`; and the chase-camera spring-arm must pull forward inside tunnels whenever obstructed between `shipGroup.position` and the trailing offset `(0, 16, 50)`.
 
 ### 5.2 Automated & In-Showcase Benchmark Harnesses
-- **CLI Headless Benchmark Suite:** Runs all five comparative environments (`rockets_baseline`, `poc1`, `poc2`, `poc3`, `poc4`) under headless Playwright, performing continuous automated carve cycles, sampling frame times, triangles, and heap memory:
+- **CLI Headless Benchmark Suite:** Runs all five comparative environments (`rockets_baseline`, `poc1`, `poc2`, `poc3`, `poc4`) under headless Playwright, performing continuous automated carve cycles, sampling all post-warmup frame intervals and main-thread work times, triangles, and heap memory, writing all 5 per-target JSON files plus `benchmarks/summary_results.json`:
   ```bash
   node benchmarks/run_all_benchmarks.cjs
   ```
-- **In-Showcase Parameterized Benchmark Suite (`pocs/index.html`):** Users can configure **Scale** (`10p`, `30p`, `50p`), **Resolution/Quality** (`low`, `medium`, `high`, `ultra`), and **Laser Brush Radius** (`40u–360u`) directly inside the Showcase UI and trigger `runAllModesBenchmark()`, which sequentially loads `poc1`–`poc4` with `?benchmark=true&scale=...&quality=...&radius=...&frames=150`, aggregates `BENCHMARK_COMPLETE` postMessage telemetry, and updates the live Comparison Matrix and summary cards.
+  Passing `--matrix` (with optional `--frames=<N>` and `--quality=<tier>`) sweeps `10p`, `30p`, and `50p` planetary scales across `poc1`–`poc4` without overwriting individual per-target JSONs and outputs `benchmarks/matrix_results.json`:
+  ```bash
+  node benchmarks/run_all_benchmarks.cjs --matrix
+  ```
+- **In-Showcase Parameterized Benchmark Suite (`pocs/index.html`):** On initialization (outside `file://`), `pocs/index.html` fetches `benchmarks/summary_results.json` (via relative path from `pocs/`, with graceful fallback to embedded defaults if unavailable) to synchronize the Comparison Matrix and active telemetry header. Users can also configure **Scale** (`10p`, `30p`, `50p`), **Resolution/Quality** (`low`, `medium`, `high`, `ultra`), and **Laser Brush Radius** (`40u–360u`) directly inside the Showcase UI and trigger `runAllModesBenchmark()`, which sequentially loads `poc1`–`poc4` with `?benchmark=true&scale=...&quality=...&radius=...&frames=150`, aggregates `BENCHMARK_COMPLETE` postMessage telemetry, and displays `avgMainThreadWorkMs` / `avgMainThreadCarveMs` alongside FPS and async latency in the live Comparison Matrix and Showcase benchmark runner table.
 
 ### 5.3 Benchmark Telemetry Inventory
+
+#### Single-Scale 5-Target Baseline Comparison (`benchmarks/summary_results.json`, 450 frames @ `10p` / `medium`)
 
 | Metric | Rockets Baseline (Monolithic 64³) | Option 1: Chunked Surface Nets (PoC 1) | Option 2: Adaptive QEF SVO (PoC 2) | Option 3: Clipmap Shell & Portals (PoC 3) | Option 4: 3D GPU SDF Raymarching (PoC 4) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Status** | Verified Legacy | Verified / Next-Gen | Verified / Next-Gen | Verified / Next-Gen | Verified / Next-Gen |
-| **Average FPS** | $59.0\text{ FPS}$ | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
-| **Average Frame Time** | $16.96\text{ ms}$ | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** |
+| **Average FPS** | $58.8\text{ FPS}$ | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
+| **Average Frame Time** | $17.00\text{ ms}$ | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** |
 | **P99 Frame Time** | $16.80\text{ ms}$ | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** |
-| **Carve Latency** | $1.67\text{ ms}$ | **$2.52\text{ ms}$** | **$1.85\text{ ms}$** | $4.90\text{ ms}$ | **$0.07\text{ ms}$** |
+| **Main-Thread Frame Work (Avg)** (`avgMainThreadWorkMs`) | N/A (Legacy) | **$0.39\text{ ms}$** | **$0.30\text{ ms}$** | **$0.26\text{ ms}$** | **$0.16\text{ ms}$** |
+| **Main-Thread Frame Work (P99)** (`p99MainThreadWorkMs`) | N/A (Legacy) | **$1.10\text{ ms}$** | **$1.60\text{ ms}$** | **$3.70\text{ ms}$** | **$0.30\text{ ms}$** |
+| **Main-Thread Carve Blocking** (`avgMainThreadCarveMs`) | $1.57\text{ ms}$ | **$0.45\text{ ms}$** (Sync dispatch) | $3.07\text{ ms}$ | $5.67\text{ ms}$ | $1.25\text{ ms}$ |
+| **Carve Latency** (`avgCarveLatency`) | $1.57\text{ ms}$ | $5.68\text{ ms}$ (Async worker) | $3.07\text{ ms}$ | $5.67\text{ ms}$ | **$1.25\text{ ms}$** |
+| **Sampled Post-Warmup Frames** (`sampledFrames`) | 450 | 421 | 421 | 421 | 421 |
 | **Visual-Collision Error** | $> 30.00\text{u}$ | **$0.00\text{u}$** | **$0.00\text{u}$** | **$0.00\text{u}$** | **$0.00\text{u}$** |
-| **Active Triangles** | 6,936 | 69,476 | 36,680 | 33,344 | 1,244 (Proxy) |
-| **Draw Calls** | 1 | 139 | 95 | 29 | 15 |
-| **JS Heap Memory** | $28.04\text{ MB}$ | $26.32\text{ MB}$ | **$17.36\text{ MB}$** | **$16.31\text{ MB}$** | $28.04\text{ MB}$ |
+| **Active Triangles** | 6,936 | 69,480 | 36,716 | 33,204 | 1,244 (Proxy) |
+| **Draw Calls** | 1 | 139 | 95 | 28 | 15 |
+| **JS Heap Memory** | $28.04\text{ MB}$ | $26.32\text{ MB}$ | $17.36\text{ MB}$ | **$16.31\text{ MB}$** | $28.04\text{ MB}$ |
+
+#### Multi-Scale Benchmark Matrix (`benchmarks/matrix_results.json`, 450 frames / `421` sampled per cell, `medium` preset)
+*(Legacy monolithic 64³/48³ baseline is fixed at $R=2800\text{u}$ (`10p`) and unscalable to `30p`/`50p`.)*
+
+| Scale | PoC | Cell / Res | Avg FPS | Main-Thread Work (Avg / P99) | Carve (Sync / Async) | Triangles / Draws | Heap RAM |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **10P (2800u)** | PoC 1 | `70.0u (18³)` | $60.0$ | $0.36\text{ ms}$ / $0.90\text{ ms}$ | **$0.38\text{ ms}$** / $5.83\text{ ms}$ | 69,524 / 139 | $24.80\text{ MB}$ |
+| **10P (2800u)** | PoC 2 | `96.0u (14³)` | $60.0$ | $0.30\text{ ms}$ / $2.00\text{ ms}$ | $3.25\text{ ms}$ / $3.25\text{ ms}$ | 36,700 / 95 | $19.55\text{ MB}$ |
+| **10P (2800u)** | PoC 3 | `28.0u (120seg / 16³)` | $60.0$ | $0.26\text{ ms}$ / $3.20\text{ ms}$ | $5.62\text{ ms}$ / $5.62\text{ ms}$ | 33,392 / 27 | **$15.35\text{ MB}$** |
+| **10P (2800u)** | PoC 4 | `77.0u (96³)` | $60.0$ | **$0.17\text{ ms}$** / **$0.40\text{ ms}$** | $1.35\text{ ms}$ / $1.35\text{ ms}$ | 1,244 / 15 | $28.04\text{ MB}$ |
+| **30P (4800u)** | PoC 1 | `120.0u (18³)` | $60.0$ | $0.34\text{ ms}$ / $1.10\text{ ms}$ | **$0.27\text{ ms}$** / $2.73\text{ ms}$ | 69,276 / 138 | $24.80\text{ MB}$ |
+| **30P (4800u)** | PoC 2 | `164.6u (14³)` | $60.0$ | $0.30\text{ ms}$ / $0.90\text{ ms}$ | $3.03\text{ ms}$ / $3.03\text{ ms}$ | 36,512 / 94 | $18.41\text{ MB}$ |
+| **30P (4800u)** | PoC 3 | `48.0u (120seg / 16³)` | $60.0$ | $0.24\text{ ms}$ / $2.80\text{ ms}$ | $4.50\text{ ms}$ / $4.50\text{ ms}$ | 32,312 / 27 | **$16.31\text{ MB}$** |
+| **30P (4800u)** | PoC 4 | `132.0u (96³)` | $60.0$ | **$0.16\text{ ms}$** / **$0.30\text{ ms}$** | $1.33\text{ ms}$ / $1.33\text{ ms}$ | 1,100 / 14 | $28.04\text{ MB}$ |
+| **50P (8000u)** | PoC 1 | `200.0u (18³)` | $60.0$ | $0.34\text{ ms}$ / $1.10\text{ ms}$ | **$0.32\text{ ms}$** / $2.95\text{ ms}$ | 69,264 / 138 | $24.80\text{ MB}$ |
+| **50P (8000u)** | PoC 2 | `274.3u (14³)` | $60.0$ | $0.29\text{ ms}$ / $0.80\text{ ms}$ | $2.73\text{ ms}$ / $2.73\text{ ms}$ | 36,508 / 94 | $18.41\text{ MB}$ |
+| **50P (8000u)** | PoC 3 | `80.0u (120seg / 16³)` | $60.0$ | $0.23\text{ ms}$ / $2.20\text{ ms}$ | $4.83\text{ ms}$ / $4.83\text{ ms}$ | 32,136 / 24 | **$16.31\text{ MB}$** |
+| **50P (8000u)** | PoC 4 | `220.0u (96³)` | $60.0$ | **$0.16\text{ ms}$** / **$0.30\text{ ms}$** | $1.30\text{ ms}$ / $1.30\text{ ms}$ | 1,100 / 14 | $28.04\text{ MB}$ |
 
 ---
 
@@ -250,8 +279,11 @@ Subterranean caves support structural reinforcement and tactical defense:
 ### 6.2 Local Execution & Verification
 To serve and interact with the comparative testbed gallery locally:
 ```bash
-# Launch test server and run automated benchmark suite
+# Launch test server and run automated benchmark suite (updates 5 target JSONs + summary_results.json)
 node benchmarks/run_all_benchmarks.cjs
+
+# Run multi-scale benchmark matrix sweep (10p, 30p, 50p across PoCs 1-4 -> matrix_results.json)
+node benchmarks/run_all_benchmarks.cjs --matrix
 ```
 To run the automated knowledge base housekeeping and file inventory audit:
 ```bash
@@ -282,8 +314,8 @@ python C:\Users\eitama\.gemini\config\skills\knowledge-base\scripts\kb_housekeep
 | `package.json` | Project metadata, scripts, and development dependencies |
 | `package-lock.json` | Locked dependency manifest for Playwright-core and Three.js |
 | `.gitignore` | Git exclusion rules for node_modules, cache, and OS artifacts |
-| `pocs/index.html` | Comprehensive interactive SME Gallery, architecture switcher, and live telemetry hub |
-| `pocs/shared/planetary_base_sandbox.js` | Shared interactive 3D engine: Flight mode, 5 tools, 0.00u telemetry, postMessage bridge |
+| `pocs/index.html` | Comprehensive interactive SME Gallery, architecture switcher, `summary_results.json` matrix sync, and live benchmark runner table |
+| `pocs/shared/planetary_base_sandbox.js` | Shared interactive 3D engine: Flight mode, 5 tools, 0.00u telemetry, unbounded post-warmup frame/work/carve benchmark recorder, postMessage bridge |
 | `pocs/poc1_chunked_octree_surface_nets.html` | Option 1: Chunked Octree Surface Nets + Triangle BVH + Async Web Workers |
 | `pocs/poc2_sparse_voxel_octree_mesh_patching.html` | Option 2: Adaptive QEF Dual Contouring SVO + Dirty AABB Mesh Patching |
 | `pocs/poc3_hierarchical_lod_clipmaps.html` | Option 3: Hybrid Planetary Clipmap Crust + Entrance Portals + Cavern Manifolds |
@@ -293,7 +325,7 @@ python C:\Users\eitama\.gemini\config\skills\knowledge-base\scripts\kb_housekeep
 | `pocs/vendor/OrbitControls.js` | Vendored Three.js r170 OrbitControls ESM module |
 | `pocs/vendor/MarchingCubes.js` | Vendored Three.js r170 MarchingCubes module for Rockets baseline |
 | `benchmarks/rockets_baseline.html` | Baseline benchmark measuring legacy Rockets monolithic 64³ MarchingCubes |
-| `benchmarks/run_all_benchmarks.cjs` | Automated Playwright benchmark orchestrator executing all 5 implementations |
+| `benchmarks/run_all_benchmarks.cjs` | Automated Playwright benchmark orchestrator executing all 5 targets (`summary_results.json`) and `--matrix` multi-scale sweeps (`matrix_results.json`) |
 | `benchmarks/run_benchmarks.cjs` | Standalone benchmark runner script |
 | `benchmarks/run_benchmarks.js` | CommonJS/ESM benchmark test server and browser runner |
 | `benchmarks/baseline_results.json` | Telemetry results for legacy Rockets monolithic 64³ baseline |
@@ -301,6 +333,8 @@ python C:\Users\eitama\.gemini\config\skills\knowledge-base\scripts\kb_housekeep
 | `benchmarks/poc2_svo_results.json` | Telemetry results for Option 2 Sparse Voxel Octree Dual Contouring |
 | `benchmarks/poc3_clipmaps_results.json` | Telemetry results for Option 3 Hierarchical Clipmap Shell & Portals |
 | `benchmarks/poc4_sdf_raymarching_results.json` | Telemetry results for Option 4 3D GPU SDF Raymarching |
+| `benchmarks/summary_results.json` | Aggregated 5-target normalized benchmark summary (`sampledFrames: 421` for PoCs 1–4, 450 for baseline) loaded by `pocs/index.html` |
+| `benchmarks/matrix_results.json` | Multi-scale (`10p`, `30p`, `50p`) 450-frame benchmark matrix sweep (`421` sampled frames per cell) across PoCs 1–4 |
 | `reports/alt_1_chunked-octree-surface-nets-with-async-web-workers.md` | Deep dive technical report on Option 1 Chunked Surface Nets |
 | `reports/alt_2_sparse-voxel-octree-with-dirty-aabb-mesh-patching.md` | Deep dive technical report on Option 2 SVO Dual Contouring |
 | `reports/alt_3_hierarchical-lod-clipmaps-for-volumetric-asteroids.md` | Deep dive technical report on Option 3 Clipmap Macro Shells |

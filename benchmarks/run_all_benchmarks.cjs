@@ -42,7 +42,7 @@ const server = http.createServer((req, res) => {
     });
 });
 
-async function runBenchmark(browser, pocName, urlPath) {
+async function runBenchmark(browser, pocName, urlPath, writeFile = true) {
     console.log(`\n=== Running Benchmark: ${pocName} ===`);
     const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
     const page = await context.newPage();
@@ -64,23 +64,98 @@ async function runBenchmark(browser, pocName, urlPath) {
     await page.goto(`http://localhost:${PORT}/${urlPath}`, { waitUntil: 'networkidle' });
 
     console.log(`Waiting for window.__BENCHMARK_RESULTS__ for ${pocName}...`);
-    await page.waitForFunction(() => window.__BENCHMARK_RESULTS__, { timeout: 60000 });
+    await page.waitForFunction(() => window.__BENCHMARK_RESULTS__, { timeout: 90000 });
     const data = await page.evaluate(() => window.__BENCHMARK_RESULTS__);
 
     if (pageError) {
         throw new Error(`Page error encountered during benchmark of ${pocName}: ${pageError.message}`);
     }
 
-    const outPath = path.join(ROOT_DIR, 'benchmarks', `${pocName}_results.json`);
-    fs.writeFileSync(outPath, JSON.stringify(data, null, 2));
-    console.log(`[OK] Results written to ${outPath}`);
+    if (writeFile) {
+        const outPath = path.join(ROOT_DIR, 'benchmarks', `${pocName}_results.json`);
+        fs.writeFileSync(outPath, JSON.stringify(data, null, 2));
+        console.log(`[OK] Results written to ${outPath}`);
+    }
     console.log(JSON.stringify(data, null, 2));
 
     await context.close();
     return data;
 }
 
+function normalizeResult(key, raw) {
+    if (key === 'baseline' || raw.poc === 'rockets_baseline') {
+        const carveMs = raw.avgCarveDurationMs ?? raw.avgCarveLatency ?? 0;
+        return {
+            poc: 'baseline',
+            scale: raw.scale || '10p',
+            quality: raw.quality || 'legacy-48^3',
+            brushRadius: raw.brushRadius ?? 140,
+            cellSize: raw.cellSize || '~109.4u (48³)',
+            avgFps: raw.avgFps ?? 0,
+            avgFrameTime: raw.avgFrameTimeMs ?? raw.avgFrameTime ?? 0,
+            p99FrameTime: raw.p99FrameTimeMs ?? raw.p99FrameTime ?? 0,
+            avgMainThreadWorkMs: raw.avgMainThreadWorkMs ?? null,
+            p99MainThreadWorkMs: raw.p99MainThreadWorkMs ?? null,
+            avgCarveLatency: carveMs,
+            avgMainThreadCarveMs: raw.avgMainThreadCarveMs ?? carveMs,
+            sampledFrames: raw.totalFrames ?? raw.sampledFrames ?? 450,
+            triangles: raw.trianglesCount ?? raw.triangles ?? 0,
+            drawCalls: raw.drawCalls ?? 0,
+            heapMemoryMB: raw.heapMemoryMb ?? raw.heapMemoryMB ?? 0,
+            visualCollisionError: raw.visualCollisionError || '> 30.00u'
+        };
+    }
+
+    return {
+        poc: raw.poc || key,
+        scale: raw.scale || '10p',
+        quality: raw.quality || 'medium',
+        brushRadius: raw.brushRadius ?? 140,
+        cellSize: raw.cellSize || '--',
+        avgFps: raw.avgFps ?? 0,
+        avgFrameTime: raw.avgFrameTime ?? 0,
+        p99FrameTime: raw.p99FrameTime ?? 0,
+        avgMainThreadWorkMs: raw.avgMainThreadWorkMs ?? null,
+        p99MainThreadWorkMs: raw.p99MainThreadWorkMs ?? null,
+        avgCarveLatency: raw.avgCarveLatency ?? 0,
+        avgMainThreadCarveMs: raw.avgMainThreadCarveMs ?? raw.avgCarveLatency ?? 0,
+        sampledFrames: raw.sampledFrames ?? 0,
+        triangles: raw.triangles ?? 0,
+        drawCalls: raw.drawCalls ?? 0,
+        heapMemoryMB: raw.heapMemoryMB ?? 0,
+        visualCollisionError: raw.visualCollisionError || '0.00u'
+    };
+}
+
+function parseCliArgs(argv) {
+    const args = argv.slice(2);
+    const matrixMode = args.includes('--matrix');
+    const framesArg = args.find(a => a.startsWith('--frames='));
+    let frames = 450;
+    let hasFramesFlag = false;
+    if (framesArg) {
+        const parsed = parseInt(framesArg.split('=')[1], 10);
+        if (Number.isFinite(parsed) && parsed >= 30) {
+            frames = parsed;
+            hasFramesFlag = true;
+        }
+    }
+    const qualityArg = args.find(a => a.startsWith('--quality='));
+    const quality = qualityArg ? qualityArg.split('=')[1] : null;
+    return { matrixMode, frames, hasFramesFlag, quality };
+}
+
+function buildQueryParams({ scale = null, frames = 450, hasFramesFlag = false, quality = null }) {
+    const qs = ['benchmark=true'];
+    if (scale) qs.push(`scale=${encodeURIComponent(scale)}`);
+    if (hasFramesFlag) qs.push(`frames=${frames}`);
+    if (quality) qs.push(`quality=${encodeURIComponent(quality)}`);
+    return qs.join('&');
+}
+
 async function main() {
+    const cli = parseCliArgs(process.argv);
+
     server.listen(PORT, async () => {
         console.log(`Benchmark HTTP server running on http://localhost:${PORT}`);
         let browser;
@@ -98,22 +173,92 @@ async function main() {
                 ]
             });
 
-            // 1. Rockets Baseline
-            await runBenchmark(browser, 'baseline', 'benchmarks/rockets_baseline.html?benchmark=true');
+            const environment = {
+                renderer: 'Playwright Chromium Headless SwiftShader',
+                node: process.version,
+                platform: process.platform
+            };
 
-            // 2. PoC 1: Chunked Surface Nets
-            await runBenchmark(browser, 'poc1_surface_nets', 'pocs/poc1_chunked_octree_surface_nets.html?benchmark=true');
+            if (cli.matrixMode) {
+                const scales = ['10p', '30p', '50p'];
+                const pocTargets = [
+                    { key: 'poc1', path: 'pocs/poc1_chunked_octree_surface_nets.html' },
+                    { key: 'poc2', path: 'pocs/poc2_sparse_voxel_octree_mesh_patching.html' },
+                    { key: 'poc3', path: 'pocs/poc3_hierarchical_lod_clipmaps.html' },
+                    { key: 'poc4', path: 'pocs/poc4_gpu_sdf_raymarching_hybrid.html' }
+                ];
+                const matrix = {};
+                const results = [];
 
-            // 3. PoC 2: SVO Dual Contouring
-            await runBenchmark(browser, 'poc2_svo', 'pocs/poc2_sparse_voxel_octree_mesh_patching.html?benchmark=true');
+                for (const scale of scales) {
+                    matrix[scale] = {};
+                    for (const target of pocTargets) {
+                        const qs = buildQueryParams({
+                            scale,
+                            frames: cli.frames,
+                            hasFramesFlag: cli.hasFramesFlag,
+                            quality: cli.quality
+                        });
+                        const raw = await runBenchmark(
+                            browser,
+                            `${target.key}_${scale}`,
+                            `${target.path}?${qs}`,
+                            false
+                        );
+                        const normalized = normalizeResult(target.key, raw);
+                        matrix[scale][target.key] = normalized;
+                        results.push(normalized);
+                    }
+                }
 
-            // 4. PoC 3: Clipmap Shell & Cavern Portals
-            await runBenchmark(browser, 'poc3_clipmaps', 'pocs/poc3_hierarchical_lod_clipmaps.html?benchmark=true');
+                const matrixOut = {
+                    generatedAt: new Date().toISOString(),
+                    environment,
+                    scales,
+                    frames: cli.frames,
+                    quality: cli.quality || 'default',
+                    baselineNote: 'Legacy monolithic 64³/48³ baseline is fixed at R=2800u (10p) and unscalable to 30p/50p',
+                    matrix,
+                    results
+                };
+                const matrixPath = path.join(ROOT_DIR, 'benchmarks', 'matrix_results.json');
+                fs.writeFileSync(matrixPath, JSON.stringify(matrixOut, null, 2));
+                console.log(`\n[SUCCESS] Matrix benchmark complete! Results written to ${matrixPath}`);
+            } else {
+                const pocQs = buildQueryParams({
+                    frames: cli.frames,
+                    hasFramesFlag: cli.hasFramesFlag,
+                    quality: cli.quality
+                });
+                const standardTargets = [
+                    { key: 'baseline', fileName: 'baseline', path: 'benchmarks/rockets_baseline.html?benchmark=true' },
+                    { key: 'poc1', fileName: 'poc1_surface_nets', path: `pocs/poc1_chunked_octree_surface_nets.html?${pocQs}` },
+                    { key: 'poc2', fileName: 'poc2_svo', path: `pocs/poc2_sparse_voxel_octree_mesh_patching.html?${pocQs}` },
+                    { key: 'poc3', fileName: 'poc3_clipmaps', path: `pocs/poc3_hierarchical_lod_clipmaps.html?${pocQs}` },
+                    { key: 'poc4', fileName: 'poc4_sdf_raymarching', path: `pocs/poc4_gpu_sdf_raymarching_hybrid.html?${pocQs}` }
+                ];
 
-            // 5. PoC 4: 3D GPU SDF Raymarcher
-            await runBenchmark(browser, 'poc4_sdf_raymarching', 'pocs/poc4_gpu_sdf_raymarching_hybrid.html?benchmark=true');
+                const targets = {};
+                const results = [];
+                for (const target of standardTargets) {
+                    const raw = await runBenchmark(browser, target.fileName, target.path, true);
+                    const normalized = normalizeResult(target.key, raw);
+                    targets[target.key] = normalized;
+                    results.push(normalized);
+                }
 
-            console.log('\n[SUCCESS] All 5 benchmarks executed cleanly with zero errors!');
+                const summaryOut = {
+                    generatedAt: new Date().toISOString(),
+                    environment,
+                    frames: cli.frames,
+                    targets,
+                    results
+                };
+                const summaryPath = path.join(ROOT_DIR, 'benchmarks', 'summary_results.json');
+                fs.writeFileSync(summaryPath, JSON.stringify(summaryOut, null, 2));
+                console.log(`\n[SUCCESS] All 5 benchmarks executed cleanly and summary written to ${summaryPath}!`);
+            }
+
             await browser.close();
             server.close(() => process.exit(0));
         } catch (err) {

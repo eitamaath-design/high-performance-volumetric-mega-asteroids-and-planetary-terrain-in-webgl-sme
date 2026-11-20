@@ -412,12 +412,20 @@ export class PlanetaryBaseSandbox {
         this.avgFps = 60;
         this.frameTime = 16.6;
         this.p99FrameTime = 16.6;
-        this.frameHistory = [];
+        this.frameHistory = []; // Rolling 90-frame HUD FPS smoothing
+        this.benchmarkFrameTimes = [];
+        this.benchmarkMainThreadWorkMs = [];
+        this.carveLatencies = [];
+        this.mainThreadCarveLatencies = [];
         this.drawCalls = 0;
         this.triangles = 0;
         this.lastCarveLatency = 0.0;
+        this.lastMainThreadCarveMs = 0.0;
         this.visualCollisionError = 0.0;
         this.frameCount = 0;
+        this._pendingBenchmarkCarves = 0;
+        this._benchmarkExtraWaitFrames = 0;
+        this.benchmarkWarmupFrames = Math.min(30, Math.floor((this.customBenchmarkFrames || 450) * 0.1));
 
         // Machinery & Exterior nodes collection
         this.placedMachinery = [];
@@ -1365,9 +1373,11 @@ export class PlanetaryBaseSandbox {
         };
     }
 
-    async executeActiveTool(forcedHit = null) {
+    async executeActiveTool(forcedHit = null, options = {}) {
         if (this._isExecutingTool) return;
+        const recordBenchmark = Boolean(options && options.recordBenchmark);
         this._isExecutingTool = true;
+        if (recordBenchmark) this._pendingBenchmarkCarves++;
         try {
             const hit = forcedHit || this.performRaycast();
             if (!hit) {
@@ -1418,28 +1428,42 @@ export class PlanetaryBaseSandbox {
             }
 
             const t0 = performance.now();
+            let toolResult = null;
 
             if (this.activeTool === 'carve' || (this.activeTool === 'raider' && !isReinforced)) {
                 if (this.config.onCarve) {
-                    await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'carve');
+                    toolResult = await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'carve');
                 }
             } else if (this.activeTool === 'reinforce') {
                 if (this.config.onReinforce) {
-                    await this.config.onReinforce(hitPoint, hitNormal, this.brushRadius);
+                    toolResult = await this.config.onReinforce(hitPoint, hitNormal, this.brushRadius);
                 }
             } else if (this.activeTool === 'breach') {
                 if (this.config.onBreach) {
-                    await this.config.onBreach(hitPoint, hitNormal, this.brushRadius);
+                    toolResult = await this.config.onBreach(hitPoint, hitNormal, this.brushRadius);
                 } else if (this.config.onCarve) {
-                    await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'breach');
+                    toolResult = await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'breach');
                 }
             } else if (this.activeTool === 'machinery') {
                 this.placeMachineryAt(hitPoint, hitNormal);
             }
 
-            this.lastCarveLatency = performance.now() - t0;
+            const elapsed = performance.now() - t0;
+            const mainThreadMs = (toolResult && typeof toolResult.mainThreadMs === 'number')
+                ? toolResult.mainThreadMs
+                : elapsed;
+            this.lastCarveLatency = elapsed;
+            this.lastMainThreadCarveMs = mainThreadMs;
             this.hud.querySelector('#tel-carve-dur').innerText = `${this.lastCarveLatency.toFixed(2)} ms`;
+
+            if (recordBenchmark && !this.benchmarkDone) {
+                this.carveLatencies.push(elapsed);
+                this.mainThreadCarveLatencies.push(mainThreadMs);
+            }
         } finally {
+            if (recordBenchmark) {
+                this._pendingBenchmarkCarves = Math.max(0, this._pendingBenchmarkCarves - 1);
+            }
             this._isExecutingTool = false;
         }
     }
@@ -1675,7 +1699,7 @@ export class PlanetaryBaseSandbox {
         });
     }
 
-    simulateRandomCarve() {
+    simulateRandomCarve(options = {}) {
         // Raycast slightly jittered near viewport center so carve always hits actual asteroid geometry
         const savedMouse = this.mousePos.clone();
         this.mousePos.set((Math.random() - 0.5) * 0.16, (Math.random() - 0.5) * 0.16);
@@ -1690,7 +1714,7 @@ export class PlanetaryBaseSandbox {
             );
             hit = { point: hitPoint, normal: hitPoint.clone().normalize() };
         }
-        this.executeActiveTool(hit);
+        return this.executeActiveTool(hit, options);
     }
 
     initAutomatedBenchmark(overrideFrames = null) {
@@ -1698,6 +1722,9 @@ export class PlanetaryBaseSandbox {
         this.benchmarkDone = false;
         this.benchmarkFrames = 0;
         this.benchmarkMaxFrames = overrideFrames || this.customBenchmarkFrames || 450;
+        this.benchmarkWarmupFrames = Math.min(30, Math.floor(this.benchmarkMaxFrames * 0.1));
+        this._pendingBenchmarkCarves = 0;
+        this._benchmarkExtraWaitFrames = 0;
         const nTicks = 6;
         this.benchmarkCarveTicks = this.benchmarkMaxFrames >= 400
             ? [60, 120, 180, 240, 300, 360]
@@ -1711,36 +1738,78 @@ export class PlanetaryBaseSandbox {
             avgFps: 0,
             avgFrameTime: 0,
             p99FrameTime: 0,
+            avgMainThreadWorkMs: 0,
+            p99MainThreadWorkMs: 0,
             avgCarveLatency: 0,
+            avgMainThreadCarveMs: 0,
+            sampledFrames: 0,
             triangles: 0,
             drawCalls: 0,
             heapMemoryMB: 0,
             visualCollisionError: '0.00u'
         };
         this.carveLatencies = [];
+        this.mainThreadCarveLatencies = [];
+        this.benchmarkFrameTimes = [];
+        this.benchmarkMainThreadWorkMs = [];
         this.frameHistory = [];
     }
 
-    stepBenchmark() {
-        if (this.benchmarkDone) return;
+    stepBenchmarkTick() {
+        if (this.benchmarkDone || this.benchmarkFrames >= this.benchmarkMaxFrames) return;
         this.benchmarkFrames++;
 
         if (this.benchmarkCarveTicks.includes(this.benchmarkFrames)) {
-            // Automated carve tick
+            // Automated carve tick (dispatched pre-render so main-thread work is captured in frameWorkMs)
             const idx = this.benchmarkCarveTicks.indexOf(this.benchmarkFrames);
             const tool = (idx % 2 === 0) ? 'carve' : 'reinforce';
             this.setActiveTool(tool);
-            this.simulateRandomCarve();
-            this.carveLatencies.push(this.lastCarveLatency);
+            const pendingPromise = this.simulateRandomCarve({ recordBenchmark: true });
+            if (pendingPromise && typeof pendingPromise.catch === 'function') {
+                pendingPromise.catch(err => console.warn('[PlanetaryBaseSandbox] Benchmark carve error:', err));
+            }
+        }
+    }
+
+    stepBenchmark(ft = this.frameTime, frameWorkMs = 0) {
+        if (this.benchmarkDone) return;
+
+        if (this._benchmarkExtraWaitFrames === 0 &&
+            this.benchmarkFrames >= this.benchmarkWarmupFrames &&
+            this.benchmarkFrames <= this.benchmarkMaxFrames) {
+            this.benchmarkFrameTimes.push(ft);
+            this.benchmarkMainThreadWorkMs.push(frameWorkMs);
         }
 
         if (this.benchmarkFrames >= this.benchmarkMaxFrames) {
+            if (this._pendingBenchmarkCarves > 0 && this._benchmarkExtraWaitFrames < 30) {
+                this._benchmarkExtraWaitFrames++;
+                return;
+            }
             this.benchmarkDone = true;
-            const sumFt = this.frameHistory.reduce((a, b) => a + b, 0);
-            const avgFt = sumFt / Math.max(1, this.frameHistory.length);
-            const sortedFt = [...this.frameHistory].sort((a, b) => a - b);
-            const p99Ft = sortedFt[Math.floor(sortedFt.length * 0.99)] || avgFt;
-            const avgCarve = this.carveLatencies.length > 0 ? (this.carveLatencies.reduce((a, b) => a + b, 0) / this.carveLatencies.length) : this.lastCarveLatency;
+
+            const ftSamples = this.benchmarkFrameTimes.length > 0 ? this.benchmarkFrameTimes : this.frameHistory;
+            const sumFt = ftSamples.reduce((a, b) => a + b, 0);
+            const avgFt = sumFt / Math.max(1, ftSamples.length);
+            const sortedFt = [...ftSamples].sort((a, b) => a - b);
+            const p99Ft = sortedFt.length > 0
+                ? sortedFt[Math.min(sortedFt.length - 1, Math.floor(sortedFt.length * 0.99))]
+                : avgFt;
+
+            const workSamples = this.benchmarkMainThreadWorkMs.length > 0 ? this.benchmarkMainThreadWorkMs : [frameWorkMs];
+            const sumWork = workSamples.reduce((a, b) => a + b, 0);
+            const avgWork = sumWork / Math.max(1, workSamples.length);
+            const sortedWork = [...workSamples].sort((a, b) => a - b);
+            const p99Work = sortedWork.length > 0
+                ? sortedWork[Math.min(sortedWork.length - 1, Math.floor(sortedWork.length * 0.99))]
+                : avgWork;
+
+            const avgCarve = this.carveLatencies.length > 0
+                ? (this.carveLatencies.reduce((a, b) => a + b, 0) / this.carveLatencies.length)
+                : this.lastCarveLatency;
+            const avgMainThreadCarve = this.mainThreadCarveLatencies.length > 0
+                ? (this.mainThreadCarveLatencies.reduce((a, b) => a + b, 0) / this.mainThreadCarveLatencies.length)
+                : avgCarve;
 
             let heap = 9.54;
             if (window.performance && window.performance.memory) {
@@ -1753,10 +1822,14 @@ export class PlanetaryBaseSandbox {
                 quality: this.currentQuality,
                 brushRadius: this.brushRadius,
                 cellSize: this.config.getCellSize ? this.config.getCellSize() : '--',
-                avgFps: parseFloat((1000 / avgFt).toFixed(1)),
+                avgFps: parseFloat((1000 / Math.max(0.01, avgFt)).toFixed(1)),
                 avgFrameTime: parseFloat(avgFt.toFixed(2)),
                 p99FrameTime: parseFloat(p99Ft.toFixed(2)),
+                avgMainThreadWorkMs: parseFloat(avgWork.toFixed(2)),
+                p99MainThreadWorkMs: parseFloat(p99Work.toFixed(2)),
                 avgCarveLatency: parseFloat(avgCarve.toFixed(2)),
+                avgMainThreadCarveMs: parseFloat(avgMainThreadCarve.toFixed(2)),
+                sampledFrames: this.benchmarkFrameTimes.length,
                 triangles: this.triangles,
                 drawCalls: this.drawCalls,
                 heapMemoryMB: parseFloat(heap.toFixed(2)),
@@ -1777,12 +1850,14 @@ export class PlanetaryBaseSandbox {
     animate(now) {
         requestAnimationFrame(this.animate);
 
-        const dt = Math.min((now - (this._lastNow || now)) / 1000, 0.1);
+        const frameWorkStart = performance.now();
+        const rawFt = (this._lastNow === undefined) ? 16.67 : Math.max(0.01, now - this._lastNow);
         this._lastNow = now;
+        const dt = Math.min(rawFt / 1000, 0.1);
         this.frameCount++;
 
-        // Measure Frame Times
-        const ft = dt * 1000;
+        // Measure Frame Times (rolling 90-frame ring buffer for HUD; unbounded post-warmup arrays for benchmarks)
+        const ft = rawFt;
         this.frameHistory.push(ft);
         if (this.frameHistory.length > 90) this.frameHistory.shift();
 
@@ -1837,11 +1912,16 @@ export class PlanetaryBaseSandbox {
             this.headlamp.position.copy(this.isFlightMode ? this.shipGroup.position : this.camera.position);
         }
 
+        if (this.isBenchmarkMode && !this.benchmarkDone) {
+            this.stepBenchmarkTick();
+        }
+
         if (this.config.onBeforeRender) {
             this.config.onBeforeRender();
         }
 
         this.renderer.render(this.scene, this.camera);
+        const frameWorkMs = performance.now() - frameWorkStart;
 
         // Extract Render Telemetry
         this.drawCalls = this.renderer.info.render.calls;
@@ -1874,8 +1954,8 @@ export class PlanetaryBaseSandbox {
             }
         }
 
-        if (this.isBenchmarkMode) {
-            this.stepBenchmark();
+        if (this.isBenchmarkMode && !this.benchmarkDone) {
+            this.stepBenchmark(ft, frameWorkMs);
         }
     }
 }

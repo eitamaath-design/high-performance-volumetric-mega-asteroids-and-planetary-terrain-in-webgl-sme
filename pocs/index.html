@@ -318,11 +318,11 @@
               </tr>
             </thead>
             <tbody>
-              <tr>
+              <tr id="row-baseline">
                 <td style="padding:8px; border:1px solid #1e293b; color:#f87171; font-weight:bold;">Legacy Baseline (64³ Grid)</td>
-                <td style="padding:8px; border:1px solid #1e293b;">~109.4u (Coarse Snapping)</td>
+                <td id="cell-baseline-ext" style="padding:8px; border:1px solid #1e293b;">~109.4u (Coarse Snapping)</td>
                 <td style="padding:8px; border:1px solid #1e293b; color:#ef4444;">> 30.00u Mismatch</td>
-                <td style="padding:8px; border:1px solid #1e293b; color:#ef4444;">32.4 ms (Hitch)</td>
+                <td id="cell-baseline-carve" style="padding:8px; border:1px solid #1e293b; color:#ef4444;">32.4 ms (Hitch)</td>
                 <td style="padding:8px; border:1px solid #1e293b;">Unsupported (Single Mat)</td>
                 <td style="padding:8px; border:1px solid #1e293b;">Unscalable (Megabyte payloads)</td>
               </tr>
@@ -420,6 +420,7 @@
     };
 
     let activePoC = 'poc1';
+    let hasLiveTelemetry = false;
     const currentParams = { scale: '10p', quality: 'high', radius: 140 };
     let lastParamChangeTime = 0;
     let isRunningBenchmark = false;
@@ -522,12 +523,7 @@
       document.getElementById('btn-fullscreen').href = url;
       document.getElementById('main-iframe').src = url;
 
-      document.getElementById('hdr-fps').innerText = conf.fps;
-      document.getElementById('hdr-ft').innerText = conf.ft;
-      document.getElementById('hdr-tris').innerText = conf.tris;
-      document.getElementById('hdr-carve').innerText = conf.carve;
-      document.getElementById('hdr-err').innerText = conf.err;
-      document.getElementById('hdr-heap').innerText = conf.heap;
+      applyEntryToHeader(conf);
     }
 
     function runSingleModeBenchmark(id) {
@@ -549,7 +545,11 @@
               avgFps: 0,
               avgFrameTime: 0,
               p99FrameTime: 0,
+              avgMainThreadWorkMs: 0,
+              p99MainThreadWorkMs: 0,
               avgCarveLatency: 0,
+              avgMainThreadCarveMs: 0,
+              sampledFrames: 0,
               triangles: 0,
               drawCalls: 0,
               heapMemoryMB: 0,
@@ -571,17 +571,97 @@
       });
     }
 
+    function formatCarveMatrixText(res) {
+      const avgCarve = Number(res.avgCarveLatency ?? 0);
+      const hasSeparateSync = typeof res.avgMainThreadCarveMs === 'number' &&
+        Math.abs(res.avgMainThreadCarveMs - avgCarve) > 0.05;
+      const carveStr = hasSeparateSync
+        ? `${Number(res.avgMainThreadCarveMs).toFixed(2)} ms sync / ${avgCarve.toFixed(2)} ms async`
+        : `${avgCarve.toFixed(2)} ms`;
+      const workStr = (typeof res.avgMainThreadWorkMs === 'number')
+        ? ` • ${Number(res.avgMainThreadWorkMs).toFixed(2)} ms CPU`
+        : '';
+      const heapStr = (typeof res.heapMemoryMB === 'number')
+        ? ` • ${Number(res.heapMemoryMB).toFixed(1)} MB`
+        : '';
+      const triStr = (typeof res.triangles === 'number')
+        ? ` • ${Number(res.triangles).toLocaleString()} tris`
+        : '';
+      return `${carveStr} (${Number(res.avgFps ?? 0).toFixed(1)} FPS${workStr}${heapStr}${triStr})`;
+    }
+
+    function applyEntryToHeader(conf) {
+      if (!conf) return;
+      document.getElementById('hdr-fps').innerText = conf.fps;
+      document.getElementById('hdr-ft').innerText = conf.ft;
+      document.getElementById('hdr-tris').innerText = conf.tris;
+      document.getElementById('hdr-carve').innerText = conf.carve;
+      document.getElementById('hdr-err').innerText = conf.err;
+      document.getElementById('hdr-heap').innerText = conf.heap;
+    }
+
+    async function loadSummaryBenchmarks() {
+      if (window.location.protocol === 'file:') return;
+      try {
+        const res = await fetch('../benchmarks/summary_results.json', { cache: 'no-cache' });
+        if (!res.ok) return;
+        const summary = await res.json();
+        const targets = summary && summary.targets ? summary.targets : null;
+        if (!targets) return;
+
+        for (const [id, entry] of Object.entries(targets)) {
+          if (!entry || !pocConfigs[id]) continue;
+          const conf = pocConfigs[id];
+          if (typeof entry.avgFps === 'number') conf.fps = entry.avgFps.toFixed(1);
+          if (typeof entry.avgFrameTime === 'number') conf.ft = `${entry.avgFrameTime.toFixed(2)}ms`;
+          if (typeof entry.triangles === 'number') conf.tris = entry.triangles.toLocaleString();
+          if (typeof entry.avgCarveLatency === 'number') {
+            const hasSeparateSync = typeof entry.avgMainThreadCarveMs === 'number' &&
+              Math.abs(entry.avgMainThreadCarveMs - entry.avgCarveLatency) > 0.05;
+            conf.carve = hasSeparateSync
+              ? `${entry.avgMainThreadCarveMs.toFixed(2)}ms sync / ${entry.avgCarveLatency.toFixed(2)}ms`
+              : `${entry.avgCarveLatency.toFixed(2)}ms`;
+          }
+          if (entry.visualCollisionError) conf.err = entry.visualCollisionError;
+          if (typeof entry.heapMemoryMB === 'number') conf.heap = `${entry.heapMemoryMB.toFixed(2)} MB`;
+
+          const extEl = document.getElementById(`cell-${id}-ext`);
+          const carveEl = document.getElementById(`cell-${id}-carve`);
+          if (extEl && entry.cellSize) extEl.innerText = entry.cellSize;
+          if (carveEl) carveEl.innerText = formatCarveMatrixText(entry);
+        }
+
+        if (!hasLiveTelemetry && !isRunningBenchmark && pocConfigs[activePoC]) {
+          applyEntryToHeader(pocConfigs[activePoC]);
+        }
+      } catch (_err) {
+        // Fallback silently to embedded pocConfigs defaults
+      }
+    }
+
     function appendBenchmarkResultRow(res) {
       const tbody = document.getElementById('live-benchmark-tbody');
       const conf = pocConfigs[res.poc];
       const color = benchmarkModeColors[res.poc] || '#e2e8f0';
+      const hasSeparateSync = typeof res.avgMainThreadCarveMs === 'number' &&
+        Math.abs(res.avgMainThreadCarveMs - res.avgCarveLatency) > 0.05;
+      const carvePrimary = hasSeparateSync
+        ? `${res.avgMainThreadCarveMs.toFixed(2)} ms sync`
+        : `${res.avgCarveLatency.toFixed(2)} ms`;
+      const carveSub = hasSeparateSync
+        ? `<div style="font-size:10px; color:#94a3b8;">Async worker: ${res.avgCarveLatency.toFixed(2)} ms</div>`
+        : '';
+      const workSub = (typeof res.avgMainThreadWorkMs === 'number')
+        ? `<div style="font-size:10px; color:#94a3b8;">CPU Work: ${res.avgMainThreadWorkMs.toFixed(2)} ms${typeof res.p99MainThreadWorkMs === 'number' ? ` / P99 ${res.p99MainThreadWorkMs.toFixed(2)} ms` : ''}</div>`
+        : '';
+
       const row = document.createElement('tr');
       row.innerHTML = `
         <td style="padding:8px; border:1px solid #1e293b; color:${color}; font-weight:bold;">${conf ? conf.title : res.poc}</td>
         <td style="padding:8px; border:1px solid #1e293b;">${res.cellSize || '--'}</td>
         <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">${res.avgFps.toFixed(1)} FPS</td>
-        <td style="padding:8px; border:1px solid #1e293b;">${res.avgFrameTime.toFixed(2)} ms / ${res.p99FrameTime.toFixed(2)} ms</td>
-        <td style="padding:8px; border:1px solid #1e293b; color:#fbbf24; font-weight:bold;">${res.avgCarveLatency.toFixed(2)} ms</td>
+        <td style="padding:8px; border:1px solid #1e293b;">${res.avgFrameTime.toFixed(2)} ms / ${res.p99FrameTime.toFixed(2)} ms${workSub}</td>
+        <td style="padding:8px; border:1px solid #1e293b; color:#fbbf24; font-weight:bold;">${carvePrimary}${carveSub}</td>
         <td style="padding:8px; border:1px solid #1e293b;">${res.triangles.toLocaleString()} / ${res.drawCalls}</td>
         <td style="padding:8px; border:1px solid #1e293b;">${res.heapMemoryMB.toFixed(2)} MB</td>
         <td style="padding:8px; border:1px solid #1e293b; color:#10b981; font-weight:bold;">${res.visualCollisionError || '0.00u'}</td>
@@ -591,7 +671,7 @@
       const extEl = document.getElementById(`cell-${res.poc}-ext`);
       const carveEl = document.getElementById(`cell-${res.poc}-carve`);
       if (extEl && res.cellSize) extEl.innerText = res.cellSize;
-      if (carveEl) carveEl.innerText = `${res.avgCarveLatency.toFixed(2)} ms (${res.avgFps.toFixed(1)} FPS)`;
+      if (carveEl) carveEl.innerText = formatCarveMatrixText(res);
     }
 
     async function runAllModesBenchmark() {
@@ -655,6 +735,7 @@
     window.addEventListener('message', (e) => {
       if (!e.data) return;
       if (e.data.type === 'TELEMETRY_UPDATE') {
+        hasLiveTelemetry = true;
         const d = e.data;
         document.getElementById('hdr-fps').innerText = d.fps.toFixed(1);
         document.getElementById('hdr-ft').innerText = `${d.frameTime.toFixed(1)}ms`;
@@ -719,6 +800,8 @@
     function closeReportModal() {
       document.getElementById('report-modal').style.display = 'none';
     }
+
+    loadSummaryBenchmarks();
   </script>
 </body>
 </html>
