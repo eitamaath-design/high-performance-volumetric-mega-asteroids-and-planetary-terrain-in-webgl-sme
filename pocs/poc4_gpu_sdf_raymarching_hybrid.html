@@ -74,6 +74,12 @@
         const _rcEntryPt = new THREE.Vector3();
         const _rcP = new THREE.Vector3();
         const _rcMp = new THREE.Vector3();
+        const _colCurPos = new THREE.Vector3();
+        const _colRemDelta = new THREE.Vector3();
+        const _colStep = new THREE.Vector3();
+        const _colGrad = new THREE.Vector3();
+        const _colNormal = new THREE.Vector3();
+        const _colHitPt = new THREE.Vector3();
 
         function evalDensityPoC4(wx, wy, wz) {
             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
@@ -249,72 +255,110 @@
             gl.bindTexture(gl.TEXTURE_3D, prevTex);
         }
 
+        // Zero-allocation CPU Trilinear SDF Distance Sampler (Exact match with GPU sampler3D texel centers)
+        function cpuSampleSDFDistance(wx, wy, wz) {
+            const invSpan = 1.0 / (DOMAIN_HALF * 2.0);
+            const u = (wx + DOMAIN_HALF) * invSpan;
+            const v = (wy + DOMAIN_HALF) * invSpan;
+            const w = (wz + DOMAIN_HALF) * invSpan;
+
+            if (u < 0 || u > 1 || v < 0 || v > 1 || w < 0 || w > 1) {
+                return 1000.0;
+            }
+
+            const maxIdx = VOL_RES - 1;
+            const gx = Math.max(0, Math.min(maxIdx, u * VOL_RES - 0.5));
+            const gy = Math.max(0, Math.min(maxIdx, v * VOL_RES - 0.5));
+            const gz = Math.max(0, Math.min(maxIdx, w * VOL_RES - 0.5));
+
+            const x0 = Math.floor(gx), x1 = x0 < maxIdx ? x0 + 1 : maxIdx;
+            const y0 = Math.floor(gy), y1 = y0 < maxIdx ? y0 + 1 : maxIdx;
+            const z0 = Math.floor(gz), z1 = z0 < maxIdx ? z0 + 1 : maxIdx;
+
+            const fx = gx - x0;
+            const fy = gy - y0;
+            const fz = gz - z0;
+            const omx = 1.0 - fx;
+            const omy = 1.0 - fy;
+
+            const strideY = VOL_RES;
+            const strideZ = VOL_RES * VOL_RES;
+            const i000 = (x0 + y0 * strideY + z0 * strideZ) * 4;
+            const i100 = (x1 + y0 * strideY + z0 * strideZ) * 4;
+            const i010 = (x0 + y1 * strideY + z0 * strideZ) * 4;
+            const i110 = (x1 + y1 * strideY + z0 * strideZ) * 4;
+            const i001 = (x0 + y0 * strideY + z1 * strideZ) * 4;
+            const i101 = (x1 + y0 * strideY + z1 * strideZ) * 4;
+            const i011 = (x0 + y1 * strideY + z1 * strideZ) * 4;
+            const i111 = (x1 + y1 * strideY + z1 * strideZ) * 4;
+
+            const d00 = volumeData[i000] * omx + volumeData[i100] * fx;
+            const d10 = volumeData[i010] * omx + volumeData[i110] * fx;
+            const d01 = volumeData[i001] * omx + volumeData[i101] * fx;
+            const d11 = volumeData[i011] * omx + volumeData[i111] * fx;
+            const d0 = d00 * omy + d10 * fy;
+            const d1 = d01 * omy + d11 * fy;
+            return (d0 * (1.0 - fz) + d1 * fz) * DOMAIN_HALF;
+        }
+
         // CPU Trilinear Interpolation Sampling (Exact match with GPU sampler3D texel centers)
         function cpuSampleSDF(wx, wy, wz) {
-            const u = (wx + DOMAIN_HALF) / (DOMAIN_HALF * 2.0);
-            const v = (wy + DOMAIN_HALF) / (DOMAIN_HALF * 2.0);
-            const w = (wz + DOMAIN_HALF) / (DOMAIN_HALF * 2.0);
+            const invSpan = 1.0 / (DOMAIN_HALF * 2.0);
+            const u = (wx + DOMAIN_HALF) * invSpan;
+            const v = (wy + DOMAIN_HALF) * invSpan;
+            const w = (wz + DOMAIN_HALF) * invSpan;
 
             if (u < 0 || u > 1 || v < 0 || v > 1 || w < 0 || w > 1) {
                 return { d: 1000.0, ore: 0.0, armor: 0.0, mat: 0 };
             }
 
-            const gx = Math.max(0, Math.min(VOL_RES - 1, u * VOL_RES - 0.5));
-            const gy = Math.max(0, Math.min(VOL_RES - 1, v * VOL_RES - 0.5));
-            const gz = Math.max(0, Math.min(VOL_RES - 1, w * VOL_RES - 0.5));
+            const maxIdx = VOL_RES - 1;
+            const gx = Math.max(0, Math.min(maxIdx, u * VOL_RES - 0.5));
+            const gy = Math.max(0, Math.min(maxIdx, v * VOL_RES - 0.5));
+            const gz = Math.max(0, Math.min(maxIdx, w * VOL_RES - 0.5));
 
-            const x0 = Math.floor(gx), x1 = Math.min(x0 + 1, VOL_RES - 1);
-            const y0 = Math.floor(gy), y1 = Math.min(y0 + 1, VOL_RES - 1);
-            const z0 = Math.floor(gz), z1 = Math.min(z0 + 1, VOL_RES - 1);
+            const x0 = Math.floor(gx), x1 = x0 < maxIdx ? x0 + 1 : maxIdx;
+            const y0 = Math.floor(gy), y1 = y0 < maxIdx ? y0 + 1 : maxIdx;
+            const z0 = Math.floor(gz), z1 = z0 < maxIdx ? z0 + 1 : maxIdx;
 
             const fx = gx - x0;
             const fy = gy - y0;
             const fz = gz - z0;
+            const omx = 1.0 - fx;
+            const omy = 1.0 - fy;
+            const omz = 1.0 - fz;
 
-            const sample = (x, y, z) => {
-                const i = (x + y * VOL_RES + z * VOL_RES * VOL_RES) * 4;
-                return {
-                    d: volumeData[i] * DOMAIN_HALF,
-                    ore: volumeData[i + 1],
-                    armor: volumeData[i + 2]
-                };
-            };
-
-            const c000 = sample(x0, y0, z0);
-            const c100 = sample(x1, y0, z0);
-            const c010 = sample(x0, y1, z0);
-            const c110 = sample(x1, y1, z0);
-            const c001 = sample(x0, y0, z1);
-            const c101 = sample(x1, y0, z1);
-            const c011 = sample(x0, y1, z1);
-            const c111 = sample(x1, y1, z1);
+            const strideY = VOL_RES;
+            const strideZ = VOL_RES * VOL_RES;
+            const i000 = (x0 + y0 * strideY + z0 * strideZ) * 4;
+            const i100 = (x1 + y0 * strideY + z0 * strideZ) * 4;
+            const i010 = (x0 + y1 * strideY + z0 * strideZ) * 4;
+            const i110 = (x1 + y1 * strideY + z0 * strideZ) * 4;
+            const i001 = (x0 + y0 * strideY + z1 * strideZ) * 4;
+            const i101 = (x1 + y0 * strideY + z1 * strideZ) * 4;
+            const i011 = (x0 + y1 * strideY + z1 * strideZ) * 4;
+            const i111 = (x1 + y1 * strideY + z1 * strideZ) * 4;
 
             // Interpolate continuous signed distance d
-            const d00 = c000.d * (1 - fx) + c100.d * fx;
-            const d10 = c010.d * (1 - fx) + c110.d * fx;
-            const d01 = c001.d * (1 - fx) + c101.d * fx;
-            const d11 = c011.d * (1 - fx) + c111.d * fx;
-            const d0 = d00 * (1 - fy) + d10 * fy;
-            const d1 = d01 * (1 - fy) + d11 * fy;
-            const d = d0 * (1 - fz) + d1 * fz;
+            const d00 = volumeData[i000] * omx + volumeData[i100] * fx;
+            const d10 = volumeData[i010] * omx + volumeData[i110] * fx;
+            const d01 = volumeData[i001] * omx + volumeData[i101] * fx;
+            const d11 = volumeData[i011] * omx + volumeData[i111] * fx;
+            const d = ((d00 * omy + d10 * fy) * omz + (d01 * omy + d11 * fy) * fz) * DOMAIN_HALF;
 
             // Interpolate continuous ore vein mask
-            const o00 = c000.ore * (1 - fx) + c100.ore * fx;
-            const o10 = c010.ore * (1 - fx) + c110.ore * fx;
-            const o01 = c001.ore * (1 - fx) + c101.ore * fx;
-            const o11 = c011.ore * (1 - fx) + c111.ore * fx;
-            const o0 = o00 * (1 - fy) + o10 * fy;
-            const o1 = o01 * (1 - fy) + o11 * fy;
-            const ore = o0 * (1 - fz) + o1 * fz;
+            const o00 = volumeData[i000 + 1] * omx + volumeData[i100 + 1] * fx;
+            const o10 = volumeData[i010 + 1] * omx + volumeData[i110 + 1] * fx;
+            const o01 = volumeData[i001 + 1] * omx + volumeData[i101 + 1] * fx;
+            const o11 = volumeData[i011 + 1] * omx + volumeData[i111 + 1] * fx;
+            const ore = (o00 * omy + o10 * fy) * omz + (o01 * omy + o11 * fy) * fz;
 
             // Interpolate continuous titanium armor mask
-            const a00 = c000.armor * (1 - fx) + c100.armor * fx;
-            const a10 = c010.armor * (1 - fx) + c110.armor * fx;
-            const a01 = c001.armor * (1 - fx) + c101.armor * fx;
-            const a11 = c011.armor * (1 - fx) + c111.armor * fx;
-            const a0 = a00 * (1 - fy) + a10 * fy;
-            const a1 = a01 * (1 - fy) + a11 * fy;
-            const armor = a0 * (1 - fz) + a1 * fz;
+            const a00 = volumeData[i000 + 2] * omx + volumeData[i100 + 2] * fx;
+            const a10 = volumeData[i010 + 2] * omx + volumeData[i110 + 2] * fx;
+            const a01 = volumeData[i001 + 2] * omx + volumeData[i101 + 2] * fx;
+            const a11 = volumeData[i011 + 2] * omx + volumeData[i111 + 2] * fx;
+            const armor = (a00 * omy + a10 * fy) * omz + (a01 * omy + a11 * fy) * fz;
 
             return {
                 d,
@@ -880,7 +924,8 @@
             pocId: 'poc4',
             pocTitle: 'Option 4: 3D GPU SDF Raymarching',
             defaultRadius: currentRadius,
-            getCollisionMesh: () => volumeBoxMesh,
+            hasLocalCollisionMesh: false,
+            getCollisionMesh: () => null,
             getVisualMesh: () => volumeBoxMesh,
             getCellSize: () => `${VOXEL_SPACING.toFixed(1)}u (${VOL_RES}³)`,
             onBeforeRender: () => {
@@ -894,11 +939,15 @@
                 }
             },
 
-            // Analytical CPU Sphere-Marching Raycast (0.00u visual-to-collision parity)
+            // Analytical CPU Sphere-Marching Raycast (0.00u visual-to-collision parity; supports world-space rays)
             customRaycast: (raycaster, camera, mousePos) => {
-                raycaster.setFromCamera(mousePos, camera);
+                if (camera && mousePos) {
+                    raycaster.setFromCamera(mousePos, camera);
+                }
                 const ro = raycaster.ray.origin;
                 const rd = raycaster.ray.direction;
+                const nearT = raycaster.near || 0.0;
+                const farT = (raycaster.far !== undefined && raycaster.far !== null) ? raycaster.far : Infinity;
 
                 // Intersect ray with volume AABB before sphere-marching
                 _rcBoxMin.set(-DOMAIN_HALF, -DOMAIN_HALF, -DOMAIN_HALF);
@@ -908,7 +957,7 @@
                 if (!insideBox && !raycaster.ray.intersectBox(_rcBox, _rcEntryPt)) {
                     return null;
                 }
-                let t = insideBox ? 0 : ro.distanceTo(_rcEntryPt) + 1.0;
+                let t = Math.max(nearT, insideBox ? 0.0 : ro.distanceTo(_rcEntryPt) + 1.0);
 
                 // Analytical Bounding-Sphere Early-Out (matches GPU shader)
                 const rBound = currentRadius * 1.25;
@@ -919,44 +968,52 @@
                 const sqrtD = Math.sqrt(dSph);
                 const ts0 = -bSph - sqrtD;
                 const ts1 = -bSph + sqrtD;
-                if (ts1 < 0.0) return null;
+                if (ts1 < nearT) return null;
                 if (ts0 > 0.0) t = Math.max(t, ts0 + 0.5);
-                const maxT = ts1;
+                const maxT = Math.min(ts1, farT);
                 if (maxT < t) return null;
 
                 let prevT = t;
                 const minStep = Math.max(currentRadius * 0.001, 1.5);
+                let testedMaxT = false;
 
-                for (let step = 0; step < 96 && t <= maxT; step++) {
+                for (let step = 0; step < 96; step++) {
                     _rcP.copy(ro).addScaledVector(rd, t);
                     if (sandbox.isXRay && _rcP.y > -sandbox.xRayOffset) {
                         if (rd.y >= -1e-5) return null;
                         const tPlane = (-sandbox.xRayOffset - ro.y) / rd.y;
                         if (tPlane > maxT) return null;
                         t = Math.max(t + 1.0, tPlane);
+                        if (t > maxT) {
+                            if (testedMaxT) break;
+                            t = maxT;
+                            testedMaxT = true;
+                        }
                         prevT = t;
                         continue;
                     }
-                    const res = cpuSampleSDF(_rcP.x, _rcP.y, _rcP.z);
-                    if (res.d <= 0.0) {
+                    const d = cpuSampleSDFDistance(_rcP.x, _rcP.y, _rcP.z);
+                    if (d <= 0.0) {
                         let a = prevT, b = t;
                         for (let k = 0; k < 5; k++) {
                             const m = 0.5 * (a + b);
                             _rcMp.copy(ro).addScaledVector(rd, m);
-                            if (cpuSampleSDF(_rcMp.x, _rcMp.y, _rcMp.z).d <= 0.0) b = m;
+                            if (cpuSampleSDFDistance(_rcMp.x, _rcMp.y, _rcMp.z) <= 0.0) b = m;
                             else a = m;
                         }
                         const refinedT = 0.5 * (a + b);
+                        if (refinedT < nearT || refinedT > farT) return null;
                         _rcP.copy(ro).addScaledVector(rd, refinedT);
                         const finalSamp = cpuSampleSDF(_rcP.x, _rcP.y, _rcP.z);
                         const eps = Math.max(10.0, VOXEL_SPACING * 0.45);
                         const norm = new THREE.Vector3(
-                            cpuSampleSDF(_rcP.x + eps, _rcP.y, _rcP.z).d - cpuSampleSDF(_rcP.x - eps, _rcP.y, _rcP.z).d,
-                            cpuSampleSDF(_rcP.x, _rcP.y + eps, _rcP.z).d - cpuSampleSDF(_rcP.x, _rcP.y - eps, _rcP.z).d,
-                            cpuSampleSDF(_rcP.x, _rcP.y, _rcP.z + eps).d - cpuSampleSDF(_rcP.x, _rcP.y, _rcP.z - eps).d
+                            cpuSampleSDFDistance(_rcP.x + eps, _rcP.y, _rcP.z) - cpuSampleSDFDistance(_rcP.x - eps, _rcP.y, _rcP.z),
+                            cpuSampleSDFDistance(_rcP.x, _rcP.y + eps, _rcP.z) - cpuSampleSDFDistance(_rcP.x, _rcP.y - eps, _rcP.z),
+                            cpuSampleSDFDistance(_rcP.x, _rcP.y, _rcP.z + eps) - cpuSampleSDFDistance(_rcP.x, _rcP.y, _rcP.z - eps)
                         );
                         if (norm.lengthSq() > 1e-8) norm.normalize();
-                        else norm.copy(_rcP).normalize();
+                        else if (_rcP.lengthSq() > 1e-8) norm.copy(_rcP).normalize();
+                        else norm.set(0, 1, 0);
 
                         return {
                             point: _rcP.clone(),
@@ -966,10 +1023,81 @@
                             object: volumeBoxMesh
                         };
                     }
+                    if (t >= maxT) break;
                     prevT = t;
-                    t += Math.max(res.d * 0.90, minStep * (1.0 + step * 0.05));
+                    const stepLen = Math.max(d * 0.90, minStep * (1.0 + step * 0.05));
+                    if (t + stepLen > maxT) {
+                        if (testedMaxT) break;
+                        t = maxT;
+                        testedMaxT = true;
+                    } else {
+                        t += stepLen;
+                    }
                 }
                 return null;
+            },
+
+            // Exact SDF Swept-Sphere Collision & 4-Tap Tetrahedral Gradient Push-Out
+            resolveSphereCollision: (pos, nextPos, radius) => {
+                _colCurPos.copy(pos);
+                _colRemDelta.copy(nextPos).sub(pos);
+                const dispLen = _colRemDelta.length();
+                const substeps = dispLen > 1e-4 ? Math.min(8, Math.max(2, Math.ceil(dispLen / Math.max(radius * 0.5, 4.0)))) : 1;
+                const eps = Math.max(4.0, VOXEL_SPACING * 0.30);
+
+                let collided = false;
+                let minD = Infinity;
+                _colNormal.set(0, 1, 0);
+                _colHitPt.set(0, 0, 0);
+
+                for (let s = 0; s < substeps; s++) {
+                    const frac = 1.0 / (substeps - s);
+                    _colStep.copy(_colRemDelta).multiplyScalar(frac);
+                    _colRemDelta.sub(_colStep);
+                    _colCurPos.add(_colStep);
+
+                    for (let pass = 0; pass < 2; pass++) {
+                        const d = cpuSampleSDFDistance(_colCurPos.x, _colCurPos.y, _colCurPos.z);
+                        if (d < radius) {
+                            const d0 = cpuSampleSDFDistance(_colCurPos.x + eps, _colCurPos.y - eps, _colCurPos.z - eps);
+                            const d1 = cpuSampleSDFDistance(_colCurPos.x - eps, _colCurPos.y - eps, _colCurPos.z + eps);
+                            const d2 = cpuSampleSDFDistance(_colCurPos.x - eps, _colCurPos.y + eps, _colCurPos.z - eps);
+                            const d3 = cpuSampleSDFDistance(_colCurPos.x + eps, _colCurPos.y + eps, _colCurPos.z + eps);
+                            _colGrad.set(
+                                d0 - d1 - d2 + d3,
+                                -d0 - d1 + d2 + d3,
+                                -d0 + d1 - d2 + d3
+                            );
+                            if (_colGrad.lengthSq() > 1e-10) {
+                                _colGrad.normalize();
+                            } else if (_colCurPos.lengthSq() > 1e-8) {
+                                _colGrad.copy(_colCurPos).normalize();
+                            } else {
+                                _colGrad.set(0, 1, 0);
+                            }
+
+                            _colCurPos.addScaledVector(_colGrad, radius - d + 0.15);
+                            const vnRem = _colRemDelta.dot(_colGrad);
+                            if (vnRem < 0) {
+                                _colRemDelta.addScaledVector(_colGrad, -vnRem);
+                            }
+                            collided = true;
+                            _colNormal.copy(_colGrad);
+                            _colHitPt.copy(_colCurPos).addScaledVector(_colGrad, -radius);
+                            if (d < minD) minD = d;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                return {
+                    position: _colCurPos,
+                    collided,
+                    normal: collided ? _colNormal : null,
+                    hitPoint: collided ? _colHitPt : null,
+                    sdfDistance: minD
+                };
             },
 
             onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {

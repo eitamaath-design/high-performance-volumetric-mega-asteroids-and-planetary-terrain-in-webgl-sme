@@ -307,6 +307,24 @@ export function findSurfacePoint(evalDensityFn, dir, minR, maxR) {
     return u.multiplyScalar(0.5 * (lo + hi));
 }
 
+const _DIAG_INV = 1.0 / Math.sqrt(3.0);
+const SPHERE_PROBE_DIRS = [
+    new THREE.Vector3( 1,  0,  0),
+    new THREE.Vector3(-1,  0,  0),
+    new THREE.Vector3( 0,  1,  0),
+    new THREE.Vector3( 0, -1,  0),
+    new THREE.Vector3( 0,  0,  1),
+    new THREE.Vector3( 0,  0, -1),
+    new THREE.Vector3( _DIAG_INV,  _DIAG_INV,  _DIAG_INV),
+    new THREE.Vector3(-_DIAG_INV,  _DIAG_INV,  _DIAG_INV),
+    new THREE.Vector3( _DIAG_INV, -_DIAG_INV,  _DIAG_INV),
+    new THREE.Vector3(-_DIAG_INV, -_DIAG_INV,  _DIAG_INV),
+    new THREE.Vector3( _DIAG_INV,  _DIAG_INV, -_DIAG_INV),
+    new THREE.Vector3(-_DIAG_INV,  _DIAG_INV, -_DIAG_INV),
+    new THREE.Vector3( _DIAG_INV, -_DIAG_INV, -_DIAG_INV),
+    new THREE.Vector3(-_DIAG_INV, -_DIAG_INV, -_DIAG_INV)
+];
+
 export class PlanetaryBaseSandbox {
     constructor(config = {}) {
         this.config = Object.assign({
@@ -328,6 +346,7 @@ export class PlanetaryBaseSandbox {
             getCollisionMesh: null,
             getVisualMesh: null,
             customRaycast: null,
+            resolveSphereCollision: null,
             checkMaterialAtHit: null
         }, config);
 
@@ -364,6 +383,29 @@ export class PlanetaryBaseSandbox {
         this._brushDirty = true;
         this._isExecutingTool = false;
         this.isSoftwareGL = false;
+
+        // Preallocated zero-GC scratch state for Flight-Mode swept collision & spring-arm
+        this._flightRaycaster = new THREE.Raycaster();
+        this._flightRayDir = new THREE.Vector3();
+        this._shipForward = new THREE.Vector3();
+        this._shipUp = new THREE.Vector3();
+        this._shipPrevPos = new THREE.Vector3();
+        this._shipDesiredPos = new THREE.Vector3();
+        this._shipNoseOrigin = new THREE.Vector3();
+        this._shipCamOffset = new THREE.Vector3();
+        this._shipCamDesired = new THREE.Vector3();
+        this._shipCamDir = new THREE.Vector3();
+        this._shipLookTarget = new THREE.Vector3();
+        this._colCurPos = new THREE.Vector3();
+        this._colRemDelta = new THREE.Vector3();
+        this._colStep = new THREE.Vector3();
+        this._colStepDir = new THREE.Vector3();
+        this._colNextSub = new THREE.Vector3();
+        this._colNormal = new THREE.Vector3();
+        this._colTmpNorm = new THREE.Vector3();
+        this._colHitPt = new THREE.Vector3();
+        this._colTmpVec = new THREE.Vector3();
+        this._currentCamArmDist = 52.5;
 
         // Telemetry
         this.fps = 60;
@@ -1039,18 +1081,39 @@ export class PlanetaryBaseSandbox {
             this.controls.enabled = false;
             this.shipGroup.visible = true;
 
-            // Spawn ship right outside asteroid surface
-            this.shipGroup.position.set(0, this.currentRadius * 0.2, this.currentRadius * 1.05);
+            // Spawn safely outside max terrain peaks (1.22*R < DOMAIN_HALF 1.32*R)
+            this.shipGroup.position.set(0, this.currentRadius * 0.16, this.currentRadius * 1.22);
             this.shipGroup.quaternion.set(0, 0, 0, 1);
             this.shipVelocity.set(0, 0, 0);
+
+            // Stationary depenetration pass so spawn starts strictly clear
+            this._shipPrevPos.copy(this.shipGroup.position);
+            this._shipDesiredPos.copy(this.shipGroup.position);
+            const spawnCol = this.config.resolveSphereCollision
+                ? this.config.resolveSphereCollision(this._shipPrevPos, this._shipDesiredPos, this.shipRadius)
+                : this.defaultResolveSphereCollision(this._shipPrevPos, this._shipDesiredPos, this.shipRadius);
+            this.shipGroup.position.copy(spawnCol.position);
+
+            this._currentCamArmDist = 52.5;
+            if (this.brushCursorMesh) this.brushCursorMesh.visible = false;
+            if (this.laserBeam) this.laserBeam.visible = false;
+            if (this.sparkPoints) this.sparkPoints.visible = false;
+            if (this.alignmentMarker) this.alignmentMarker.visible = false;
+            if (this.normalLine) this.normalLine.visible = false;
         } else {
             btn.style.background = '#1e293b';
             btn.style.color = '#93c5fd';
             btn.innerText = 'Fly Ship [F]';
             this.controls.enabled = true;
             this.shipGroup.visible = false;
+            this.camera.up.set(0, 1, 0);
+            if (this.laserBeam) this.laserBeam.visible = false;
+            if (this.sparkPoints) this.sparkPoints.visible = false;
+            if (this.alignmentMarker) this.alignmentMarker.visible = false;
+            if (this.normalLine) this.normalLine.visible = false;
             this.camera.position.set(0, this.currentRadius * 0.7, this.currentRadius * 2.1);
             this.controls.target.set(0, 0, 0);
+            this.controls.update();
         }
     }
 
@@ -1162,6 +1225,9 @@ export class PlanetaryBaseSandbox {
     }
 
     performRaycast() {
+        this.raycaster.near = 0.1;
+        this.raycaster.far = Infinity;
+
         if (this.config.customRaycast) {
             return this.config.customRaycast(this.raycaster, this.camera, this.mousePos);
         }
@@ -1176,6 +1242,127 @@ export class PlanetaryBaseSandbox {
             return hits[0];
         }
         return null;
+    }
+
+    /**
+     * World-space raycast respecting customRaycast hooks (PoCs 3 & 4) with zero-vector guard.
+     */
+    performRaycastFromOrigin(origin, dir, maxDist = Infinity) {
+        this._flightRayDir.copy(dir);
+        if (this._flightRayDir.lengthSq() < 1e-12) return null;
+        this._flightRayDir.normalize();
+
+        this._flightRaycaster.near = 0.0;
+        this._flightRaycaster.far = maxDist;
+        this._flightRaycaster.set(origin, this._flightRayDir);
+
+        if (this.config.customRaycast) {
+            return this.config.customRaycast(this._flightRaycaster, null, null);
+        }
+
+        const colMesh = this.config.getCollisionMesh ? this.config.getCollisionMesh() : null;
+        if (!colMesh) return null;
+
+        const targets = Array.isArray(colMesh) ? colMesh : [colMesh];
+        if (targets.length === 0) return null;
+        const hits = this._flightRaycaster.intersectObjects(targets, true);
+        return hits.length > 0 ? hits[0] : null;
+    }
+
+    /**
+     * Extract outward surface normal facing toward the ray origin (handles DoubleSide backfaces).
+     */
+    _extractHitNormal(hit, rayDir, outNorm) {
+        if (hit.face && hit.object) {
+            outNorm.copy(hit.face.normal).transformDirection(hit.object.matrixWorld);
+        } else if (hit.normal) {
+            outNorm.copy(hit.normal);
+        } else {
+            outNorm.copy(hit.point);
+        }
+        if (outNorm.lengthSq() < 1e-12) {
+            outNorm.copy(rayDir).negate();
+        } else {
+            outNorm.normalize();
+        }
+        if (outNorm.dot(rayDir) > 0) {
+            outNorm.negate();
+        }
+        return outNorm;
+    }
+
+    /**
+     * Shared multi-direction swept-sphere collision & tangent-slide resolver (PoCs 1, 2, 3).
+     */
+    defaultResolveSphereCollision(prevPos, desiredPos, radius) {
+        this._colCurPos.copy(prevPos);
+        this._colRemDelta.copy(desiredPos).sub(prevPos);
+        const dispLen = this._colRemDelta.length();
+        const substeps = dispLen > 1e-4 ? Math.min(6, Math.max(1, Math.ceil(dispLen / Math.max(radius * 0.65, 4.0)))) : 1;
+
+        let collided = false;
+        this._colNormal.set(0, 1, 0);
+        this._colHitPt.set(0, 0, 0);
+
+        for (let s = 0; s < substeps; s++) {
+            const frac = 1.0 / (substeps - s);
+            this._colStep.copy(this._colRemDelta).multiplyScalar(frac);
+            this._colRemDelta.sub(this._colStep);
+            const stepLen = this._colStep.length();
+
+            if (stepLen > 1e-4) {
+                this._colStepDir.copy(this._colStep).multiplyScalar(1.0 / stepLen);
+                const fwdHit = this.performRaycastFromOrigin(this._colCurPos, this._colStepDir, stepLen + radius);
+                this._colNextSub.copy(this._colCurPos).add(this._colStep);
+                if (fwdHit) {
+                    const n = this._extractHitNormal(fwdHit, this._colStepDir, this._colTmpNorm);
+                    const planeDist = this._colTmpVec.copy(this._colNextSub).sub(fwdHit.point).dot(n);
+                    if (planeDist < radius) {
+                        this._colNextSub.addScaledVector(n, radius - planeDist + 0.05);
+                        const vnRem = this._colRemDelta.dot(n);
+                        if (vnRem < 0) this._colRemDelta.addScaledVector(n, -vnRem);
+                        collided = true;
+                        this._colNormal.copy(n);
+                        this._colHitPt.copy(fwdHit.point);
+                    }
+                }
+                this._colCurPos.copy(this._colNextSub);
+            }
+
+            // Spherical multi-direction depenetration (up to 2 passes)
+            for (let pass = 0; pass < 2; pass++) {
+                let passAdjusted = false;
+                for (let dIdx = 0; dIdx < SPHERE_PROBE_DIRS.length; dIdx++) {
+                    const probeDir = SPHERE_PROBE_DIRS[dIdx];
+                    const hit = this.performRaycastFromOrigin(this._colCurPos, probeDir, radius);
+                    if (hit && hit.distance < radius) {
+                        const n = this._extractHitNormal(hit, probeDir, this._colTmpNorm);
+                        const cosAlign = Math.max(0.0, -probeDir.dot(n));
+                        const perpDist = this._colTmpVec.copy(this._colCurPos).sub(hit.point).dot(n);
+                        const pushDist = (cosAlign > 0.25 && perpDist >= 0.0 && perpDist < radius)
+                            ? (radius - perpDist + 0.05)
+                            : (radius - hit.distance + 0.05);
+                        if (pushDist > 0) {
+                            this._colCurPos.addScaledVector(n, pushDist);
+                            passAdjusted = true;
+                        }
+                        const vnRem = this._colRemDelta.dot(n);
+                        if (vnRem < 0) this._colRemDelta.addScaledVector(n, -vnRem);
+                        collided = true;
+                        this._colNormal.copy(n);
+                        this._colHitPt.copy(hit.point);
+                    }
+                }
+                if (!passAdjusted) break;
+            }
+        }
+
+        return {
+            position: this._colCurPos,
+            collided,
+            normal: collided ? this._colNormal : null,
+            hitPoint: collided ? this._colHitPt : null
+        };
     }
 
     async executeActiveTool(forcedHit = null) {
@@ -1342,11 +1529,7 @@ export class PlanetaryBaseSandbox {
     updateShipPhysics(dt) {
         if (!this.isFlightMode) return;
 
-        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.shipGroup.quaternion);
-        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.shipGroup.quaternion);
-        const up = new THREE.Vector3(0, 1, 0).applyQuaternion(this.shipGroup.quaternion);
-
-        // Turn inputs
+        // Turn inputs (6-DOF pitch, yaw, roll)
         const turnSpeed = 1.8;
         if (this.keys['arrowleft'] || this.keys['a']) this.shipGroup.rotateY(turnSpeed * dt);
         if (this.keys['arrowright'] || this.keys['d']) this.shipGroup.rotateY(-turnSpeed * dt);
@@ -1355,49 +1538,93 @@ export class PlanetaryBaseSandbox {
         if (this.keys['q']) this.shipGroup.rotateZ(turnSpeed * dt);
         if (this.keys['e']) this.shipGroup.rotateZ(-turnSpeed * dt);
 
-        // Thrust
+        this._shipForward.set(0, 0, -1).applyQuaternion(this.shipGroup.quaternion);
+        this._shipUp.set(0, 1, 0).applyQuaternion(this.shipGroup.quaternion);
+
+        // Thrust (Shift boost decoupled from Space nose-mounted laser)
         const accel = 650.0;
+        const isFiring = Boolean(this.keys[' '] || this.isSpaceDown);
         if (this.keys['shift']) {
-            this.shipVelocity.addScaledVector(forward, accel * dt);
-        } else if (this.keys[' ']) { // Spacebar: forward + laser
-            this.shipVelocity.addScaledVector(forward, accel * 0.7 * dt);
-            const nosePos = this.shipGroup.position.clone().addScaledVector(forward, 15);
-            this.raycaster.set(nosePos, forward);
-            const hit = this.performRaycast();
-            if (hit && hit.distance < 450) {
-                this.executeActiveTool(hit);
-            }
+            this.shipVelocity.addScaledVector(this._shipForward, accel * dt);
+        } else if (isFiring) {
+            this.shipVelocity.addScaledVector(this._shipForward, accel * 0.7 * dt);
         }
 
-        // Damping / inertia
-        this.shipVelocity.multiplyScalar(Math.pow(0.92, dt * 60));
-
-        // Real-time Swept Collision against exact visual terrain
-        const nextPos = this.shipGroup.position.clone().addScaledVector(this.shipVelocity, dt);
-        const colMesh = this.config.getCollisionMesh ? this.config.getCollisionMesh() : null;
-
-        if (colMesh) {
-            const targets = Array.isArray(colMesh) ? colMesh : [colMesh];
-            const ray = new THREE.Raycaster(this.shipGroup.position, this.shipVelocity.clone().normalize(), 0, this.shipVelocity.length() * dt + this.shipRadius);
-            const hits = ray.intersectObjects(targets, true);
-
-            if (hits.length > 0 && hits[0].distance <= this.shipRadius + 2) {
-                // Slide along collision normal with zero penetration
-                const hitNormal = hits[0].face ? hits[0].face.normal.clone().transformDirection(hits[0].object.matrixWorld) : hits[0].point.clone().normalize();
-                const normalVel = hitNormal.clone().multiplyScalar(this.shipVelocity.dot(hitNormal));
-                this.shipVelocity.sub(normalVel); // Cancel velocity towards surface
-                this.spawnSparks(hits[0].point, hitNormal, 10);
+        // Nose-mounted laser (20Hz execution + smooth per-frame beam rendering)
+        if (isFiring) {
+            const hit = this.performRaycastFromOrigin(
+                this._shipNoseOrigin.copy(this.shipGroup.position),
+                this._shipForward,
+                450
+            );
+            if (hit && hit.distance < 450) {
+                this.renderLaserBeam(this.shipGroup.position, hit.point);
+                const now = performance.now();
+                if (!this._isExecutingTool && (now - this.lastCarveTick >= this.carveTickInterval)) {
+                    this.executeActiveTool(hit);
+                }
             } else {
-                this.shipGroup.position.copy(nextPos);
+                this.laserBeam.visible = false;
+                this.alignmentMarker.visible = false;
+                this.normalLine.visible = false;
             }
         } else {
-            this.shipGroup.position.copy(nextPos);
+            this.laserBeam.visible = false;
+            this.alignmentMarker.visible = false;
+            this.normalLine.visible = false;
         }
 
-        // Camera follows behind ship in third-person view
-        const camOffset = new THREE.Vector3(0, 16, 50).applyQuaternion(this.shipGroup.quaternion);
-        this.camera.position.copy(this.shipGroup.position).add(camOffset);
-        this.camera.lookAt(this.shipGroup.position.clone().addScaledVector(forward, 80));
+        // Damping / inertia + zero-velocity snap
+        this.shipVelocity.multiplyScalar(Math.pow(0.92, dt * 60));
+        if (this.shipVelocity.lengthSq() < 1e-8) {
+            this.shipVelocity.set(0, 0, 0);
+        }
+
+        // Swept-sphere collision & smooth tangent-slide projection
+        const prevPos = this._shipPrevPos.copy(this.shipGroup.position);
+        const desiredPos = this._shipDesiredPos.copy(prevPos).addScaledVector(this.shipVelocity, dt);
+        const colRes = this.config.resolveSphereCollision
+            ? this.config.resolveSphereCollision(prevPos, desiredPos, this.shipRadius)
+            : this.defaultResolveSphereCollision(prevPos, desiredPos, this.shipRadius);
+
+        // Always advance ship position to resolved pose (no stuttery freezing)
+        this.shipGroup.position.copy(colRes.position);
+
+        if (colRes.collided && colRes.normal) {
+            const n = colRes.normal;
+            const vn = this.shipVelocity.dot(n);
+            if (vn < 0) {
+                const restitution = (-vn > 40.0) ? 0.12 : 0.0;
+                this.shipVelocity.addScaledVector(n, -vn * (1.0 + restitution));
+                this.shipVelocity.multiplyScalar(0.96);
+                if (-vn > 20.0 && colRes.hitPoint) {
+                    this.spawnSparks(colRes.hitPoint, n, 8);
+                }
+            }
+            if (this.shipVelocity.lengthSq() < 1e-8) {
+                this.shipVelocity.set(0, 0, 0);
+            }
+        }
+
+        // Chase-camera spring-arm occlusion pull-in
+        this._shipCamOffset.set(0, 16, 50).applyQuaternion(this.shipGroup.quaternion);
+        const desiredArmDist = this._shipCamOffset.length();
+        this._shipCamDir.copy(this._shipCamOffset).multiplyScalar(1.0 / desiredArmDist);
+        const camHit = this.performRaycastFromOrigin(this.shipGroup.position, this._shipCamDir, desiredArmDist);
+        let targetArmDist = desiredArmDist;
+        if (camHit && camHit.distance < desiredArmDist) {
+            targetArmDist = Math.max(1.5, camHit.distance > 9.0 ? (camHit.distance - 6.0) : (camHit.distance * 0.5));
+        }
+        if (targetArmDist < this._currentCamArmDist) {
+            this._currentCamArmDist = targetArmDist;
+        } else {
+            this._currentCamArmDist += (targetArmDist - this._currentCamArmDist) * Math.min(1.0, dt * 10.0);
+        }
+        this._shipCamDesired.copy(this.shipGroup.position).addScaledVector(this._shipCamDir, this._currentCamArmDist);
+        this.camera.position.copy(this._shipCamDesired);
+        this.camera.up.copy(this._shipUp);
+        this._shipLookTarget.copy(this.shipGroup.position).addScaledVector(this._shipForward, 80);
+        this.camera.lookAt(this._shipLookTarget);
     }
 
     initPostMessageBridge() {

@@ -49,7 +49,7 @@
 
         let currentRadius = 2800;
         let planetaryMacroShell = null;
-        const MACRO_GRID_RES = 4;
+        const MACRO_GRID_RES = 8;
         let macroRaycastGrid = null;
         let macroRayStamp = 1;
         const _rcCellHit = new THREE.Vector3();
@@ -249,7 +249,7 @@
             geo.computeVertexNormals();
             geo.computeBoundingBox();
 
-            // Build 4x4x4 spatial triangle grid for fast portal-aware customRaycast
+            // Build 8x8x8 spatial triangle grid for fast portal-aware customRaycast
             const bbox = geo.boundingBox;
             const gMinX = bbox.min.x - 1.0, gMinY = bbox.min.y - 1.0, gMinZ = bbox.min.z - 1.0;
             const gMaxX = bbox.max.x + 1.0, gMaxY = bbox.max.y + 1.0, gMaxZ = bbox.max.z + 1.0;
@@ -849,9 +849,11 @@
             },
             getCellSize: () => `${SUBTERRANEAN_CELL_SIZE.toFixed(1)}u (${macroSegments}seg / ${SUBTERRANEAN_CHUNK_RES}³)`,
 
-            // Portal-aware raycast accelerated by 4x4x4 spatial triangle grid
+            // Portal-aware raycast accelerated by 8x8x8 spatial triangle grid (supports world-space rays)
             customRaycast: (raycaster, camera, mousePos) => {
-                raycaster.setFromCamera(mousePos, camera);
+                if (camera && mousePos) {
+                    raycaster.setFromCamera(mousePos, camera);
+                }
 
                 let bestSubHit = null;
                 if (activeSubterraneanMeshes.length > 0) {
@@ -886,7 +888,7 @@
                     const posAttr = macroRaycastGrid.posAttr;
                     const idxAttr = macroRaycastGrid.indexAttr;
 
-                    let bestDist = bestSubHit ? bestSubHit.distance : Infinity;
+                    let bestDist = Math.min(bestSubHit ? bestSubHit.distance : Infinity, raycaster.far);
                     let bestMacroHit = null;
 
                     for (let i = 0; i < _rcHitCells.length; i++) {
@@ -923,6 +925,7 @@
 
                             _rcTriHelper.set(_rcTriA, _rcTriB, _rcTriC);
                             _rcTriHelper.getNormal(_rcTriNorm);
+                            if (_rcTriNorm.dot(ray.direction) > 0) _rcTriNorm.negate();
 
                             bestDist = dist;
                             bestMacroHit = {
