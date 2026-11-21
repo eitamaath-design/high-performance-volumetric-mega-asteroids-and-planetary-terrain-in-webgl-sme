@@ -34,7 +34,8 @@
         const _poc3CoarseGrid = new Float32Array(5 * 5 * 5);
         const _poc3SinOreX = new Float32Array(32);
         const MAX_PORTALS = 4096;
-        const portalHoles = []; // Array of { point: Vector3, radius: number, radiusSq: number }
+        const portalSlotData = new Array(MAX_PORTALS).fill(null); // Per-slot { point: Vector3, radius: number, radiusSq: number }
+        const portalSlotCells = new Array(MAX_PORTALS).fill(null); // Per-slot { minX, maxX, minY, maxY, minZ, maxZ }
         let nextPortalIndex = 0;
 
         // Clustered 3D Spatial Grid (32x32x32 cells x 16 portal IDs/cell in 1024x128 RGBA Float)
@@ -121,13 +122,135 @@
         }
 
         function clearPortalGrid() {
-            portalHoles.length = 0;
+            portalSlotData.fill(null);
+            portalSlotCells.fill(null);
             nextPortalIndex = 0;
             portalGridData.fill(0);
             portalListData.fill(0);
             portalGridTex.needsUpdate = true;
             portalListTex.needsUpdate = true;
             macroCrustMaterial.userData.shaderUniforms.uPortalDomainHalf.value = currentRadius * 1.30;
+        }
+
+        function computePortalCellBounds(x, y, z, r, domainHalf) {
+            const domainSize = domainHalf * 2.0;
+            const clampCell = (v) => Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(v)));
+            return {
+                minX: clampCell(((x - r + domainHalf) / domainSize) * PORTAL_GRID_RES),
+                maxX: clampCell(((x + r + domainHalf) / domainSize) * PORTAL_GRID_RES),
+                minY: clampCell(((y - r + domainHalf) / domainSize) * PORTAL_GRID_RES),
+                maxY: clampCell(((y + r + domainHalf) / domainSize) * PORTAL_GRID_RES),
+                minZ: clampCell(((z - r + domainHalf) / domainSize) * PORTAL_GRID_RES),
+                maxZ: clampCell(((z + r + domainHalf) / domainSize) * PORTAL_GRID_RES)
+            };
+        }
+
+        function uploadPortalGridRows(minTileRow, maxTileRow) {
+            if (minTileRow > maxTileRow) return;
+            const gl = sandbox && sandbox.renderer ? sandbox.renderer.getContext() : null;
+            const gridTexProps = sandbox && sandbox.renderer ? sandbox.renderer.properties.get(portalGridTex) : null;
+            const glGridTex = gridTexProps ? gridTexProps.__webglTexture : null;
+            if (gl && glGridTex) {
+                const rowCount = maxTileRow - minTileRow + 1;
+                const subView = portalGridData.subarray(minTileRow * 1024 * 4, (maxTileRow + 1) * 1024 * 4);
+                const prevTex = gl.getParameter(gl.TEXTURE_BINDING_2D);
+                const prevAlign = gl.getParameter(gl.UNPACK_ALIGNMENT);
+                const prevFlipY = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL);
+                gl.bindTexture(gl.TEXTURE_2D, glGridTex);
+                gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+                if (prevFlipY) gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+                gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, minTileRow, 1024, rowCount, gl.RGBA, gl.FLOAT, subView);
+                if (prevFlipY) gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, prevFlipY);
+                gl.pixelStorei(gl.UNPACK_ALIGNMENT, prevAlign);
+                gl.bindTexture(gl.TEXTURE_2D, prevTex);
+            } else {
+                portalGridTex.needsUpdate = true;
+            }
+        }
+
+        function evictPortalSlotFromGrid(slotId, dirtyRange) {
+            const oldBounds = portalSlotCells[slotId];
+            if (!oldBounds) return;
+            const targetId = slotId + 1.0;
+            for (let cz = oldBounds.minZ; cz <= oldBounds.maxZ; cz++) {
+                const tileX = cz % 8;
+                const tileY = Math.floor(cz / 8);
+                for (let cy = oldBounds.minY; cy <= oldBounds.maxY; cy++) {
+                    const baseY = tileY * 32 + cy;
+                    for (let cx = oldBounds.minX; cx <= oldBounds.maxX; cx++) {
+                        const baseX = (tileX * 32 + cx) * 4;
+                        const cellBaseIdx = (baseY * 1024 + baseX) * 4;
+                        let writeIdx = 0;
+                        let changed = false;
+                        for (let s = 0; s < 16; s++) {
+                            const val = portalGridData[cellBaseIdx + s];
+                            if (val === 0.0) break;
+                            if (val === targetId) {
+                                changed = true;
+                                continue;
+                            }
+                            if (writeIdx !== s) {
+                                portalGridData[cellBaseIdx + writeIdx] = val;
+                            }
+                            writeIdx++;
+                        }
+                        if (changed) {
+                            for (let s = writeIdx; s < 16; s++) {
+                                portalGridData[cellBaseIdx + s] = 0.0;
+                            }
+                            if (baseY < dirtyRange.minRow) dirtyRange.minRow = baseY;
+                            if (baseY > dirtyRange.maxRow) dirtyRange.maxRow = baseY;
+                        }
+                    }
+                }
+            }
+            portalSlotCells[slotId] = null;
+            portalSlotData[slotId] = null;
+        }
+
+        function insertPortalIdIntoCells(portalId, bounds, existingBounds, dirtyRange) {
+            for (let cz = bounds.minZ; cz <= bounds.maxZ; cz++) {
+                const tileX = cz % 8;
+                const tileY = Math.floor(cz / 8);
+                for (let cy = bounds.minY; cy <= bounds.maxY; cy++) {
+                    const baseY = tileY * 32 + cy;
+                    for (let cx = bounds.minX; cx <= bounds.maxX; cx++) {
+                        if (
+                            existingBounds &&
+                            cx >= existingBounds.minX && cx <= existingBounds.maxX &&
+                            cy >= existingBounds.minY && cy <= existingBounds.maxY &&
+                            cz >= existingBounds.minZ && cz <= existingBounds.maxZ
+                        ) {
+                            continue;
+                        }
+                        const baseX = (tileX * 32 + cx) * 4;
+                        const cellBaseIdx = (baseY * 1024 + baseX) * 4;
+                        let alreadyPresent = false;
+                        let placed = false;
+                        for (let s = 0; s < 16; s++) {
+                            const cur = portalGridData[cellBaseIdx + s];
+                            if (cur === portalId) {
+                                alreadyPresent = true;
+                                break;
+                            }
+                            if (cur === 0.0) {
+                                portalGridData[cellBaseIdx + s] = portalId;
+                                placed = true;
+                                break;
+                            }
+                        }
+                        if (alreadyPresent) continue;
+                        if (!placed) {
+                            for (let s = 0; s < 15; s++) {
+                                portalGridData[cellBaseIdx + s] = portalGridData[cellBaseIdx + s + 1];
+                            }
+                            portalGridData[cellBaseIdx + 15] = portalId;
+                        }
+                        if (baseY < dirtyRange.minRow) dirtyRange.minRow = baseY;
+                        if (baseY > dirtyRange.maxRow) dirtyRange.maxRow = baseY;
+                    }
+                }
+            }
         }
 
         function isPointInsideClusteredPortalCPU(worldPos) {
@@ -156,7 +279,7 @@
                     const dx = worldPos.x - portalListData[listBase];
                     const dy = worldPos.y - portalListData[listBase + 1];
                     const dz = worldPos.z - portalListData[listBase + 2];
-                    if (Math.sqrt(dx * dx + dy * dy + dz * dz) < pr) {
+                    if (dx * dx + dy * dy + dz * dz < pr * pr) {
                         return true;
                     }
                 }
@@ -170,20 +293,68 @@
             // Only cut a surface portal in the macro crust if the carve sphere intersects the surface crust
             if (distFromSurface > brushRadius * 1.35) return;
 
-            for (let i = 0; i < portalHoles.length; i++) {
-                if (portalHoles[i].point.distanceTo(point) < cutRadius * 0.40 && portalHoles[i].radius >= cutRadius * 0.92) {
-                    return; // Already covered by an existing portal cutout
+            const domainHalf = currentRadius * 1.30;
+            const domainSize = domainHalf * 2.0;
+            const rimPad = Math.max(8.0, Math.min(22.0, currentRadius * 0.005));
+
+            // O(1) center-cell spatial check for enclosure deduplication and concentric expansion
+            const u = (point.x + domainHalf) / domainSize;
+            const v = (point.y + domainHalf) / domainSize;
+            const w = (point.z + domainHalf) / domainSize;
+            if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0 && w >= 0.0 && w <= 1.0) {
+                const ccx = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(u * PORTAL_GRID_RES)));
+                const ccy = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(v * PORTAL_GRID_RES)));
+                const ccz = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(w * PORTAL_GRID_RES)));
+                const cBaseX = ((ccz % 8) * PORTAL_GRID_RES + ccx) * 4;
+                const cBaseY = Math.floor(ccz / 8) * PORTAL_GRID_RES + ccy;
+                const cCellBaseIdx = (cBaseY * 1024 + cBaseX) * 4;
+
+                for (let s = 0; s < 16; s++) {
+                    const id = portalGridData[cCellBaseIdx + s];
+                    if (id <= 0.0) break;
+                    const slot = Math.round(id) - 1;
+                    if (slot < 0 || slot >= MAX_PORTALS) continue;
+                    const listBase = slot * 4;
+                    const ex = portalListData[listBase];
+                    const ey = portalListData[listBase + 1];
+                    const ez = portalListData[listBase + 2];
+                    const existingR = portalListData[listBase + 3];
+                    if (existingR <= 0.0) continue;
+
+                    const dist = Math.hypot(point.x - ex, point.y - ey, point.z - ez);
+                    // Completely enclosed by an existing portal: deduplicate without allocating a new slot
+                    if (dist + cutRadius <= existingR + 1.0) {
+                        return;
+                    }
+                    // Nearly concentric larger portal: expand existing slot in place
+                    if (dist < 0.25 * Math.min(cutRadius, existingR) && cutRadius > existingR) {
+                        portalListData[listBase + 3] = cutRadius;
+                        portalListTex.needsUpdate = true;
+                        if (portalSlotData[slot]) {
+                            portalSlotData[slot].radius = cutRadius;
+                            portalSlotData[slot].radiusSq = cutRadius * cutRadius;
+                        }
+                        const oldBounds = portalSlotCells[slot];
+                        const newBounds = computePortalCellBounds(ex, ey, ez, cutRadius + rimPad, domainHalf);
+                        const dirtyRange = { minRow: 128, maxRow: -1 };
+                        insertPortalIdIntoCells(id, newBounds, oldBounds, dirtyRange);
+                        portalSlotCells[slot] = newBounds;
+                        uploadPortalGridRows(dirtyRange.minRow, dirtyRange.maxRow);
+                        return;
+                    }
                 }
             }
 
             const portalSlot = nextPortalIndex % MAX_PORTALS;
             nextPortalIndex++;
-            const portalObj = { point: point.clone(), radius: cutRadius, radiusSq: cutRadius * cutRadius };
-            if (portalHoles.length < MAX_PORTALS) {
-                portalHoles.push(portalObj);
-            } else {
-                portalHoles[portalSlot] = portalObj;
+
+            const dirtyRange = { minRow: 128, maxRow: -1 };
+            // Cleanly evict recycled slot from all previous grid cells before reusing slotId
+            if (portalSlotCells[portalSlot] !== null) {
+                evictPortalSlotFromGrid(portalSlot, dirtyRange);
             }
+
+            portalSlotData[portalSlot] = { point: point.clone(), radius: cutRadius, radiusSq: cutRadius * cutRadius };
 
             const listBase = portalSlot * 4;
             portalListData[listBase] = point.x;
@@ -193,69 +364,161 @@
             portalListTex.needsUpdate = true;
 
             const portalId = portalSlot + 1.0;
-            const domainHalf = currentRadius * 1.30;
-            const domainSize = domainHalf * 2.0;
-            const minCX = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.x - cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
-            const maxCX = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.x + cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
-            const minCY = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.y - cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
-            const maxCY = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.y + cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
-            const minCZ = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.z - cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
-            const maxCZ = Math.max(0, Math.min(PORTAL_GRID_RES - 1, Math.floor(((point.z + cutRadius + domainHalf) / domainSize) * PORTAL_GRID_RES)));
+            const newBounds = computePortalCellBounds(point.x, point.y, point.z, cutRadius + rimPad, domainHalf);
+            portalSlotCells[portalSlot] = newBounds;
+            insertPortalIdIntoCells(portalId, newBounds, null, dirtyRange);
+            uploadPortalGridRows(dirtyRange.minRow, dirtyRange.maxRow);
+        }
 
-            let minTileRow = 128;
-            let maxTileRow = -1;
-            for (let cz = minCZ; cz <= maxCZ; cz++) {
-                const tileX = cz % 8;
-                const tileY = Math.floor(cz / 8);
-                for (let cy = minCY; cy <= maxCY; cy++) {
-                    const baseY = tileY * 32 + cy;
-                    if (baseY < minTileRow) minTileRow = baseY;
-                    if (baseY > maxTileRow) maxTileRow = baseY;
-                    for (let cx = minCX; cx <= maxCX; cx++) {
-                        const baseX = (tileX * 32 + cx) * 4;
-                        const cellBaseIdx = (baseY * 1024 + baseX) * 4;
-                        let placed = false;
-                        for (let s = 0; s < 16; s++) {
-                            if (portalGridData[cellBaseIdx + s] === 0.0) {
-                                portalGridData[cellBaseIdx + s] = portalId;
-                                placed = true;
-                                break;
-                            }
+        // 6-Face Spherified Cube-Sphere Macro Crust Generator (Uniform cell aspect ratio equator-to-poles)
+        function buildCubeSphereGeometry(faceSegs, evalRadiusFn) {
+            const n = Math.max(4, Math.floor(faceSegs));
+            const vertsPerFace = (n + 1) * (n + 1);
+            const totalVerts = 6 * vertsPerFace;
+            const trisPerFace = n * n * 2;
+            const totalIndices = 6 * trisPerFace * 3;
+
+            const positions = new Float32Array(totalVerts * 3);
+            const normals = new Float32Array(totalVerts * 3);
+            const colors = new Float32Array(totalVerts * 3);
+            const indices = totalVerts > 65535 ? new Uint32Array(totalIndices) : new Uint16Array(totalIndices);
+
+            // 6 faces with right x up == normal (outward CCW winding)
+            const faces = [
+                { normal: [ 1,  0,  0], right: [ 0,  0, -1], up: [ 0,  1,  0] }, // +X
+                { normal: [-1,  0,  0], right: [ 0,  0,  1], up: [ 0,  1,  0] }, // -X
+                { normal: [ 0,  1,  0], right: [ 1,  0,  0], up: [ 0,  0, -1] }, // +Y
+                { normal: [ 0, -1,  0], right: [ 1,  0,  0], up: [ 0,  0,  1] }, // -Y
+                { normal: [ 0,  0,  1], right: [ 1,  0,  0], up: [ 0,  1,  0] }, // +Z
+                { normal: [ 0,  0, -1], right: [-1,  0,  0], up: [ 0,  1,  0] }  // -Z
+            ];
+
+            const eps = 0.002;
+            let vCursor = 0;
+            let iCursor = 0;
+
+            for (let f = 0; f < 6; f++) {
+                const face = faces[f];
+                const fnx = face.normal[0], fny = face.normal[1], fnz = face.normal[2];
+                const rx = face.right[0], ry = face.right[1], rz = face.right[2];
+                const ux = face.up[0], uy = face.up[1], uz = face.up[2];
+                const baseVert = f * vertsPerFace;
+
+                for (let j = 0; j <= n; j++) {
+                    const v = (j / n) * 2.0 - 1.0;
+                    for (let i = 0; i <= n; i++) {
+                        const u = (i / n) * 2.0 - 1.0;
+                        const cx = fnx + u * rx + v * ux;
+                        const cy = fny + u * ry + v * uy;
+                        const cz = fnz + u * rz + v * uz;
+
+                        // Exact spherified cube projection onto unit sphere
+                        const x2 = cx * cx;
+                        const y2 = cy * cy;
+                        const z2 = cz * cz;
+                        const sx = cx * Math.sqrt(Math.max(0.0, 1.0 - y2 * 0.5 - z2 * 0.5 + (y2 * z2) / 3.0));
+                        const sy = cy * Math.sqrt(Math.max(0.0, 1.0 - z2 * 0.5 - x2 * 0.5 + (z2 * x2) / 3.0));
+                        const sz = cz * Math.sqrt(Math.max(0.0, 1.0 - x2 * 0.5 - y2 * 0.5 + (x2 * y2) / 3.0));
+
+                        const rad = evalRadiusFn(sx, sy, sz);
+                        const o = vCursor * 3;
+                        positions[o] = sx * rad;
+                        positions[o + 1] = sy * rad;
+                        positions[o + 2] = sz * rad;
+
+                        // Seamless outward finite-difference normal on the unit-sphere tangent plane
+                        let t1x, t1y, t1z;
+                        if (Math.abs(sy) < 0.9) {
+                            t1x = sz; t1y = 0.0; t1z = -sx;
+                        } else {
+                            t1x = 0.0; t1y = -sz; t1z = sy;
                         }
-                        if (!placed) {
-                            for (let s = 0; s < 15; s++) {
-                                portalGridData[cellBaseIdx + s] = portalGridData[cellBaseIdx + s + 1];
-                            }
-                            portalGridData[cellBaseIdx + 15] = portalId;
+                        const t1Inv = 1.0 / (Math.hypot(t1x, t1y, t1z) || 1.0);
+                        t1x *= t1Inv; t1y *= t1Inv; t1z *= t1Inv;
+
+                        // t2 = S x t1 (so t1 x t2 = S, outward)
+                        const t2x = sy * t1z - sz * t1y;
+                        const t2y = sz * t1x - sx * t1z;
+                        const t2z = sx * t1y - sy * t1x;
+
+                        let d1px = sx + eps * t1x, d1py = sy + eps * t1y, d1pz = sz + eps * t1z;
+                        let inv = 1.0 / Math.hypot(d1px, d1py, d1pz);
+                        d1px *= inv; d1py *= inv; d1pz *= inv;
+                        const r1p = evalRadiusFn(d1px, d1py, d1pz);
+
+                        let d1mx = sx - eps * t1x, d1my = sy - eps * t1y, d1mz = sz - eps * t1z;
+                        inv = 1.0 / Math.hypot(d1mx, d1my, d1mz);
+                        d1mx *= inv; d1my *= inv; d1mz *= inv;
+                        const r1m = evalRadiusFn(d1mx, d1my, d1mz);
+
+                        let d2px = sx + eps * t2x, d2py = sy + eps * t2y, d2pz = sz + eps * t2z;
+                        inv = 1.0 / Math.hypot(d2px, d2py, d2pz);
+                        d2px *= inv; d2py *= inv; d2pz *= inv;
+                        const r2p = evalRadiusFn(d2px, d2py, d2pz);
+
+                        let d2mx = sx - eps * t2x, d2my = sy - eps * t2y, d2mz = sz - eps * t2z;
+                        inv = 1.0 / Math.hypot(d2mx, d2my, d2mz);
+                        d2mx *= inv; d2my *= inv; d2mz *= inv;
+                        const r2m = evalRadiusFn(d2mx, d2my, d2mz);
+
+                        const p1x = d1px * r1p - d1mx * r1m;
+                        const p1y = d1py * r1p - d1my * r1m;
+                        const p1z = d1pz * r1p - d1mz * r1m;
+
+                        const p2x = d2px * r2p - d2mx * r2m;
+                        const p2y = d2py * r2p - d2my * r2m;
+                        const p2z = d2pz * r2p - d2mz * r2m;
+
+                        let nx = p1y * p2z - p1z * p2y;
+                        let ny = p1z * p2x - p1x * p2z;
+                        let nz = p1x * p2y - p1y * p2x;
+                        const nLen = Math.hypot(nx, ny, nz) || 1.0;
+                        nx /= nLen; ny /= nLen; nz /= nLen;
+                        if (nx * sx + ny * sy + nz * sz < 0.0) {
+                            nx = -nx; ny = -ny; nz = -nz;
                         }
+                        normals[o] = nx;
+                        normals[o + 1] = ny;
+                        normals[o + 2] = nz;
+
+                        // Subtle elevation-based vertex color
+                        const elev = Math.max(0.0, Math.min(1.0, (rad / currentRadius - 0.85) / 0.30));
+                        colors[o] = 0.44 + elev * 0.18;
+                        colors[o + 1] = 0.45 + elev * 0.16;
+                        colors[o + 2] = 0.48 + elev * 0.14;
+
+                        vCursor++;
+                    }
+                }
+
+                for (let j = 0; j < n; j++) {
+                    for (let i = 0; i < n; i++) {
+                        const a = baseVert + j * (n + 1) + i;
+                        const b = a + 1;
+                        const c = a + (n + 1) + 1;
+                        const d = a + (n + 1);
+                        indices[iCursor++] = a;
+                        indices[iCursor++] = b;
+                        indices[iCursor++] = c;
+                        indices[iCursor++] = a;
+                        indices[iCursor++] = c;
+                        indices[iCursor++] = d;
                     }
                 }
             }
 
-            if (minTileRow <= maxTileRow) {
-                const gl = sandbox && sandbox.renderer ? sandbox.renderer.getContext() : null;
-                const gridTexProps = sandbox && sandbox.renderer ? sandbox.renderer.properties.get(portalGridTex) : null;
-                const glGridTex = gridTexProps ? gridTexProps.__webglTexture : null;
-                if (gl && glGridTex) {
-                    const rowCount = maxTileRow - minTileRow + 1;
-                    const subView = portalGridData.subarray(minTileRow * 1024 * 4, (maxTileRow + 1) * 1024 * 4);
-                    const prevTex = gl.getParameter(gl.TEXTURE_BINDING_2D);
-                    const prevAlign = gl.getParameter(gl.UNPACK_ALIGNMENT);
-                    const prevFlipY = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL);
-                    gl.bindTexture(gl.TEXTURE_2D, glGridTex);
-                    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-                    if (prevFlipY) gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-                    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, minTileRow, 1024, rowCount, gl.RGBA, gl.FLOAT, subView);
-                    if (prevFlipY) gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, prevFlipY);
-                    gl.pixelStorei(gl.UNPACK_ALIGNMENT, prevAlign);
-                    gl.bindTexture(gl.TEXTURE_2D, prevTex);
-                } else {
-                    portalGridTex.needsUpdate = true;
-                }
-            }
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+            geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            geo.setIndex(new THREE.BufferAttribute(indices, 1));
+            geo.userData = { isCubeSphere: true, faceSegs: n, faces: 6 };
+            geo.computeBoundingBox();
+            geo.computeBoundingSphere();
+            return geo;
         }
 
-        // High-Resolution Smooth Macro Planetary Shell
+        // High-Resolution Smooth Macro Planetary Shell (6-Face Spherified Cube-Sphere)
         function buildMacroCrust(scene) {
             if (planetaryMacroShell) {
                 scene.remove(planetaryMacroShell);
@@ -264,19 +527,9 @@
             }
             macroRaycastGrid = null;
 
-            const geo = new THREE.SphereGeometry(currentRadius, macroSegments, macroSegments);
+            const faceSegs = Math.max(8, Math.round(macroSegments / 3));
+            const geo = buildCubeSphereGeometry(faceSegs, evalMacroRadiusAt);
             const pos = geo.attributes.position;
-
-            for (let i = 0; i < pos.count; i++) {
-                const vx = pos.getX(i);
-                const vy = pos.getY(i);
-                const vz = pos.getZ(i);
-                const len = Math.sqrt(vx * vx + vy * vy + vz * vz) || 1.0;
-                const scale = evalMacroRadiusAt(vx, vy, vz) / len;
-                pos.setXYZ(i, vx * scale, vy * scale, vz * scale);
-            }
-            geo.computeVertexNormals();
-            geo.computeBoundingBox();
 
             // Build 8x8x8 spatial triangle grid for fast portal-aware customRaycast
             const bbox = geo.boundingBox;
@@ -1107,14 +1360,7 @@
                             const dist = ro.distanceTo(hitPt);
                             if (dist < raycaster.near || dist > raycaster.far || dist >= bestDist) continue;
 
-                            let insideCutout = false;
-                            for (let p = 0; p < portalHoles.length; p++) {
-                                if (hitPt.distanceToSquared(portalHoles[p].point) < portalHoles[p].radiusSq) {
-                                    insideCutout = true;
-                                    break;
-                                }
-                            }
-                            if (insideCutout) continue;
+                            if (isPointInsideClusteredPortalCPU(hitPt)) continue;
 
                             _rcTriHelper.set(_rcTriA, _rcTriB, _rcTriC);
                             _rcTriHelper.getNormal(_rcTriNorm);
@@ -1141,8 +1387,7 @@
                 for (let i = 0; i < hits.length; i++) {
                     const h = hits[i];
                     if (h.object === planetaryMacroShell) {
-                        const insideCutout = portalHoles.some(p => h.point.distanceToSquared(p.point) < p.radiusSq);
-                        if (insideCutout) continue; // Ignore discarded portal pixels
+                        if (isPointInsideClusteredPortalCPU(h.point)) continue; // Ignore discarded portal pixels
                     }
                     return h;
                 }
@@ -1194,6 +1439,22 @@
             }
         });
         batchManager.setScene(sandbox.scene);
+
+        window.__POC3_PORTAL_API__ = {
+            registerPortalHole,
+            clearPortalGrid,
+            isPointInsideClusteredPortalCPU,
+            evalMacroRadiusAt,
+            portalGridData,
+            portalListData,
+            portalSlotCells,
+            portalSlotData,
+            MAX_PORTALS,
+            PORTAL_GRID_RES,
+            getNextPortalIndex: () => nextPortalIndex,
+            setNextPortalIndex: (v) => { nextPortalIndex = v; },
+            getMacroShell: () => planetaryMacroShell
+        };
 
         currentRadius = sandbox.currentRadius;
         applyQualityConfigPoC3(sandbox.currentQuality);

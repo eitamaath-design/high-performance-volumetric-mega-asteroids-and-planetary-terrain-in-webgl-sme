@@ -113,33 +113,43 @@ export function createTriplanarAsteroidMaterial(options = {}) {
             uniform float uUsePortalTex;
             uniform float uPortalDomainHalf;
 
-            bool checkPortalId(float id, vec3 worldPos) {
-                if (id <= 0.0) return false;
+            float evalPortalSignedDist(float id, vec3 worldPos) {
+                if (id <= 0.0) return 1e9;
                 float idx = id - 1.0;
                 vec2 listUV = vec2(mod(idx, 64.0) + 0.5, floor(idx / 64.0) + 0.5) / 64.0;
                 vec4 portal = texture2D(uPortalListTex, listUV);
-                return (portal.w > 0.0 && distance(worldPos, portal.xyz) < portal.w);
+                if (portal.w <= 0.0) return 1e9;
+                return distance(worldPos, portal.xyz) - portal.w;
             }
 
-            bool isInsideClusteredPortal(vec3 worldPos) {
+            float evalClusteredPortalEdgeDist(vec3 worldPos) {
                 vec3 uvw = (worldPos + uPortalDomainHalf) / (2.0 * uPortalDomainHalf);
-                if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) return false;
+                if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) return 1e9;
                 vec3 cell = clamp(floor(uvw * 32.0), vec3(0.0), vec3(31.0));
                 float baseX = (mod(cell.z, 8.0) * 32.0 + cell.x) * 4.0;
                 float baseY = floor(cell.z / 8.0) * 32.0 + cell.y;
+                float minDist = 1e9;
                 for (int t = 0; t < 4; t++) {
                     vec2 gridUV = vec2(baseX + float(t) + 0.5, baseY + 0.5) / vec2(1024.0, 128.0);
                     vec4 ids = texture2D(uPortalGridTex, gridUV);
-                    if (ids.x <= 0.0) return false;
-                    if (checkPortalId(ids.x, worldPos)) return true;
-                    if (ids.y <= 0.0) return false;
-                    if (checkPortalId(ids.y, worldPos)) return true;
-                    if (ids.z <= 0.0) return false;
-                    if (checkPortalId(ids.z, worldPos)) return true;
-                    if (ids.w <= 0.0) return false;
-                    if (checkPortalId(ids.w, worldPos)) return true;
+                    if (ids.x <= 0.0) break;
+                    float d0 = evalPortalSignedDist(ids.x, worldPos);
+                    if (d0 < 0.0) return d0;
+                    minDist = min(minDist, d0);
+                    if (ids.y <= 0.0) break;
+                    float d1 = evalPortalSignedDist(ids.y, worldPos);
+                    if (d1 < 0.0) return d1;
+                    minDist = min(minDist, d1);
+                    if (ids.z <= 0.0) break;
+                    float d2 = evalPortalSignedDist(ids.z, worldPos);
+                    if (d2 < 0.0) return d2;
+                    minDist = min(minDist, d2);
+                    if (ids.w <= 0.0) break;
+                    float d3 = evalPortalSignedDist(ids.w, worldPos);
+                    if (d3 < 0.0) return d3;
+                    minDist = min(minDist, d3);
                 }
-                return false;
+                return minDist;
             }
             `;
         }
@@ -203,15 +213,19 @@ export function createTriplanarAsteroidMaterial(options = {}) {
         let clipReplace = `#include <clipping_planes_fragment>`;
         if (hasPortals) {
             clipReplace += `
+            float portalEdgeDist = 1e9;
             if (uUsePortalTex > 0.5) {
-                if (isInsideClusteredPortal(vTriWorldPos)) {
+                portalEdgeDist = evalClusteredPortalEdgeDist(vTriWorldPos);
+                if (portalEdgeDist < 0.0) {
                     discard;
                 }
             } else {
                 for (int i = 0; i < 48; i++) {
                     if (i >= uPortalCount) break;
-                    if (uPortals[i].w > 0.0 && distance(vTriWorldPos, uPortals[i].xyz) < uPortals[i].w * 0.90) {
-                        discard;
+                    if (uPortals[i].w > 0.0) {
+                        float pd = distance(vTriWorldPos, uPortals[i].xyz) - uPortals[i].w * 0.90;
+                        if (pd < 0.0) discard;
+                        portalEdgeDist = min(portalEdgeDist, pd);
                     }
                 }
             }
@@ -262,6 +276,13 @@ export function createTriplanarAsteroidMaterial(options = {}) {
             }
 
             diffuseColor.rgb = surfaceAlbedo * (0.85 + 0.3 * fbmMicro);
+            ${hasPortals ? `
+            float portalRimWidth = clamp(uAsteroidRadius * 0.005, 8.0, 22.0);
+            if (portalEdgeDist < portalRimWidth) {
+                float rimBevelAO = mix(0.42, 1.0, smoothstep(0.0, portalRimWidth, portalEdgeDist));
+                diffuseColor.rgb *= rimBevelAO;
+            }
+            ` : ''}
         `;
 
         const normalReplace = `
