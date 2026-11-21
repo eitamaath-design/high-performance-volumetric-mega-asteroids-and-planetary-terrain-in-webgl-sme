@@ -40,6 +40,7 @@ import {
 export function createTriplanarAsteroidMaterial(options = {}) {
     const vertexColors = options.vertexColors !== undefined ? options.vertexColors : true;
     const hasPortals = Boolean(options.hasPortals);
+    const useMatWeights = Boolean(options.useMatWeights);
     const defaultRadius = options.radius || 2800.0;
 
     const uniforms = {
@@ -65,7 +66,8 @@ export function createTriplanarAsteroidMaterial(options = {}) {
     mat.userData.shaderUniforms = uniforms;
     mat.userData.isTriplanarAsteroidMaterial = true;
     mat.userData.defaultSide = defaultSide;
-    mat.customProgramCacheKey = () => `triplanar-asteroid-${vertexColors ? 'vc' : 'nc'}-${hasPortals ? 'portals' : 'solid'}`;
+    mat.userData.useMatWeights = useMatWeights;
+    mat.customProgramCacheKey = () => `triplanar-asteroid-${vertexColors ? 'vc' : 'nc'}-${hasPortals ? 'portals' : 'solid'}-${useMatWeights ? 'mw' : 'nomw'}`;
 
     mat.onBeforeCompile = (shader) => {
         shader.uniforms.uAsteroidRadius = uniforms.uAsteroidRadius;
@@ -78,25 +80,27 @@ export function createTriplanarAsteroidMaterial(options = {}) {
             shader.uniforms.uPortalDomainHalf = uniforms.uPortalDomainHalf;
         }
 
-        shader.vertexShader = shader.vertexShader
-            .replace(
-                '#include <common>',
-                `#include <common>
+        const vertHeader = `#include <common>
                 varying vec3 vTriWorldPos;
-                varying vec3 vTriWorldNorm;`
-            )
-            .replace(
-                '#include <worldpos_vertex>',
-                `#include <worldpos_vertex>
+                varying vec3 vTriWorldNorm;${useMatWeights ? `
+                attribute vec3 aMatWeights;
+                varying vec3 vMatWeights;` : ''}`;
+
+        const vertWorldPos = `#include <worldpos_vertex>
                 vec4 triWp = modelMatrix * vec4( transformed, 1.0 );
                 vTriWorldPos = triWp.xyz;
-                vTriWorldNorm = normalize( mat3( modelMatrix ) * objectNormal );`
-            );
+                vTriWorldNorm = normalize( mat3( modelMatrix ) * objectNormal );${useMatWeights ? `
+                vMatWeights = aMatWeights;` : ''}`;
+
+        shader.vertexShader = shader.vertexShader
+            .replace('#include <common>', vertHeader)
+            .replace('#include <worldpos_vertex>', vertWorldPos);
 
         let fragHeader = `
             #include <common>
             varying vec3 vTriWorldPos;
             varying vec3 vTriWorldNorm;
+            ${useMatWeights ? 'varying vec3 vMatWeights;' : ''}
             uniform float uAsteroidRadius;
         `;
 
@@ -233,10 +237,15 @@ export function createTriplanarAsteroidMaterial(options = {}) {
             float triIsOre = 0.0;
             float triHexEdge = 1.0;
 
+            ${useMatWeights ? `
+                triIsArmor = smoothstep(0.15, 0.55, vMatWeights.z);
+                triIsOre = smoothstep(0.15, 0.55, vMatWeights.y) * (1.0 - triIsArmor);
+            ` : `
             #if defined( USE_COLOR )
                 triIsArmor = smoothstep(0.60, 0.85, vColor.b) * smoothstep(0.55, 0.78, vColor.g) * (1.0 - smoothstep(0.25, 0.55, vColor.r));
                 triIsOre = smoothstep(0.75, 0.92, vColor.r) * (1.0 - smoothstep(0.25, 0.50, vColor.b));
             #endif
+            `}
 
             vec3 surfaceAlbedo = procRock;
             float oreMask = triIsOre * smoothstep(0.45, 0.75, fbmMicro + 0.25 * triFbm(triPos * 0.015));
@@ -308,6 +317,30 @@ export function createTriplanarAsteroidMaterial(options = {}) {
     };
 
     return mat;
+}
+
+export function distPointToSegmentSq(px, py, pz, ax, ay, az, bx, by, bz) {
+    const abx = bx - ax;
+    const aby = by - ay;
+    const abz = bz - az;
+    const apx = px - ax;
+    const apy = py - ay;
+    const apz = pz - az;
+    const abLenSq = abx * abx + aby * aby + abz * abz;
+    if (abLenSq <= 1e-12) {
+        return apx * apx + apy * apy + apz * apz;
+    }
+    let t = (apx * abx + apy * aby + apz * abz) / abLenSq;
+    if (t < 0.0) t = 0.0;
+    else if (t > 1.0) t = 1.0;
+    const dx = apx - abx * t;
+    const dy = apy - aby * t;
+    const dz = apz - abz * t;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+export function distPointToSegment(px, py, pz, ax, ay, az, bx, by, bz) {
+    return Math.sqrt(distPointToSegmentSq(px, py, pz, ax, ay, az, bx, by, bz));
 }
 
 export function findSurfacePoint(evalDensityFn, dir, minR, maxR) {
@@ -403,6 +436,7 @@ export class PlanetaryBaseSandbox {
         this.showCollisionOverlay = true;
 
         this.isSpaceDown = false;
+        this._lastToolHit = null;
         this.mousePos = new THREE.Vector2();
         this.raycaster = new THREE.Raycaster();
         this.lastCarveTick = 0;
@@ -1063,6 +1097,7 @@ export class PlanetaryBaseSandbox {
             this.keys[k] = false;
             if (e.code === 'Space' || e.key === ' ') {
                 this.isSpaceDown = false;
+                this._lastToolHit = null;
                 this.laserBeam.visible = false;
                 this.sparkPoints.visible = false;
             }
@@ -1071,6 +1106,7 @@ export class PlanetaryBaseSandbox {
         window.addEventListener('blur', () => {
             this.keys = {};
             this.isSpaceDown = false;
+            this._lastToolHit = null;
             this.laserBeam.visible = false;
             this.sparkPoints.visible = false;
         });
@@ -1078,6 +1114,7 @@ export class PlanetaryBaseSandbox {
 
     setActiveTool(tool) {
         this.activeTool = tool;
+        this._lastToolHit = null;
         const toolBtns = this._hudEls?.toolBtns || [];
         toolBtns.forEach(b => {
             const isMatch = b.getAttribute('data-tool') === tool;
@@ -1104,6 +1141,7 @@ export class PlanetaryBaseSandbox {
 
     async setQuality(qualityKey) {
         if (!['low', 'medium', 'high', 'ultra'].includes(qualityKey)) return;
+        this._lastToolHit = null;
         this.currentQuality = qualityKey;
         this.syncQualityButtons();
         if (this.config.onQualityChange) {
@@ -1113,6 +1151,7 @@ export class PlanetaryBaseSandbox {
     }
 
     async setScale(scaleKey) {
+        this._lastToolHit = null;
         this.currentScaleKey = scaleKey;
         const scales = {
             '10p': { r: 2800, name: '10 Players (R=2800u)' },
@@ -1152,6 +1191,7 @@ export class PlanetaryBaseSandbox {
     }
 
     toggleFlightMode() {
+        this._lastToolHit = null;
         this.isFlightMode = !this.isFlightMode;
         const btn = this._hudEls?.btnToggleFlight;
         if (this.isFlightMode) {
@@ -1283,7 +1323,14 @@ export class PlanetaryBaseSandbox {
 
         dom.addEventListener('pointerleave', () => {
             this._brushDirty = false;
+            this._lastToolHit = null;
             if (this.brushCursorMesh) this.brushCursorMesh.visible = false;
+        });
+
+        dom.addEventListener('pointerup', () => {
+            if (!this.isSpaceDown) {
+                this._lastToolHit = null;
+            }
         });
 
         this.controls.addEventListener('change', () => {
@@ -1492,6 +1539,7 @@ export class PlanetaryBaseSandbox {
         try {
             const hit = forcedHit || this.performRaycast();
             if (!hit) {
+                this._lastToolHit = null;
                 this.laserBeam.visible = false;
                 this.sparkPoints.visible = false;
                 this.alignmentMarker.visible = false;
@@ -1534,8 +1582,18 @@ export class PlanetaryBaseSandbox {
 
             if (this.activeTool === 'raider' && isReinforced) {
                 // Blocked by reinforced bulkhead!
+                this._lastToolHit = null;
                 this.flashRaiderAlert();
                 return;
+            }
+
+            let prevHit = null;
+            if (options && options.prevHit) {
+                if (options.prevHit.distanceTo(hitPoint) <= this.brushRadius * 4.0) {
+                    prevHit = options.prevHit.clone();
+                }
+            } else if (this._lastToolHit && this._lastToolHit.distanceTo(hitPoint) <= this.brushRadius * 4.0) {
+                prevHit = this._lastToolHit.clone();
             }
 
             const t0 = performance.now();
@@ -1547,23 +1605,27 @@ export class PlanetaryBaseSandbox {
                 recordedOpType = CARVE_OP_TYPE.carve;
                 recordedMatId = 0;
                 if (this.config.onCarve) {
-                    toolResult = await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'carve');
+                    toolResult = await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'carve', prevHit);
                 }
+                this._lastToolHit = hitPoint.clone();
             } else if (this.activeTool === 'reinforce') {
                 recordedOpType = CARVE_OP_TYPE.reinforce;
                 recordedMatId = 3;
                 if (this.config.onReinforce) {
-                    toolResult = await this.config.onReinforce(hitPoint, hitNormal, this.brushRadius);
+                    toolResult = await this.config.onReinforce(hitPoint, hitNormal, this.brushRadius, prevHit);
                 }
+                this._lastToolHit = hitPoint.clone();
             } else if (this.activeTool === 'breach') {
                 recordedOpType = CARVE_OP_TYPE.breach;
                 recordedMatId = 0;
                 if (this.config.onBreach) {
-                    toolResult = await this.config.onBreach(hitPoint, hitNormal, this.brushRadius);
+                    toolResult = await this.config.onBreach(hitPoint, hitNormal, this.brushRadius, prevHit);
                 } else if (this.config.onCarve) {
-                    toolResult = await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'breach');
+                    toolResult = await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'breach', prevHit);
                 }
+                this._lastToolHit = hitPoint.clone();
             } else if (this.activeTool === 'machinery') {
+                this._lastToolHit = null;
                 this.placeMachineryAt(hitPoint, hitNormal);
             }
 
@@ -1995,6 +2057,9 @@ export class PlanetaryBaseSandbox {
     }
 
     simulateRandomCarve(options = {}) {
+        if (!options || !options.prevHit) {
+            this._lastToolHit = null;
+        }
         // Raycast slightly jittered near viewport center so carve always hits actual asteroid geometry
         const savedMouse = this.mousePos.clone();
         this.mousePos.set((Math.random() - 0.5) * 0.16, (Math.random() - 0.5) * 0.16);

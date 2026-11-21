@@ -30,6 +30,7 @@ export class ChunkBatchManager {
             posArray: null,
             normArray: null,
             colArray: null,
+            matWeightArray: null,
             idxArray: null,
             vertexCapacity: 0,
             indexCapacity: 0,
@@ -74,7 +75,7 @@ export class ChunkBatchManager {
         return (x >= 0 ? 1 : 0) | (y >= 0 ? 2 : 0) | (z >= 0 ? 4 : 0);
     }
 
-    upsertChunk(key, octantPos, positions, normals, colors, indices) {
+    upsertChunk(key, octantPos, positions, normals, colors, indices, matWeights = null) {
         if (!positions || !indices || positions.length === 0 || indices.length === 0) {
             this.removeChunk(key);
             return false;
@@ -107,6 +108,7 @@ export class ChunkBatchManager {
             positions,
             normals,
             colors,
+            matWeights,
             indices,
             vertCount: positions.length / 3,
             idxCount: indices.length,
@@ -192,17 +194,21 @@ export class ChunkBatchManager {
                 bucket.posArray = new Float32Array(nextCap * 3);
                 bucket.normArray = new Float32Array(nextCap * 3);
                 bucket.colArray = new Float32Array(nextCap * 3);
+                bucket.matWeightArray = new Float32Array(nextCap * 3);
 
                 const posAttr = new THREE.BufferAttribute(bucket.posArray, 3);
                 const normAttr = new THREE.BufferAttribute(bucket.normArray, 3);
                 const colAttr = new THREE.BufferAttribute(bucket.colArray, 3);
+                const matWeightAttr = new THREE.BufferAttribute(bucket.matWeightArray, 3);
                 posAttr.setUsage(THREE.DynamicDrawUsage);
                 normAttr.setUsage(THREE.DynamicDrawUsage);
                 colAttr.setUsage(THREE.DynamicDrawUsage);
+                matWeightAttr.setUsage(THREE.DynamicDrawUsage);
 
                 geo.setAttribute('position', posAttr);
                 geo.setAttribute('normal', normAttr);
                 geo.setAttribute('color', colAttr);
+                geo.setAttribute('aMatWeights', matWeightAttr);
                 reallocatedVerts = true;
                 this.stats.vboAllocations++;
             }
@@ -223,6 +229,7 @@ export class ChunkBatchManager {
             const posArray = bucket.posArray;
             const normArray = bucket.normArray;
             const colArray = bucket.colArray;
+            const matWeightArray = bucket.matWeightArray;
             const idxArray = bucket.idxArray;
 
             let vOffset = 0;
@@ -232,6 +239,16 @@ export class ChunkBatchManager {
                 posArray.set(entry.positions, vOff3);
                 normArray.set(entry.normals, vOff3);
                 colArray.set(entry.colors, vOff3);
+                if (entry.matWeights && entry.matWeights.length === entry.vertCount * 3) {
+                    matWeightArray.set(entry.matWeights, vOff3);
+                } else {
+                    for (let k = 0; k < entry.vertCount; k++) {
+                        const mo = vOff3 + k * 3;
+                        matWeightArray[mo] = 1.0;
+                        matWeightArray[mo + 1] = 0.0;
+                        matWeightArray[mo + 2] = 0.0;
+                    }
+                }
 
                 const srcIdx = entry.indices;
                 const idxLen = entry.idxCount;
@@ -246,6 +263,7 @@ export class ChunkBatchManager {
             const posAttr = geo.attributes.position;
             const normAttr = geo.attributes.normal;
             const colAttr = geo.attributes.color;
+            const matWeightAttr = geo.attributes.aMatWeights;
             const idxAttr = geo.index;
 
             if (!reallocatedVerts) {
@@ -257,11 +275,14 @@ export class ChunkBatchManager {
                     normAttr.addUpdateRange(0, floatCount);
                     colAttr.clearUpdateRanges();
                     colAttr.addUpdateRange(0, floatCount);
+                    matWeightAttr.clearUpdateRanges();
+                    matWeightAttr.addUpdateRange(0, floatCount);
                 }
             }
             posAttr.needsUpdate = true;
             normAttr.needsUpdate = true;
             colAttr.needsUpdate = true;
+            matWeightAttr.needsUpdate = true;
 
             if (!reallocatedIndices && typeof idxAttr.clearUpdateRanges === 'function') {
                 idxAttr.clearUpdateRanges();
@@ -345,6 +366,7 @@ export class ChunkBatchManager {
                 b.posArray = null;
                 b.normArray = null;
                 b.colArray = null;
+                b.matWeightArray = null;
                 b.idxArray = null;
                 b.vertexCapacity = 0;
                 b.indexCapacity = 0;

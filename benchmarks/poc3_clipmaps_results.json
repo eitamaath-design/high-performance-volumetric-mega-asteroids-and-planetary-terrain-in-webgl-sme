@@ -8,13 +8,13 @@
   "avgFrameTime": 16.71,
   "p99FrameTime": 16.8,
   "avgMainThreadWorkMs": 0.35,
-  "p99MainThreadWorkMs": 8.8,
-  "avgCarveLatency": 17.42,
-  "avgMainThreadCarveMs": 2.72,
+  "p99MainThreadWorkMs": 10.4,
+  "avgCarveLatency": 17.37,
+  "avgMainThreadCarveMs": 2.73,
   "sampledFrames": 421,
-  "triangles": 62161,
+  "triangles": 63004,
   "drawCalls": 17,
-  "heapMemoryMB": 26.32,
+  "heapMemoryMB": 23.37,
   "visualCollisionError": "0.00u",
   "visualCollisionErrorNumeric": 0
 }

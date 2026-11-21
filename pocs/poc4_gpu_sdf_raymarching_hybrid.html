@@ -11,7 +11,7 @@
 <body>
     <script type="module">
         import * as THREE from './vendor/three.module.js';
-        import { PlanetaryBaseSandbox, findSurfacePoint } from './shared/planetary_base_sandbox.js';
+        import { PlanetaryBaseSandbox, findSurfacePoint, distPointToSegment } from './shared/planetary_base_sandbox.js';
         import { FastNoise3D } from './shared/deterministic_noise.js';
 
         const noise = new FastNoise3D(999);
@@ -1029,15 +1029,27 @@
             scene.add(volumeBoxMesh);
         }
 
-        function carveSpherePoC4(hitPoint, brushRadius, mode = 'carve') {
+        function carveSpherePoC4(hitPoint, brushRadius, mode = 'carve', prevHit = null) {
             let modified = false;
+            const bx = hitPoint.x, by = hitPoint.y, bz = hitPoint.z;
+            const hasCapsule = Boolean(prevHit && prevHit.distanceTo(hitPoint) <= brushRadius * 4.0 && prevHit.distanceToSquared(hitPoint) > 1e-4);
+            const ax = hasCapsule ? prevHit.x : bx;
+            const ay = hasCapsule ? prevHit.y : by;
+            const az = hasCapsule ? prevHit.z : bz;
+            const bMinX = hasCapsule ? Math.min(ax, bx) : bx;
+            const bMaxX = hasCapsule ? Math.max(ax, bx) : bx;
+            const bMinY = hasCapsule ? Math.min(ay, by) : by;
+            const bMaxY = hasCapsule ? Math.max(ay, by) : by;
+            const bMinZ = hasCapsule ? Math.min(az, bz) : bz;
+            const bMaxZ = hasCapsule ? Math.max(az, bz) : bz;
+
             const pad = brushRadius + VOXEL_SPACING * 1.5;
-            const minX = Math.max(0, Math.floor(((hitPoint.x - pad) + DOMAIN_HALF) / VOXEL_SPACING));
-            const maxX = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.x + pad) + DOMAIN_HALF) / VOXEL_SPACING));
-            const minY = Math.max(0, Math.floor(((hitPoint.y - pad) + DOMAIN_HALF) / VOXEL_SPACING));
-            const maxY = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.y + pad) + DOMAIN_HALF) / VOXEL_SPACING));
-            const minZ = Math.max(0, Math.floor(((hitPoint.z - pad) + DOMAIN_HALF) / VOXEL_SPACING));
-            const maxZ = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.z + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const minX = Math.max(0, Math.floor(((bMinX - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxX = Math.min(VOL_RES - 1, Math.ceil(((bMaxX + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const minY = Math.max(0, Math.floor(((bMinY - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxY = Math.min(VOL_RES - 1, Math.ceil(((bMaxY + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const minZ = Math.max(0, Math.floor(((bMinZ - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxZ = Math.min(VOL_RES - 1, Math.ceil(((bMaxZ + pad) + DOMAIN_HALF) / VOXEL_SPACING));
 
             let dMinX = maxX, dMaxX = minX, dMinY = maxY, dMaxY = minY, dMinZ = maxZ, dMaxZ = minZ;
             const volRes2 = VOL_RES * VOL_RES;
@@ -1049,7 +1061,9 @@
                     const yzOff = zOff + y * VOL_RES;
                     for (let x = minX; x <= maxX; x++) {
                         const wx = -DOMAIN_HALF + (x + 0.5) * VOXEL_SPACING;
-                        const distToHit = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                        const distToHit = hasCapsule
+                            ? distPointToSegment(wx, wy, wz, ax, ay, az, bx, by, bz)
+                            : Math.hypot(wx - bx, wy - by, wz - bz);
                         const idx4 = (x + yzOff) * 4;
                         let cellModified = false;
 
@@ -1095,16 +1109,28 @@
             }
         }
 
-        function reinforceSpherePoC4(hitPoint, brushRadius) {
+        function reinforceSpherePoC4(hitPoint, brushRadius, prevHit = null) {
             let modified = false;
+            const bx = hitPoint.x, by = hitPoint.y, bz = hitPoint.z;
+            const hasCapsule = Boolean(prevHit && prevHit.distanceTo(hitPoint) <= brushRadius * 4.0 && prevHit.distanceToSquared(hitPoint) > 1e-4);
+            const ax = hasCapsule ? prevHit.x : bx;
+            const ay = hasCapsule ? prevHit.y : by;
+            const az = hasCapsule ? prevHit.z : bz;
+            const bMinX = hasCapsule ? Math.min(ax, bx) : bx;
+            const bMaxX = hasCapsule ? Math.max(ax, bx) : bx;
+            const bMinY = hasCapsule ? Math.min(ay, by) : by;
+            const bMaxY = hasCapsule ? Math.max(ay, by) : by;
+            const bMinZ = hasCapsule ? Math.min(az, bz) : bz;
+            const bMaxZ = hasCapsule ? Math.max(az, bz) : bz;
+
             const effRadius = brushRadius + VOXEL_SPACING * 0.55;
             const pad = effRadius + VOXEL_SPACING * 1.5;
-            const minX = Math.max(0, Math.floor(((hitPoint.x - pad) + DOMAIN_HALF) / VOXEL_SPACING));
-            const maxX = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.x + pad) + DOMAIN_HALF) / VOXEL_SPACING));
-            const minY = Math.max(0, Math.floor(((hitPoint.y - pad) + DOMAIN_HALF) / VOXEL_SPACING));
-            const maxY = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.y + pad) + DOMAIN_HALF) / VOXEL_SPACING));
-            const minZ = Math.max(0, Math.floor(((hitPoint.z - pad) + DOMAIN_HALF) / VOXEL_SPACING));
-            const maxZ = Math.min(VOL_RES - 1, Math.ceil(((hitPoint.z + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const minX = Math.max(0, Math.floor(((bMinX - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxX = Math.min(VOL_RES - 1, Math.ceil(((bMaxX + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const minY = Math.max(0, Math.floor(((bMinY - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxY = Math.min(VOL_RES - 1, Math.ceil(((bMaxY + pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const minZ = Math.max(0, Math.floor(((bMinZ - pad) + DOMAIN_HALF) / VOXEL_SPACING));
+            const maxZ = Math.min(VOL_RES - 1, Math.ceil(((bMaxZ + pad) + DOMAIN_HALF) / VOXEL_SPACING));
 
             let dMinX = maxX, dMaxX = minX, dMinY = maxY, dMaxY = minY, dMinZ = maxZ, dMaxZ = minZ;
             const volRes2 = VOL_RES * VOL_RES;
@@ -1116,7 +1142,9 @@
                     const yzOff = zOff + y * VOL_RES;
                     for (let x = minX; x <= maxX; x++) {
                         const wx = -DOMAIN_HALF + (x + 0.5) * VOXEL_SPACING;
-                        const distToHit = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                        const distToHit = hasCapsule
+                            ? distPointToSegment(wx, wy, wz, ax, ay, az, bx, by, bz)
+                            : Math.hypot(wx - bx, wy - by, wz - bz);
                         if (distToHit <= effRadius) {
                             const idx4 = (x + yzOff) * 4;
                             const curD = volumeData[idx4] * DOMAIN_HALF;
@@ -1465,12 +1493,12 @@
                 };
             },
 
-            onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
-                carveSpherePoC4(hitPoint, brushRadius, mode);
+            onCarve: async (hitPoint, hitNormal, brushRadius, mode, prevHit = null) => {
+                carveSpherePoC4(hitPoint, brushRadius, mode, prevHit);
             },
 
-            onReinforce: async (hitPoint, hitNormal, brushRadius) => {
-                reinforceSpherePoC4(hitPoint, brushRadius);
+            onReinforce: async (hitPoint, hitNormal, brushRadius, prevHit = null) => {
+                reinforceSpherePoC4(hitPoint, brushRadius, prevHit);
             },
 
             checkMaterialAtHit: (point, hit) => {

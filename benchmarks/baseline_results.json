@@ -1,13 +1,13 @@
 {
   "poc": "rockets_baseline",
   "totalFrames": 450,
-  "avgFrameTimeMs": 17,
+  "avgFrameTimeMs": 16.85,
   "p99FrameTimeMs": 16.8,
-  "avgFps": 58.8,
+  "avgFps": 59.3,
   "trianglesCount": 6936,
   "drawCalls": 1,
   "carveCount": 6,
-  "avgCarveDurationMs": 1.63,
+  "avgCarveDurationMs": 1.55,
   "heapMemoryMb": 28.04,
   "visualCollisionError": "> 30.00u"
 }

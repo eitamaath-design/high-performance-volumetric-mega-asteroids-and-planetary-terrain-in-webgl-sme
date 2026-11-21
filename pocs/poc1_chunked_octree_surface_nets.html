@@ -11,7 +11,7 @@
 <body>
     <script type="module">
         import * as THREE from './vendor/three.module.js';
-        import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint } from './shared/planetary_base_sandbox.js';
+        import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint, distPointToSegmentSq } from './shared/planetary_base_sandbox.js';
         import { MeshingWorkerPool } from './shared/meshing_worker_pool.js';
         import { ChunkBatchManager } from './shared/chunk_batch_manager.js';
         import { FastNoise3D } from './shared/deterministic_noise.js';
@@ -72,11 +72,40 @@
         window.__POC1_GET_LEAVES__ = () => collectLeaves();
 
         // Procedural 3D Triplanar Rock + Ore + Hex Titanium Bulkhead Material
-        const chunkMaterial = createTriplanarAsteroidMaterial({ vertexColors: true, radius: currentRadius });
+        const chunkMaterial = createTriplanarAsteroidMaterial({ vertexColors: true, useMatWeights: true, radius: currentRadius });
         const batchManager = new ChunkBatchManager(null, chunkMaterial);
         window.__POC1_BATCH_MANAGER__ = batchManager;
 
-        function nodeIntersectsSphere(node, cx, cy, cz, r) {
+        function makeEditOp(type, hitPoint, brushRadius, mode = 'carve', prevHit = null) {
+            const bx = hitPoint.x, by = hitPoint.y, bz = hitPoint.z;
+            let hasCapsule = false;
+            let ax = bx, ay = by, az = bz;
+            if (prevHit) {
+                const dx = bx - prevHit.x, dy = by - prevHit.y, dz = bz - prevHit.z;
+                const segLenSq = dx * dx + dy * dy + dz * dz;
+                const maxSweep = brushRadius * 4.0;
+                if (segLenSq > 1e-4 && segLenSq <= maxSweep * maxSweep) {
+                    hasCapsule = true;
+                    ax = prevHit.x; ay = prevHit.y; az = prevHit.z;
+                }
+            }
+            return {
+                type,
+                mode,
+                x: bx, y: by, z: bz,
+                ax, ay, az,
+                hasCapsule,
+                minX: hasCapsule ? Math.min(ax, bx) : bx,
+                maxX: hasCapsule ? Math.max(ax, bx) : bx,
+                minY: hasCapsule ? Math.min(ay, by) : by,
+                maxY: hasCapsule ? Math.max(ay, by) : by,
+                minZ: hasCapsule ? Math.min(az, bz) : bz,
+                maxZ: hasCapsule ? Math.max(az, bz) : bz,
+                radius: brushRadius
+            };
+        }
+
+        function nodeIntersectsOp(node, op, r) {
             const halo = 2.0 * node.cellSize;
             const minX = node.minBounds.x - halo;
             const maxX = node.maxBounds.x + halo;
@@ -84,23 +113,37 @@
             const maxY = node.maxBounds.y + halo;
             const minZ = node.minBounds.z - halo;
             const maxZ = node.maxBounds.z + halo;
-            const dx = cx < minX ? minX - cx : (cx > maxX ? cx - maxX : 0);
-            const dy = cy < minY ? minY - cy : (cy > maxY ? cy - maxY : 0);
-            const dz = cz < minZ ? minZ - cz : (cz > maxZ ? cz - maxZ : 0);
-            return (dx * dx + dy * dy + dz * dz) <= r * r;
+            if (!op.hasCapsule) {
+                const dx = op.x < minX ? minX - op.x : (op.x > maxX ? op.x - maxX : 0);
+                const dy = op.y < minY ? minY - op.y : (op.y > maxY ? op.y - maxY : 0);
+                const dz = op.z < minZ ? minZ - op.z : (op.z > maxZ ? op.z - maxZ : 0);
+                return (dx * dx + dy * dy + dz * dz) <= r * r;
+            }
+            return (
+                op.maxX + r >= minX && op.minX - r <= maxX &&
+                op.maxY + r >= minY && op.minY - r <= maxY &&
+                op.maxZ + r >= minZ && op.minZ - r <= maxZ
+            );
         }
 
-        function nodeBoxIntersectsSphere(node, cx, cy, cz, r) {
+        function nodeBoxIntersectsOp(node, op, r) {
             const minX = node.minBounds.x;
             const maxX = node.maxBounds.x;
             const minY = node.minBounds.y;
             const maxY = node.maxBounds.y;
             const minZ = node.minBounds.z;
             const maxZ = node.maxBounds.z;
-            const dx = cx < minX ? minX - cx : (cx > maxX ? cx - maxX : 0);
-            const dy = cy < minY ? minY - cy : (cy > maxY ? cy - maxY : 0);
-            const dz = cz < minZ ? minZ - cz : (cz > maxZ ? cz - maxZ : 0);
-            return (dx * dx + dy * dy + dz * dz) <= r * r;
+            if (!op.hasCapsule) {
+                const dx = op.x < minX ? minX - op.x : (op.x > maxX ? op.x - maxX : 0);
+                const dy = op.y < minY ? minY - op.y : (op.y > maxY ? op.y - maxY : 0);
+                const dz = op.z < minZ ? minZ - op.z : (op.z > maxZ ? op.z - maxZ : 0);
+                return (dx * dx + dy * dy + dz * dz) <= r * r;
+            }
+            return (
+                op.maxX + r >= minX && op.minX - r <= maxX &&
+                op.maxY + r >= minY && op.minY - r <= maxY &&
+                op.maxZ + r >= minZ && op.minZ - r <= maxZ
+            );
         }
 
         function splitPad(node, opRadius) {
@@ -210,7 +253,7 @@
                     let hasEdit = false;
                     for (let i = 0; i < editHistory.length; i++) {
                         const op = editHistory[i];
-                        if (nodeIntersectsSphere(this, op.x, op.y, op.z, op.radius + this.cellSize * 2.5)) {
+                        if (nodeIntersectsOp(this, op, op.radius + this.cellSize * 2.5)) {
                             hasEdit = true;
                             break;
                         }
@@ -254,7 +297,7 @@
                         let hasEdit = false;
                         for (let i = 0; i < editHistory.length; i++) {
                             const op = editHistory[i];
-                            if (nodeIntersectsSphere(this, op.x, op.y, op.z, op.radius + this.cellSize * 2.5)) {
+                            if (nodeIntersectsOp(this, op, op.radius + this.cellSize * 2.5)) {
                                 hasEdit = true;
                                 break;
                             }
@@ -339,25 +382,35 @@
                     if (op.type === 'carve') {
                         const pad = op.radius + this.cellSize * 2.5;
                         const padSq = pad * pad;
-                        const minPX = Math.max(0, Math.floor((op.x - pad - this.minBounds.x) * invCell + 2));
-                        const maxPX = Math.min(pRes - 1, Math.ceil((op.x + pad - this.minBounds.x) * invCell + 2));
-                        const minPY = Math.max(0, Math.floor((op.y - pad - this.minBounds.y) * invCell + 2));
-                        const maxPY = Math.min(pRes - 1, Math.ceil((op.y + pad - this.minBounds.y) * invCell + 2));
-                        const minPZ = Math.max(0, Math.floor((op.z - pad - this.minBounds.z) * invCell + 2));
-                        const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + pad - this.minBounds.z) * invCell + 2));
+                        const breachPad = op.radius + this.cellSize * 1.5;
+                        const breachSq = breachPad * breachPad;
+                        const isBreach = op.mode === 'breach';
+                        const minPX = Math.max(0, Math.floor((op.minX - pad - this.minBounds.x) * invCell + 2));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((op.maxX + pad - this.minBounds.x) * invCell + 2));
+                        const minPY = Math.max(0, Math.floor((op.minY - pad - this.minBounds.y) * invCell + 2));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((op.maxY + pad - this.minBounds.y) * invCell + 2));
+                        const minPZ = Math.max(0, Math.floor((op.minZ - pad - this.minBounds.z) * invCell + 2));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((op.maxZ + pad - this.minBounds.z) * invCell + 2));
                         if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
                         for (let pz = minPZ; pz <= maxPZ; pz++) {
-                            const dz = this.minBounds.z + (pz - 2) * this.cellSize - op.z;
+                            const wz = this.minBounds.z + (pz - 2) * this.cellSize;
+                            const dz = wz - op.z;
                             const zOff = pz * pRes2;
                             for (let py = minPY; py <= maxPY; py++) {
-                                const dy = this.minBounds.y + (py - 2) * this.cellSize - op.y;
+                                const wy = this.minBounds.y + (py - 2) * this.cellSize;
+                                const dy = wy - op.y;
                                 const yzOff = zOff + py * pRes;
                                 for (let px = minPX; px <= maxPX; px++) {
-                                    const dx = this.minBounds.x + (px - 2) * this.cellSize - op.x;
-                                    const dSq = dx * dx + dy * dy + dz * dz;
+                                    const wx = this.minBounds.x + (px - 2) * this.cellSize;
+                                    const dSq = op.hasCapsule
+                                        ? distPointToSegmentSq(wx, wy, wz, op.ax, op.ay, op.az, op.x, op.y, op.z)
+                                        : ((wx - op.x) * (wx - op.x) + dy * dy + dz * dz);
                                     if (dSq <= padSq) {
-                                        const carveD = op.radius - Math.sqrt(dSq);
                                         const vIdx = yzOff + px;
+                                        if (isBreach && dSq <= breachSq && this.materialData[vIdx] === 3) {
+                                            this.materialData[vIdx] = 1;
+                                        }
+                                        const carveD = op.radius - Math.sqrt(dSq);
                                         if (carveD > this.voxelData[vIdx]) {
                                             this.voxelData[vIdx] = carveD;
                                         }
@@ -367,23 +420,28 @@
                         }
                     } else if (op.type === 'reinforce') {
                         const rSq = op.radius * op.radius;
-                        const minPX = Math.max(0, Math.floor((op.x - op.radius - this.minBounds.x) * invCell + 2));
-                        const maxPX = Math.min(pRes - 1, Math.ceil((op.x + op.radius - this.minBounds.x) * invCell + 2));
-                        const minPY = Math.max(0, Math.floor((op.y - op.radius - this.minBounds.y) * invCell + 2));
-                        const maxPY = Math.min(pRes - 1, Math.ceil((op.y + op.radius - this.minBounds.y) * invCell + 2));
-                        const minPZ = Math.max(0, Math.floor((op.z - op.radius - this.minBounds.z) * invCell + 2));
-                        const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + op.radius - this.minBounds.z) * invCell + 2));
+                        const minPX = Math.max(0, Math.floor((op.minX - op.radius - this.minBounds.x) * invCell + 2));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((op.maxX + op.radius - this.minBounds.x) * invCell + 2));
+                        const minPY = Math.max(0, Math.floor((op.minY - op.radius - this.minBounds.y) * invCell + 2));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((op.maxY + op.radius - this.minBounds.y) * invCell + 2));
+                        const minPZ = Math.max(0, Math.floor((op.minZ - op.radius - this.minBounds.z) * invCell + 2));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((op.maxZ + op.radius - this.minBounds.z) * invCell + 2));
                         if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
                         for (let pz = minPZ; pz <= maxPZ; pz++) {
-                            const dz = this.minBounds.z + (pz - 2) * this.cellSize - op.z;
+                            const wz = this.minBounds.z + (pz - 2) * this.cellSize;
+                            const dz = wz - op.z;
                             const zOff = pz * pRes2;
                             for (let py = minPY; py <= maxPY; py++) {
-                                const dy = this.minBounds.y + (py - 2) * this.cellSize - op.y;
+                                const wy = this.minBounds.y + (py - 2) * this.cellSize;
+                                const dy = wy - op.y;
                                 const yzOff = zOff + py * pRes;
                                 for (let px = minPX; px <= maxPX; px++) {
-                                    const dx = this.minBounds.x + (px - 2) * this.cellSize - op.x;
+                                    const wx = this.minBounds.x + (px - 2) * this.cellSize;
+                                    const dSq = op.hasCapsule
+                                        ? distPointToSegmentSq(wx, wy, wz, op.ax, op.ay, op.az, op.x, op.y, op.z)
+                                        : ((wx - op.x) * (wx - op.x) + dy * dy + dz * dz);
                                     const vIdx = yzOff + px;
-                                    if (dx * dx + dy * dy + dz * dz <= rSq && this.voxelData[vIdx] < 0.0) {
+                                    if (dSq <= rSq && this.voxelData[vIdx] < 0.0) {
                                         this.materialData[vIdx] = 3;
                                         this.hasArmor = true;
                                     }
@@ -414,7 +472,7 @@
                     return;
                 }
                 const deferFlush = Boolean(options && options.deferFlush);
-                const { positions, normals, colors, indices } = result;
+                const { positions, normals, colors, matWeights, indices } = result;
                 if (!positions || !indices || positions.length === 0 || indices.length === 0) {
                     if (this.hasMesh) {
                         batchManager.removeChunk(this.key);
@@ -440,7 +498,7 @@
                     return;
                 }
 
-                batchManager.upsertChunk(this.key, this.center, positions, normals, colors, indices);
+                batchManager.upsertChunk(this.key, this.center, positions, normals, colors, indices, matWeights);
                 this.hasMesh = true;
                 this.lastUsedTick = ++chunkUseTick;
                 if (!deferFlush) batchManager.flush(scene);
@@ -669,7 +727,7 @@
                         } else if (
                             child.cellSize > FINE_CELL_LIMIT &&
                             child.level < MAX_SUBDIV_LEVEL &&
-                            nodeBoxIntersectsSphere(child, op.x, op.y, op.z, splitPad(child, op.radius))
+                            nodeBoxIntersectsOp(child, op, splitPad(child, op.radius))
                         ) {
                             splitChunkNode(child, op, retiredKeys, splitNodes, newLeaves);
                         } else {
@@ -709,22 +767,22 @@
             }
         }
 
-        async function carveSpherePoC1(hitPoint, brushRadius) {
+        async function carveSpherePoC1(hitPoint, brushRadius, mode = 'carve', prevHit = null) {
             return enqueueSerializedOp(async (opEpoch) => {
                 if (opEpoch !== worldEpoch) {
                     return { mainThreadMs: 0, cancelled: true };
                 }
                 const syncStart = performance.now();
-                const op = { type: 'carve', x: hitPoint.x, y: hitPoint.y, z: hitPoint.z, radius: brushRadius };
+                const op = makeEditOp('carve', hitPoint, brushRadius, mode, prevHit);
                 editHistory.push(op);
 
                 const effPad = brushRadius + Math.max(45.0, CELL_SIZE * 3.5);
-                const minCX = Math.floor((op.x - effPad) / CHUNK_SIZE);
-                const maxCX = Math.floor((op.x + effPad) / CHUNK_SIZE);
-                const minCY = Math.floor((op.y - effPad) / CHUNK_SIZE);
-                const maxCY = Math.floor((op.y + effPad) / CHUNK_SIZE);
-                const minCZ = Math.floor((op.z - effPad) / CHUNK_SIZE);
-                const maxCZ = Math.floor((op.z + effPad) / CHUNK_SIZE);
+                const minCX = Math.floor((op.minX - effPad) / CHUNK_SIZE);
+                const maxCX = Math.floor((op.maxX + effPad) / CHUNK_SIZE);
+                const minCY = Math.floor((op.minY - effPad) / CHUNK_SIZE);
+                const maxCY = Math.floor((op.maxY + effPad) / CHUNK_SIZE);
+                const minCZ = Math.floor((op.minZ - effPad) / CHUNK_SIZE);
+                const maxCZ = Math.floor((op.maxZ + effPad) / CHUNK_SIZE);
 
                 const retiredKeys = [];
                 const splitNodes = [];
@@ -734,7 +792,7 @@
 
                 function visitForCarve(node, isNewlyCreatedRoot) {
                     const reachPad = Math.max(op.radius + node.cellSize * 2.5, splitPad(node, op.radius));
-                    if (!nodeIntersectsSphere(node, op.x, op.y, op.z, reachPad)) return;
+                    if (!nodeIntersectsOp(node, op, reachPad)) return;
 
                     if (node.children !== null) {
                         for (let i = 0; i < 8; i++) {
@@ -748,13 +806,13 @@
                     if (
                         node.cellSize > FINE_CELL_LIMIT &&
                         node.level < MAX_SUBDIV_LEVEL &&
-                        nodeBoxIntersectsSphere(node, op.x, op.y, op.z, splitPad(node, op.radius))
+                        nodeBoxIntersectsOp(node, op, splitPad(node, op.radius))
                     ) {
                         splitChunkNode(node, op, retiredKeys, splitNodes, newLeaves);
                         return;
                     }
 
-                    if (!nodeIntersectsSphere(node, op.x, op.y, op.z, op.radius + node.cellSize * 2.5)) {
+                    if (!nodeIntersectsOp(node, op, op.radius + node.cellSize * 2.5)) {
                         if (isNewlyCreatedRoot && node.state === 'surface') {
                             rebuildLeaves.add(node);
                         }
@@ -781,28 +839,39 @@
                     const pRes2 = pRes * pRes;
                     const pad = op.radius + node.cellSize * 2.5;
                     const padSq = pad * pad;
+                    const breachPad = op.radius + node.cellSize * 1.5;
+                    const breachSq = breachPad * breachPad;
+                    const isBreach = op.mode === 'breach';
                     const invCell = 1.0 / node.cellSize;
-                    const minPX = Math.max(0, Math.floor((op.x - pad - node.minBounds.x) * invCell + 2));
-                    const maxPX = Math.min(pRes - 1, Math.ceil((op.x + pad - node.minBounds.x) * invCell + 2));
-                    const minPY = Math.max(0, Math.floor((op.y - pad - node.minBounds.y) * invCell + 2));
-                    const maxPY = Math.min(pRes - 1, Math.ceil((op.y + pad - node.minBounds.y) * invCell + 2));
-                    const minPZ = Math.max(0, Math.floor((op.z - pad - node.minBounds.z) * invCell + 2));
-                    const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + pad - node.minBounds.z) * invCell + 2));
+                    const minPX = Math.max(0, Math.floor((op.minX - pad - node.minBounds.x) * invCell + 2));
+                    const maxPX = Math.min(pRes - 1, Math.ceil((op.maxX + pad - node.minBounds.x) * invCell + 2));
+                    const minPY = Math.max(0, Math.floor((op.minY - pad - node.minBounds.y) * invCell + 2));
+                    const maxPY = Math.min(pRes - 1, Math.ceil((op.maxY + pad - node.minBounds.y) * invCell + 2));
+                    const minPZ = Math.max(0, Math.floor((op.minZ - pad - node.minBounds.z) * invCell + 2));
+                    const maxPZ = Math.min(pRes - 1, Math.ceil((op.maxZ + pad - node.minBounds.z) * invCell + 2));
                     if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) return;
 
                     let modified = false;
                     for (let pz = minPZ; pz <= maxPZ; pz++) {
-                        const dz = node.minBounds.z + (pz - 2) * node.cellSize - op.z;
+                        const wz = node.minBounds.z + (pz - 2) * node.cellSize;
+                        const dz = wz - op.z;
                         const zOff = pz * pRes2;
                         for (let py = minPY; py <= maxPY; py++) {
-                            const dy = node.minBounds.y + (py - 2) * node.cellSize - op.y;
+                            const wy = node.minBounds.y + (py - 2) * node.cellSize;
+                            const dy = wy - op.y;
                             const yzOff = zOff + py * pRes;
                             for (let px = minPX; px <= maxPX; px++) {
-                                const dx = node.minBounds.x + (px - 2) * node.cellSize - op.x;
-                                const dSq = dx * dx + dy * dy + dz * dz;
+                                const wx = node.minBounds.x + (px - 2) * node.cellSize;
+                                const dSq = op.hasCapsule
+                                    ? distPointToSegmentSq(wx, wy, wz, op.ax, op.ay, op.az, op.x, op.y, op.z)
+                                    : ((wx - op.x) * (wx - op.x) + dy * dy + dz * dz);
                                 if (dSq <= padSq) {
-                                    const carveD = op.radius - Math.sqrt(dSq);
                                     const idx = yzOff + px;
+                                    if (isBreach && dSq <= breachSq && node.materialData[idx] === 3) {
+                                        node.materialData[idx] = 1;
+                                        modified = true;
+                                    }
+                                    const carveD = op.radius - Math.sqrt(dSq);
                                     if (carveD > node.voxelData[idx]) {
                                         node.voxelData[idx] = carveD;
                                         modified = true;
@@ -828,7 +897,7 @@
                                 if (
                                     root.cellSize > FINE_CELL_LIMIT &&
                                     root.level < MAX_SUBDIV_LEVEL &&
-                                    nodeBoxIntersectsSphere(root, op.x, op.y, op.z, splitPad(root, op.radius))
+                                    nodeBoxIntersectsOp(root, op, splitPad(root, op.radius))
                                 ) {
                                     chunkMap.set(key, root);
                                     splitChunkNode(root, op, retiredKeys, splitNodes, newLeaves);
@@ -886,22 +955,22 @@
             });
         }
 
-        async function reinforceSpherePoC1(hitPoint, brushRadius) {
+        async function reinforceSpherePoC1(hitPoint, brushRadius, prevHit = null) {
             return enqueueSerializedOp(async (opEpoch) => {
                 if (opEpoch !== worldEpoch) {
                     return { mainThreadMs: 0, cancelled: true };
                 }
                 const syncStart = performance.now();
-                const op = { type: 'reinforce', x: hitPoint.x, y: hitPoint.y, z: hitPoint.z, radius: brushRadius };
+                const op = makeEditOp('reinforce', hitPoint, brushRadius, 'reinforce', prevHit);
                 editHistory.push(op);
 
                 const effPad = brushRadius + Math.max(45.0, CELL_SIZE * 3.5);
-                const minCX = Math.floor((op.x - effPad) / CHUNK_SIZE);
-                const maxCX = Math.floor((op.x + effPad) / CHUNK_SIZE);
-                const minCY = Math.floor((op.y - effPad) / CHUNK_SIZE);
-                const maxCY = Math.floor((op.y + effPad) / CHUNK_SIZE);
-                const minCZ = Math.floor((op.z - effPad) / CHUNK_SIZE);
-                const maxCZ = Math.floor((op.z + effPad) / CHUNK_SIZE);
+                const minCX = Math.floor((op.minX - effPad) / CHUNK_SIZE);
+                const maxCX = Math.floor((op.maxX + effPad) / CHUNK_SIZE);
+                const minCY = Math.floor((op.minY - effPad) / CHUNK_SIZE);
+                const maxCY = Math.floor((op.maxY + effPad) / CHUNK_SIZE);
+                const minCZ = Math.floor((op.minZ - effPad) / CHUNK_SIZE);
+                const maxCZ = Math.floor((op.maxZ + effPad) / CHUNK_SIZE);
 
                 const retiredKeys = [];
                 const splitNodes = [];
@@ -911,7 +980,7 @@
 
                 function visitForReinforce(node) {
                     const reachPad = Math.max(op.radius + node.cellSize * 2.0, splitPad(node, op.radius));
-                    if (!nodeIntersectsSphere(node, op.x, op.y, op.z, reachPad)) return;
+                    if (!nodeIntersectsOp(node, op, reachPad)) return;
 
                     if (node.children !== null) {
                         for (let i = 0; i < 8; i++) {
@@ -926,7 +995,7 @@
                         node.cellSize > FINE_CELL_LIMIT &&
                         node.level < MAX_SUBDIV_LEVEL &&
                         node.hasMesh &&
-                        nodeBoxIntersectsSphere(node, op.x, op.y, op.z, splitPad(node, op.radius))
+                        nodeBoxIntersectsOp(node, op, splitPad(node, op.radius))
                     ) {
                         splitChunkNode(node, op, retiredKeys, splitNodes, newLeaves);
                         return;
@@ -936,25 +1005,30 @@
                     const pRes2 = pRes * pRes;
                     const invCell = 1.0 / node.cellSize;
                     const rSq = op.radius * op.radius;
-                    const minPX = Math.max(0, Math.floor((op.x - op.radius - node.minBounds.x) * invCell + 2));
-                    const maxPX = Math.min(pRes - 1, Math.ceil((op.x + op.radius - node.minBounds.x) * invCell + 2));
-                    const minPY = Math.max(0, Math.floor((op.y - op.radius - node.minBounds.y) * invCell + 2));
-                    const maxPY = Math.min(pRes - 1, Math.ceil((op.y + op.radius - node.minBounds.y) * invCell + 2));
-                    const minPZ = Math.max(0, Math.floor((op.z - op.radius - node.minBounds.z) * invCell + 2));
-                    const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + op.radius - node.minBounds.z) * invCell + 2));
+                    const minPX = Math.max(0, Math.floor((op.minX - op.radius - node.minBounds.x) * invCell + 2));
+                    const maxPX = Math.min(pRes - 1, Math.ceil((op.maxX + op.radius - node.minBounds.x) * invCell + 2));
+                    const minPY = Math.max(0, Math.floor((op.minY - op.radius - node.minBounds.y) * invCell + 2));
+                    const maxPY = Math.min(pRes - 1, Math.ceil((op.maxY + op.radius - node.minBounds.y) * invCell + 2));
+                    const minPZ = Math.max(0, Math.floor((op.minZ - op.radius - node.minBounds.z) * invCell + 2));
+                    const maxPZ = Math.min(pRes - 1, Math.ceil((op.maxZ + op.radius - node.minBounds.z) * invCell + 2));
                     if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) return;
 
                     let modified = false;
                     for (let pz = minPZ; pz <= maxPZ; pz++) {
-                        const dz = node.minBounds.z + (pz - 2) * node.cellSize - op.z;
+                        const wz = node.minBounds.z + (pz - 2) * node.cellSize;
+                        const dz = wz - op.z;
                         const zOff = pz * pRes2;
                         for (let py = minPY; py <= maxPY; py++) {
-                            const dy = node.minBounds.y + (py - 2) * node.cellSize - op.y;
+                            const wy = node.minBounds.y + (py - 2) * node.cellSize;
+                            const dy = wy - op.y;
                             const yzOff = zOff + py * pRes;
                             for (let px = minPX; px <= maxPX; px++) {
-                                const dx = node.minBounds.x + (px - 2) * node.cellSize - op.x;
+                                const wx = node.minBounds.x + (px - 2) * node.cellSize;
+                                const dSq = op.hasCapsule
+                                    ? distPointToSegmentSq(wx, wy, wz, op.ax, op.ay, op.az, op.x, op.y, op.z)
+                                    : ((wx - op.x) * (wx - op.x) + dy * dy + dz * dz);
                                 const idx = yzOff + px;
-                                if (dx * dx + dy * dy + dz * dz <= rSq && node.voxelData[idx] < 0.0) {
+                                if (dSq <= rSq && node.voxelData[idx] < 0.0) {
                                     node.materialData[idx] = 3; // Reinforced Titanium Bulkhead
                                     node.hasArmor = true;
                                     modified = true;
@@ -1063,22 +1137,20 @@
                 return `${CELL_SIZE.toFixed(1)}u (${CHUNK_RES}³)`;
             },
 
-            onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
-                return await carveSpherePoC1(hitPoint, brushRadius);
+            onCarve: async (hitPoint, hitNormal, brushRadius, mode, prevHit = null) => {
+                return await carveSpherePoC1(hitPoint, brushRadius, mode, prevHit);
             },
 
-            onReinforce: async (hitPoint, hitNormal, brushRadius) => {
-                return await reinforceSpherePoC1(hitPoint, brushRadius);
+            onReinforce: async (hitPoint, hitNormal, brushRadius, prevHit = null) => {
+                return await reinforceSpherePoC1(hitPoint, brushRadius, prevHit);
             },
 
             checkMaterialAtHit: (point, hit) => {
-                if (hit && hit.face) {
-                    const colAttr = hit.object.geometry.attributes.color;
-                    if (colAttr) {
-                        const a = hit.face.a;
-                        if (colAttr.getY(a) > 0.8 && colAttr.getZ(a) > 0.9) {
-                            return true;
-                        }
+                if (hit && hit.face && hit.object && hit.object.geometry) {
+                    const mwAttr = hit.object.geometry.attributes.aMatWeights;
+                    if (mwAttr) {
+                        const avgArmor = (mwAttr.getZ(hit.face.a) + mwAttr.getZ(hit.face.b) + mwAttr.getZ(hit.face.c)) / 3.0;
+                        return avgArmor >= 0.35;
                     }
                 }
                 return false;

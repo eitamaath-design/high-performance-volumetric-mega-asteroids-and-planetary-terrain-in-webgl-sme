@@ -11,7 +11,7 @@
 <body>
     <script type="module">
         import * as THREE from './vendor/three.module.js';
-        import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint } from './shared/planetary_base_sandbox.js';
+        import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint, distPointToSegmentSq } from './shared/planetary_base_sandbox.js';
         import { MeshingWorkerPool } from './shared/meshing_worker_pool.js';
         import { ChunkBatchManager } from './shared/chunk_batch_manager.js';
         import { FastNoise3D } from './shared/deterministic_noise.js';
@@ -104,6 +104,7 @@
         const cavernMaterial = createTriplanarAsteroidMaterial({
             vertexColors: true,
             hasPortals: false,
+            useMatWeights: true,
             radius: currentRadius
         });
         const batchManager = new ChunkBatchManager(null, cavernMaterial);
@@ -480,7 +481,7 @@
                 const deferFlush = Boolean(options && options.deferFlush);
                 this.hasNearCarve = this.maxCarveInChunk >= -this.cellSize * 2.0;
 
-                const { positions, normals, colors, indices } = result;
+                const { positions, normals, colors, matWeights, indices } = result;
                 if (!positions || !indices || positions.length === 0 || indices.length === 0) {
                     let allVoid = true;
                     const vArr = this.voxelData;
@@ -499,7 +500,7 @@
                     return;
                 }
                 this.isAllVoid = false;
-                batchManager.upsertChunk(this.key, this.center, positions, normals, colors, indices);
+                batchManager.upsertChunk(this.key, this.center, positions, normals, colors, indices, matWeights);
                 this.hasMesh = true;
                 this.lastUsedTick = ++chunkUseTick;
                 if (!deferFlush) batchManager.flush(scene);
@@ -579,7 +580,7 @@
             }
         }
 
-        function ensureSubterraneanChunksAround(point, radius) {
+        function ensureSubterraneanChunksAround(point, radius, prevHit = null) {
             const pad = radius + SUBTERRANEAN_CELL_SIZE * 3.0;
             const maxDist = radius + SUBTERRANEAN_CELL_SIZE * 2.5;
             const maxDistSq = maxDist * maxDist;
@@ -588,37 +589,67 @@
             const pRes = SUBTERRANEAN_CHUNK_RES + 3;
             const halfSpan = (pRes - 1) * SUBTERRANEAN_CELL_SIZE * 0.5;
             const halfDiag = halfSpan * 1.732051;
+            const halfChunkDiag = SUBTERRANEAN_CHUNK_SIZE * 0.866026;
+            const capMaxDistSq = (maxDist + halfChunkDiag) * (maxDist + halfChunkDiag);
+            const capDeepLimitSq = (deepLimit + halfChunkDiag) * (deepLimit + halfChunkDiag);
             const minR = currentRadius * 0.85;
             const maxR = currentRadius * 1.18;
 
-            const minCX = Math.floor((point.x - pad) / SUBTERRANEAN_CHUNK_SIZE);
-            const maxCX = Math.floor((point.x + pad) / SUBTERRANEAN_CHUNK_SIZE);
-            const minCY = Math.floor((point.y - pad) / SUBTERRANEAN_CHUNK_SIZE);
-            const maxCY = Math.floor((point.y + pad) / SUBTERRANEAN_CHUNK_SIZE);
-            const minCZ = Math.floor((point.z - pad) / SUBTERRANEAN_CHUNK_SIZE);
-            const maxCZ = Math.floor((point.z + pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const bx = point.x, by = point.y, bz = point.z;
+            const hasCapsule = Boolean(prevHit && prevHit.distanceTo(point) <= radius * 4.0 && prevHit.distanceToSquared(point) > 1e-4);
+            const ax = hasCapsule ? prevHit.x : bx;
+            const ay = hasCapsule ? prevHit.y : by;
+            const az = hasCapsule ? prevHit.z : bz;
+            const bMinX = hasCapsule ? Math.min(ax, bx) : bx;
+            const bMaxX = hasCapsule ? Math.max(ax, bx) : bx;
+            const bMinY = hasCapsule ? Math.min(ay, by) : by;
+            const bMaxY = hasCapsule ? Math.max(ay, by) : by;
+            const bMinZ = hasCapsule ? Math.min(az, bz) : bz;
+            const bMaxZ = hasCapsule ? Math.max(az, bz) : bz;
+
+            const minCX = Math.floor((bMinX - pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const maxCX = Math.floor((bMaxX + pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const minCY = Math.floor((bMinY - pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const maxCY = Math.floor((bMaxY + pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const minCZ = Math.floor((bMinZ - pad) / SUBTERRANEAN_CHUNK_SIZE);
+            const maxCZ = Math.floor((bMaxZ + pad) / SUBTERRANEAN_CHUNK_SIZE);
 
             const touched = [];
             for (let cz = minCZ; cz <= maxCZ; cz++) {
                 const minZ = cz * SUBTERRANEAN_CHUNK_SIZE;
                 const maxZ = minZ + SUBTERRANEAN_CHUNK_SIZE;
-                const dz = point.z < minZ ? minZ - point.z : (point.z > maxZ ? point.z - maxZ : 0);
-                const dz2 = dz * dz;
-                if (dz2 > maxDistSq) continue;
+                let dz2 = 0;
+                if (!hasCapsule) {
+                    const dz = bz < minZ ? minZ - bz : (bz > maxZ ? bz - maxZ : 0);
+                    dz2 = dz * dz;
+                    if (dz2 > maxDistSq) continue;
+                }
                 const ccz = minZ - SUBTERRANEAN_CELL_SIZE + halfSpan;
+                const midZ = minZ + SUBTERRANEAN_CHUNK_SIZE * 0.5;
                 for (let cy = minCY; cy <= maxCY; cy++) {
                     const minY = cy * SUBTERRANEAN_CHUNK_SIZE;
                     const maxY = minY + SUBTERRANEAN_CHUNK_SIZE;
-                    const dy = point.y < minY ? minY - point.y : (point.y > maxY ? point.y - maxY : 0);
-                    const dyz2 = dz2 + dy * dy;
-                    if (dyz2 > maxDistSq) continue;
+                    let dyz2 = 0;
+                    if (!hasCapsule) {
+                        const dy = by < minY ? minY - by : (by > maxY ? by - maxY : 0);
+                        dyz2 = dz2 + dy * dy;
+                        if (dyz2 > maxDistSq) continue;
+                    }
                     const ccy = minY - SUBTERRANEAN_CELL_SIZE + halfSpan;
+                    const midY = minY + SUBTERRANEAN_CHUNK_SIZE * 0.5;
                     for (let cx = minCX; cx <= maxCX; cx++) {
                         const minX = cx * SUBTERRANEAN_CHUNK_SIZE;
                         const maxX = minX + SUBTERRANEAN_CHUNK_SIZE;
-                        const dx = point.x < minX ? minX - point.x : (point.x > maxX ? point.x - maxX : 0);
-                        const distSq = dx * dx + dyz2;
-                        if (distSq > maxDistSq) continue;
+                        let distSq;
+                        if (!hasCapsule) {
+                            const dx = bx < minX ? minX - bx : (bx > maxX ? bx - maxX : 0);
+                            distSq = dx * dx + dyz2;
+                            if (distSq > maxDistSq) continue;
+                        } else {
+                            const midX = minX + SUBTERRANEAN_CHUNK_SIZE * 0.5;
+                            distSq = distPointToSegmentSq(midX, midY, midZ, ax, ay, az, bx, by, bz);
+                            if (distSq > capMaxDistSq) continue;
+                        }
 
                         const key = `${cx},${cy},${cz}`;
                         if (voidChunkKeys.has(key)) continue;
@@ -630,7 +661,7 @@
                                 voidChunkKeys.add(key);
                                 continue;
                             }
-                            if (cDist + halfDiag < minR && distSq > deepLimitSq) {
+                            if (cDist + halfDiag < minR && distSq > (hasCapsule ? capDeepLimitSq : deepLimitSq)) {
                                 continue;
                             }
                             chunk = new SubterraneanChunk(cx, cy, cz);
@@ -685,18 +716,45 @@
             }
         }
 
-        async function carveSpherePoC3(hitPoint, brushRadius) {
+        async function carveSpherePoC3(hitPoint, brushRadius, mode = 'carve', prevHit = null) {
             return enqueueSerializedOp(async (opEpoch) => {
                 if (opEpoch !== worldEpoch) {
                     return { mainThreadMs: 0, cancelled: true };
                 }
                 const syncStart = performance.now();
-                registerPortalHole(hitPoint, brushRadius);
+                const bx = hitPoint.x, by = hitPoint.y, bz = hitPoint.z;
+                const hasCapsule = Boolean(prevHit && prevHit.distanceTo(hitPoint) <= brushRadius * 4.0 && prevHit.distanceToSquared(hitPoint) > 1e-4);
+                const ax = hasCapsule ? prevHit.x : bx;
+                const ay = hasCapsule ? prevHit.y : by;
+                const az = hasCapsule ? prevHit.z : bz;
 
-                const affected = ensureSubterraneanChunksAround(hitPoint, brushRadius);
+                if (hasCapsule) {
+                    const segLen = prevHit.distanceTo(hitPoint);
+                    const portalSteps = Math.max(1, Math.ceil(segLen / Math.max(1.0, brushRadius * 0.6)));
+                    const samplePt = new THREE.Vector3();
+                    for (let s = 0; s <= portalSteps; s++) {
+                        const t = s / portalSteps;
+                        samplePt.set(ax + (bx - ax) * t, ay + (by - ay) * t, az + (bz - az) * t);
+                        registerPortalHole(samplePt, brushRadius);
+                    }
+                } else {
+                    registerPortalHole(hitPoint, brushRadius);
+                }
+
+                const bMinX = hasCapsule ? Math.min(ax, bx) : bx;
+                const bMaxX = hasCapsule ? Math.max(ax, bx) : bx;
+                const bMinY = hasCapsule ? Math.min(ay, by) : by;
+                const bMaxY = hasCapsule ? Math.max(ay, by) : by;
+                const bMinZ = hasCapsule ? Math.min(az, bz) : bz;
+                const bMaxZ = hasCapsule ? Math.max(az, bz) : bz;
+
+                const affected = ensureSubterraneanChunksAround(hitPoint, brushRadius, hasCapsule ? prevHit : null);
                 const pRes = SUBTERRANEAN_CHUNK_RES + 3;
                 const pRes2 = pRes * pRes;
                 const pad = brushRadius + SUBTERRANEAN_CELL_SIZE * 4.0;
+                const breachPad = brushRadius + SUBTERRANEAN_CELL_SIZE * 1.5;
+                const breachSq = breachPad * breachPad;
+                const isBreach = mode === 'breach';
                 const invCell = 1.0 / SUBTERRANEAN_CELL_SIZE;
                 const protectedKeys = new Set();
                 const modifiedChunks = [];
@@ -704,12 +762,12 @@
 
                 for (let i = 0; i < affected.length; i++) {
                     const chunk = affected[i];
-                    const minPX = Math.max(0, Math.floor((hitPoint.x - pad - chunk.minBounds.x) * invCell + 1));
-                    const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + pad - chunk.minBounds.x) * invCell + 1));
-                    const minPY = Math.max(0, Math.floor((hitPoint.y - pad - chunk.minBounds.y) * invCell + 1));
-                    const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + pad - chunk.minBounds.y) * invCell + 1));
-                    const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 1));
-                    const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 1));
+                    const minPX = Math.max(0, Math.floor((bMinX - pad - chunk.minBounds.x) * invCell + 1));
+                    const maxPX = Math.min(pRes - 1, Math.ceil((bMaxX + pad - chunk.minBounds.x) * invCell + 1));
+                    const minPY = Math.max(0, Math.floor((bMinY - pad - chunk.minBounds.y) * invCell + 1));
+                    const maxPY = Math.min(pRes - 1, Math.ceil((bMaxY + pad - chunk.minBounds.y) * invCell + 1));
+                    const minPZ = Math.max(0, Math.floor((bMinZ - pad - chunk.minBounds.z) * invCell + 1));
+                    const maxPZ = Math.min(pRes - 1, Math.ceil((bMaxZ + pad - chunk.minBounds.z) * invCell + 1));
                     if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) {
                         if (!chunk.hasMesh && !chunk.hasArmor && !chunk.hasNearCarve) {
                             subterraneanChunks.delete(chunk.key);
@@ -724,21 +782,29 @@
                     const voxLim = brushRadius + SUBTERRANEAN_CELL_SIZE;
                     const voxLimSq = voxLim * voxLim;
                     for (let pz = minPZ; pz <= maxPZ; pz++) {
-                        const dz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.z;
+                        const wz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE;
+                        const dz = wz - bz;
                         const dz2 = dz * dz;
                         const zOff = pz * pRes2;
                         for (let py = minPY; py <= maxPY; py++) {
-                            const dy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.y;
+                            const wy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE;
+                            const dy = wy - by;
                             const dyz2 = dz2 + dy * dy;
-                            if (dyz2 > padSq) continue;
+                            if (!hasCapsule && dyz2 > padSq) continue;
                             const yzOff = zOff + py * pRes;
                             for (let px = minPX; px <= maxPX; px++) {
-                                const dx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.x;
-                                const dSq = dyz2 + dx * dx;
+                                const wx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
+                                const dSq = hasCapsule
+                                    ? distPointToSegmentSq(wx, wy, wz, ax, ay, az, bx, by, bz)
+                                    : (dyz2 + (wx - bx) * (wx - bx));
                                 if (dSq > padSq) continue;
                                 const dist = Math.sqrt(dSq);
                                 const carveD = brushRadius - dist;
                                 const idx = yzOff + px;
+                                if (isBreach && dSq <= breachSq && chunk.materialData[idx] === 3) {
+                                    chunk.materialData[idx] = 1;
+                                    modified = true;
+                                }
                                 if (carveD > chunk.carveField[idx]) {
                                     chunk.carveField[idx] = carveD;
                                     if (carveD > chunk.maxCarveInChunk) {
@@ -797,22 +863,34 @@
             });
         }
 
-        async function reinforceSpherePoC3(hitPoint, brushRadius) {
+        async function reinforceSpherePoC3(hitPoint, brushRadius, prevHit = null) {
             return enqueueSerializedOp(async (opEpoch) => {
                 if (opEpoch !== worldEpoch) {
                     return { mainThreadMs: 0, cancelled: true };
                 }
                 const syncStart = performance.now();
+                const bx = hitPoint.x, by = hitPoint.y, bz = hitPoint.z;
+                const hasCapsule = Boolean(prevHit && prevHit.distanceTo(hitPoint) <= brushRadius * 4.0 && prevHit.distanceToSquared(hitPoint) > 1e-4);
+                const ax = hasCapsule ? prevHit.x : bx;
+                const ay = hasCapsule ? prevHit.y : by;
+                const az = hasCapsule ? prevHit.z : bz;
+                const bMinX = hasCapsule ? Math.min(ax, bx) : bx;
+                const bMaxX = hasCapsule ? Math.max(ax, bx) : bx;
+                const bMinY = hasCapsule ? Math.min(ay, by) : by;
+                const bMaxY = hasCapsule ? Math.max(ay, by) : by;
+                const bMinZ = hasCapsule ? Math.min(az, bz) : bz;
+                const bMaxZ = hasCapsule ? Math.max(az, bz) : bz;
+
                 const pRes = SUBTERRANEAN_CHUNK_RES + 3;
                 const pRes2 = pRes * pRes;
                 const pad = brushRadius + SUBTERRANEAN_CELL_SIZE;
                 const invCell = 1.0 / SUBTERRANEAN_CELL_SIZE;
-                const minCX = Math.floor((hitPoint.x - pad) / SUBTERRANEAN_CHUNK_SIZE);
-                const maxCX = Math.floor((hitPoint.x + pad) / SUBTERRANEAN_CHUNK_SIZE);
-                const minCY = Math.floor((hitPoint.y - pad) / SUBTERRANEAN_CHUNK_SIZE);
-                const maxCY = Math.floor((hitPoint.y + pad) / SUBTERRANEAN_CHUNK_SIZE);
-                const minCZ = Math.floor((hitPoint.z - pad) / SUBTERRANEAN_CHUNK_SIZE);
-                const maxCZ = Math.floor((hitPoint.z + pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const minCX = Math.floor((bMinX - pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const maxCX = Math.floor((bMaxX + pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const minCY = Math.floor((bMinY - pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const maxCY = Math.floor((bMaxY + pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const minCZ = Math.floor((bMinZ - pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const maxCZ = Math.floor((bMaxZ + pad) / SUBTERRANEAN_CHUNK_SIZE);
                 const rebuilds = [];
 
                 for (let cz = minCZ; cz <= maxCZ; cz++) {
@@ -821,29 +899,34 @@
                             const chunk = subterraneanChunks.get(`${cx},${cy},${cz}`);
                             if (!chunk) continue;
 
-                            const minPX = Math.max(0, Math.floor((hitPoint.x - pad - chunk.minBounds.x) * invCell + 1));
-                            const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + pad - chunk.minBounds.x) * invCell + 1));
-                            const minPY = Math.max(0, Math.floor((hitPoint.y - pad - chunk.minBounds.y) * invCell + 1));
-                            const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + pad - chunk.minBounds.y) * invCell + 1));
-                            const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 1));
-                            const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 1));
+                            const minPX = Math.max(0, Math.floor((bMinX - pad - chunk.minBounds.x) * invCell + 1));
+                            const maxPX = Math.min(pRes - 1, Math.ceil((bMaxX + pad - chunk.minBounds.x) * invCell + 1));
+                            const minPY = Math.max(0, Math.floor((bMinY - pad - chunk.minBounds.y) * invCell + 1));
+                            const maxPY = Math.min(pRes - 1, Math.ceil((bMaxY + pad - chunk.minBounds.y) * invCell + 1));
+                            const minPZ = Math.max(0, Math.floor((bMinZ - pad - chunk.minBounds.z) * invCell + 1));
+                            const maxPZ = Math.min(pRes - 1, Math.ceil((bMaxZ + pad - chunk.minBounds.z) * invCell + 1));
                             if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
 
                             let modified = false;
                             const rSq = brushRadius * brushRadius;
                             for (let pz = minPZ; pz <= maxPZ; pz++) {
-                                const dz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.z;
+                                const wz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE;
+                                const dz = wz - bz;
                                 const dz2 = dz * dz;
                                 const zOff = pz * pRes2;
                                 for (let py = minPY; py <= maxPY; py++) {
-                                    const dy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.y;
+                                    const wy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE;
+                                    const dy = wy - by;
                                     const dyz2 = dz2 + dy * dy;
-                                    if (dyz2 > rSq) continue;
+                                    if (!hasCapsule && dyz2 > rSq) continue;
                                     const yzOff = zOff + py * pRes;
                                     for (let px = minPX; px <= maxPX; px++) {
-                                        const dx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.x;
+                                        const wx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE;
+                                        const dSq = hasCapsule
+                                            ? distPointToSegmentSq(wx, wy, wz, ax, ay, az, bx, by, bz)
+                                            : (dyz2 + (wx - bx) * (wx - bx));
                                         const idx = yzOff + px;
-                                        if (dyz2 + dx * dx <= rSq && chunk.voxelData[idx] < 0) {
+                                        if (dSq <= rSq && chunk.voxelData[idx] < 0) {
                                             chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
                                             chunk.hasArmor = true;
                                             modified = true;
@@ -1066,22 +1149,20 @@
                 return null;
             },
 
-            onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
-                return await carveSpherePoC3(hitPoint, brushRadius);
+            onCarve: async (hitPoint, hitNormal, brushRadius, mode, prevHit = null) => {
+                return await carveSpherePoC3(hitPoint, brushRadius, mode, prevHit);
             },
 
-            onReinforce: async (hitPoint, hitNormal, brushRadius) => {
-                return await reinforceSpherePoC3(hitPoint, brushRadius);
+            onReinforce: async (hitPoint, hitNormal, brushRadius, prevHit = null) => {
+                return await reinforceSpherePoC3(hitPoint, brushRadius, prevHit);
             },
 
             checkMaterialAtHit: (point, hit) => {
-                if (hit && hit.face && hit.object !== planetaryMacroShell) {
-                    const colAttr = hit.object.geometry.attributes.color;
-                    if (colAttr) {
-                        const a = hit.face.a;
-                        if (colAttr.getY(a) > 0.8 && colAttr.getZ(a) > 0.9) {
-                            return true;
-                        }
+                if (hit && hit.face && hit.object && hit.object !== planetaryMacroShell && hit.object.geometry) {
+                    const mwAttr = hit.object.geometry.attributes.aMatWeights;
+                    if (mwAttr) {
+                        const avgArmor = (mwAttr.getZ(hit.face.a) + mwAttr.getZ(hit.face.b) + mwAttr.getZ(hit.face.c)) / 3.0;
+                        return avgArmor >= 0.35;
                     }
                 }
                 return false;

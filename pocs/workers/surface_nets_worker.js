@@ -25,9 +25,73 @@ let _cellVertMap = new Int32Array(36 * 36 * 36);
 let _verts = new Float32Array(16384 * 3);
 let _norms = new Float32Array(16384 * 3);
 let _cols = new Float32Array(16384 * 3);
+let _matWeights = new Float32Array(16384 * 3);
 let _mats = new Uint8Array(16384);
 let _extFlags = new Uint8Array(16384);
 let _indices = new Uint32Array(65536 * 3);
+const _triGradOut = new Float32Array(3);
+
+function sampleTrilinearGradient(voxelData, pRes, pRes2, fx, fy, fz, out) {
+    const maxC = pRes - 2;
+    const maxI0 = pRes - 3;
+    const cx = fx < 1.0 ? 1.0 : (fx > maxC ? maxC : fx);
+    const cy = fy < 1.0 ? 1.0 : (fy > maxC ? maxC : fy);
+    const cz = fz < 1.0 ? 1.0 : (fz > maxC ? maxC : fz);
+
+    let x0 = Math.floor(cx);
+    if (x0 > maxI0) x0 = maxI0;
+    let y0 = Math.floor(cy);
+    if (y0 > maxI0) y0 = maxI0;
+    let z0 = Math.floor(cz);
+    if (z0 > maxI0) z0 = maxI0;
+
+    const tx = cx - x0;
+    const ty = cy - y0;
+    const tz = cz - z0;
+    const omx = 1.0 - tx;
+    const omy = 1.0 - ty;
+    const omz = 1.0 - tz;
+
+    const base = x0 + y0 * pRes + z0 * pRes2;
+    const i000 = base;
+    const i100 = base + 1;
+    const i010 = base + pRes;
+    const i110 = base + pRes + 1;
+    const i001 = base + pRes2;
+    const i101 = base + pRes2 + 1;
+    const i011 = base + pRes2 + pRes;
+    const i111 = base + pRes2 + pRes + 1;
+
+    const gx00 = (voxelData[i000 + 1] - voxelData[i000 - 1]) * omx + (voxelData[i100 + 1] - voxelData[i100 - 1]) * tx;
+    const gx10 = (voxelData[i010 + 1] - voxelData[i010 - 1]) * omx + (voxelData[i110 + 1] - voxelData[i110 - 1]) * tx;
+    const gx01 = (voxelData[i001 + 1] - voxelData[i001 - 1]) * omx + (voxelData[i101 + 1] - voxelData[i101 - 1]) * tx;
+    const gx11 = (voxelData[i011 + 1] - voxelData[i011 - 1]) * omx + (voxelData[i111 + 1] - voxelData[i111 - 1]) * tx;
+    const gx = (gx00 * omy + gx10 * ty) * omz + (gx01 * omy + gx11 * ty) * tz;
+
+    const gy00 = (voxelData[i000 + pRes] - voxelData[i000 - pRes]) * omx + (voxelData[i100 + pRes] - voxelData[i100 - pRes]) * tx;
+    const gy10 = (voxelData[i010 + pRes] - voxelData[i010 - pRes]) * omx + (voxelData[i110 + pRes] - voxelData[i110 - pRes]) * tx;
+    const gy01 = (voxelData[i001 + pRes] - voxelData[i001 - pRes]) * omx + (voxelData[i101 + pRes] - voxelData[i101 - pRes]) * tx;
+    const gy11 = (voxelData[i011 + pRes] - voxelData[i011 - pRes]) * omx + (voxelData[i111 + pRes] - voxelData[i111 - pRes]) * tx;
+    const gy = (gy00 * omy + gy10 * ty) * omz + (gy01 * omy + gy11 * ty) * tz;
+
+    const gz00 = (voxelData[i000 + pRes2] - voxelData[i000 - pRes2]) * omx + (voxelData[i100 + pRes2] - voxelData[i100 - pRes2]) * tx;
+    const gz10 = (voxelData[i010 + pRes2] - voxelData[i010 - pRes2]) * omx + (voxelData[i110 + pRes2] - voxelData[i110 - pRes2]) * tx;
+    const gz01 = (voxelData[i001 + pRes2] - voxelData[i001 - pRes2]) * omx + (voxelData[i101 + pRes2] - voxelData[i101 - pRes2]) * tx;
+    const gz11 = (voxelData[i011 + pRes2] - voxelData[i011 - pRes2]) * omx + (voxelData[i111 + pRes2] - voxelData[i111 - pRes2]) * tx;
+    const gz = (gz00 * omy + gz10 * ty) * omz + (gz01 * omy + gz11 * ty) * tz;
+
+    const lenSq = gx * gx + gy * gy + gz * gz;
+    if (lenSq > 1e-12) {
+        const invLen = 1.0 / Math.sqrt(lenSq);
+        out[0] = gx * invLen;
+        out[1] = gy * invLen;
+        out[2] = gz * invLen;
+    } else {
+        out[0] = 0.0;
+        out[1] = 1.0;
+        out[2] = 0.0;
+    }
+}
 
 function ensureCellMapCapacity(totalCells) {
     if (totalCells > _cellVertMap.length) {
@@ -44,6 +108,7 @@ function ensureVertexCapacity(vCount) {
         const nv = new Float32Array(nextVerts); nv.set(_verts); _verts = nv;
         const nn = new Float32Array(nextVerts); nn.set(_norms); _norms = nn;
         const nc = new Float32Array(nextVerts); nc.set(_cols); _cols = nc;
+        const nw = new Float32Array(nextVerts); nw.set(_matWeights); _matWeights = nw;
         const nextCount = nextVerts / 3;
         const nm = new Uint8Array(nextCount); nm.set(_mats); _mats = nm;
         const nf = new Uint8Array(nextCount); nf.set(_extFlags); _extFlags = nf;
@@ -201,21 +266,19 @@ function runSurfaceNets(data) {
                 const wy = minY + (vy - halo) * cellSize;
                 const wz = minZ + (vz - halo) * cellSize;
 
-                // Central differences strictly inside [1 .. pRes - 2]
-                const ipx = Math.max(1, Math.min(pRes - 2, Math.round(vx)));
-                const ipy = Math.max(1, Math.min(pRes - 2, Math.round(vy)));
-                const ipz = Math.max(1, Math.min(pRes - 2, Math.round(vz)));
-                const gIdx = ipx + ipy * pRes + ipz * pRes2;
-                const nx = voxelData[gIdx + 1] - voxelData[gIdx - 1];
-                const ny = voxelData[gIdx + pRes] - voxelData[gIdx - pRes];
-                const nz = voxelData[gIdx + pRes2] - voxelData[gIdx - pRes2];
-                const lenSq = nx * nx + ny * ny + nz * nz;
-                let unx = 0.0, uny = 1.0, unz = 0.0;
-                if (lenSq > 1e-12) {
-                    const invLen = 1.0 / Math.sqrt(lenSq);
-                    unx = nx * invLen;
-                    uny = ny * invLen;
-                    unz = nz * invLen;
+                // Exact trilinear interpolation of central-difference SDF gradient at fractional dual-vertex (vx, vy, vz)
+                sampleTrilinearGradient(voxelData, pRes, pRes2, vx, vy, vz, _triGradOut);
+                const unx = _triGradOut[0];
+                const uny = _triGradOut[1];
+                const unz = _triGradOut[2];
+
+                const totalMat = rockCount + oreCount + armorCount;
+                let wRock = 1.0, wOre = 0.0, wArmor = 0.0;
+                if (totalMat > 0) {
+                    const invMat = 1.0 / totalMat;
+                    wRock = rockCount * invMat;
+                    wOre = oreCount * invMat;
+                    wArmor = armorCount * invMat;
                 }
 
                 let domMat = 1;
@@ -250,6 +313,7 @@ function runSurfaceNets(data) {
                 _verts[vOff] = wx; _verts[vOff + 1] = wy; _verts[vOff + 2] = wz;
                 _norms[vOff] = unx; _norms[vOff + 1] = uny; _norms[vOff + 2] = unz;
                 _cols[vOff] = rCol; _cols[vOff + 1] = gCol; _cols[vOff + 2] = bCol;
+                _matWeights[vOff] = wRock; _matWeights[vOff + 1] = wOre; _matWeights[vOff + 2] = wArmor;
                 _mats[vIdx] = domMat;
                 _extFlags[vIdx] = (hasCarveField && maxCarveVal < extThresh) ? 1 : 0;
             }
@@ -426,23 +490,10 @@ function runDualContour(data) {
                         _edgePts[off + 2] = pz;
                         mx += px; my += py; mz += pz;
 
-                        const gpx = cx + (p2x !== p1x ? (t >= 0.5 ? 1 : 0) : p1x);
-                        const gpy = cy + (p2y !== p1y ? (t >= 0.5 ? 1 : 0) : p1y);
-                        const gpz = cz + (p2z !== p1z ? (t >= 0.5 ? 1 : 0) : p1z);
-                        const gIdx = gpx + gpy * pRes + gpz * pRes2;
-                        let nx = voxelData[gIdx + 1] - voxelData[gIdx - 1];
-                        let ny = voxelData[gIdx + pRes] - voxelData[gIdx - pRes];
-                        let nz = voxelData[gIdx + pRes2] - voxelData[gIdx - pRes2];
-                        const nLenSq = nx * nx + ny * ny + nz * nz;
-                        if (nLenSq > 1e-10) {
-                            const invLen = 1.0 / Math.sqrt(nLenSq);
-                            nx *= invLen; ny *= invLen; nz *= invLen;
-                        } else {
-                            nx = 0; ny = 1; nz = 0;
-                        }
-                        _edgeNorms[off] = nx;
-                        _edgeNorms[off + 1] = ny;
-                        _edgeNorms[off + 2] = nz;
+                        sampleTrilinearGradient(voxelData, pRes, pRes2, ix, iy, iz, _triGradOut);
+                        _edgeNorms[off] = _triGradOut[0];
+                        _edgeNorms[off + 1] = _triGradOut[1];
+                        _edgeNorms[off + 2] = _triGradOut[2];
                         edgeCount++;
                     }
                 }
@@ -487,19 +538,28 @@ function runDualContour(data) {
                 if (qz < cellMinZ + pad) qz = cellMinZ + pad;
                 else if (qz > cellMinZ + cellSize - pad) qz = cellMinZ + cellSize - pad;
 
-                let anx = 0, any = 0, anz = 0;
-                for (let p = 0; p < edgeCount; p++) {
-                    const off = p * 3;
-                    anx += _edgeNorms[off];
-                    any += _edgeNorms[off + 1];
-                    anz += _edgeNorms[off + 2];
-                }
-                const aLenSq = anx * anx + any * any + anz * anz;
-                if (aLenSq > 1e-10) {
-                    const invALen = 1.0 / Math.sqrt(aLenSq);
-                    anx *= invALen; any *= invALen; anz *= invALen;
-                } else {
-                    anx = 0; any = 1; anz = 0;
+                // Smooth trilinearly-interpolated SDF gradient at solved QEF dual vertex
+                const invCellSize = 1.0 / cellSize;
+                sampleTrilinearGradient(
+                    voxelData,
+                    pRes,
+                    pRes2,
+                    (qx - minX) * invCellSize + 2.0,
+                    (qy - minY) * invCellSize + 2.0,
+                    (qz - minZ) * invCellSize + 2.0,
+                    _triGradOut
+                );
+                const anx = _triGradOut[0];
+                const any = _triGradOut[1];
+                const anz = _triGradOut[2];
+
+                const totalMat = rockCount + oreCount + armorCount;
+                let wRock = 1.0, wOre = 0.0, wArmor = 0.0;
+                if (totalMat > 0) {
+                    const invMat = 1.0 / totalMat;
+                    wRock = rockCount * invMat;
+                    wOre = oreCount * invMat;
+                    wArmor = armorCount * invMat;
                 }
 
                 let domMat = 1;
@@ -532,6 +592,7 @@ function runDualContour(data) {
                 _verts[vOff] = qx; _verts[vOff + 1] = qy; _verts[vOff + 2] = qz;
                 _norms[vOff] = anx; _norms[vOff + 1] = any; _norms[vOff + 2] = anz;
                 _cols[vOff] = rCol; _cols[vOff + 1] = gCol; _cols[vOff + 2] = bCol;
+                _matWeights[vOff] = wRock; _matWeights[vOff + 1] = wOre; _matWeights[vOff + 2] = wArmor;
                 _mats[vIdx] = domMat;
             }
         }
@@ -613,6 +674,7 @@ self.onmessage = function(e) {
         const emptyF = new Float32Array(0);
         const emptyN = new Float32Array(0);
         const emptyC = new Float32Array(0);
+        const emptyW = new Float32Array(0);
         const emptyM = new Uint8Array(0);
         const emptyI = new Uint32Array(0);
         self.postMessage({
@@ -622,9 +684,10 @@ self.onmessage = function(e) {
             positions: emptyF,
             normals: emptyN,
             colors: emptyC,
+            matWeights: emptyW,
             materials: emptyM,
             indices: emptyI
-        }, [emptyF.buffer, emptyN.buffer, emptyC.buffer, emptyM.buffer, emptyI.buffer]);
+        }, [emptyF.buffer, emptyN.buffer, emptyC.buffer, emptyW.buffer, emptyM.buffer, emptyI.buffer]);
         return;
     }
 
@@ -635,6 +698,7 @@ self.onmessage = function(e) {
     const posArray = _verts.slice(0, vCount * 3);
     const normArray = _norms.slice(0, vCount * 3);
     const colArray = _cols.slice(0, vCount * 3);
+    const matWeightArray = _matWeights.slice(0, vCount * 3);
     const matArray = _mats.slice(0, vCount);
     const idxArray = _indices.slice(0, iCount);
 
@@ -645,7 +709,8 @@ self.onmessage = function(e) {
         positions: posArray,
         normals: normArray,
         colors: colArray,
+        matWeights: matWeightArray,
         materials: matArray,
         indices: idxArray
-    }, [posArray.buffer, normArray.buffer, colArray.buffer, matArray.buffer, idxArray.buffer]);
+    }, [posArray.buffer, normArray.buffer, colArray.buffer, matWeightArray.buffer, matArray.buffer, idxArray.buffer]);
 };
