@@ -12,6 +12,7 @@
     <script type="module">
         import * as THREE from './vendor/three.module.js';
         import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint } from './shared/planetary_base_sandbox.js';
+        import { MeshingWorkerPool } from './shared/meshing_worker_pool.js';
 
         // --- Fast 3D Simplex-Style Noise ---
         class FastNoise3D {
@@ -84,14 +85,6 @@
         const _rcHitCells = [];
         const _poc3CoarseGrid = new Float32Array(5 * 5 * 5);
         const _poc3SinOreX = new Float32Array(32);
-        const _poc3CellVertMap = new Int32Array(32 * 32 * 32);
-        const _poc3CVals = new Float32Array(8);
-        const _poc3CornerIdx = new Int32Array(8);
-        let _poc3Verts = new Float32Array(16384 * 3);
-        let _poc3Norms = new Float32Array(16384 * 3);
-        let _poc3Cols = new Float32Array(16384 * 3);
-        let _poc3ExtFlag = new Uint8Array(16384);
-        let _poc3Indices = new Uint32Array(65536 * 3);
         const MAX_PORTALS = 4096;
         const portalHoles = []; // Array of { point: Vector3, radius: number, radiusSq: number }
         let nextPortalIndex = 0;
@@ -131,10 +124,26 @@
         let MACRO_COLLAR_INSET = 4.0;
         const MAX_SUBTERRANEAN_CHUNKS = 512;
 
+        let worldEpoch = 0;
+        let opSerialChain = Promise.resolve();
         const subterraneanChunks = new Map();
         const voidChunkKeys = new Set();
         const activeSubterraneanMeshes = [];
+
+        // Bounded ESM Worker Pool (Option 3 + Option 1 Production Hybrid)
+        const workerPool = new MeshingWorkerPool(new URL('workers/surface_nets_worker.js', window.location.href).href);
+        window.__POC3_WORKER_POOL__ = workerPool;
         window.__POC3_CHUNKS__ = subterraneanChunks;
+
+        function enqueueSerializedOp(fn) {
+            const capturedEpoch = worldEpoch;
+            const next = opSerialChain.then(
+                () => fn(capturedEpoch),
+                () => fn(capturedEpoch)
+            );
+            opSerialChain = next.catch(() => {});
+            return next;
+        }
 
         // High-res Triplanar Materials (Macro crust supports clustered portal cutouts; Cavern supports vertex-color armor)
         const macroCrustMaterial = createTriplanarAsteroidMaterial({
@@ -386,12 +395,15 @@
             scene.add(planetaryMacroShell);
         }
 
-        // Subterranean Voxel Chunk (Dual-Grid Surface Nets mesher restricted to carved cavern manifolds)
+        // Subterranean Voxel Chunk (Dual-Grid Surface Nets offloaded to shared MeshingWorkerPool)
         class SubterraneanChunk {
-            constructor(cx, cy, cz) {
+            constructor(cx, cy, cz, epoch = worldEpoch) {
                 this.cx = cx;
                 this.cy = cy;
                 this.cz = cz;
+                this.epoch = epoch;
+                this.res = SUBTERRANEAN_CHUNK_RES;
+                this.cellSize = SUBTERRANEAN_CELL_SIZE;
                 this.key = `${cx},${cy},${cz}`;
                 this.minBounds = new THREE.Vector3(cx * SUBTERRANEAN_CHUNK_SIZE, cy * SUBTERRANEAN_CHUNK_SIZE, cz * SUBTERRANEAN_CHUNK_SIZE);
                 this.maxBounds = this.minBounds.clone().addScalar(SUBTERRANEAN_CHUNK_SIZE);
@@ -399,9 +411,11 @@
                 this.hasArmor = false;
                 this.isAllVoid = false;
                 this.hasNearCarve = false;
-                this.maxCarveInChunk = -SUBTERRANEAN_CELL_SIZE * 4.0;
+                this.maxCarveInChunk = -this.cellSize * 4.0;
+                this.isGenerating = false;
+                this.needsRebuild = false;
 
-                const pRes = SUBTERRANEAN_CHUNK_RES + 3;
+                const pRes = this.res + 3;
                 const total = pRes * pRes * pRes;
                 this.voxelData = new Float32Array(total);
                 this.carveField = new Float32Array(total);
@@ -503,229 +517,14 @@
                 }
             }
 
-            rebuild(scene) {
-                const pRes = SUBTERRANEAN_CHUNK_RES + 3;
-                const pRes2 = pRes * pRes;
-                const res = SUBTERRANEAN_CHUNK_RES;
-                const vox = this.voxelData;
-                const crv = this.carveField;
-                const mat = this.materialData;
-
-                const corners = [
-                    [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
-                    [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]
-                ];
-                const edges = [
-                    [0,1], [2,3], [4,5], [6,7],
-                    [0,2], [1,3], [4,6], [5,7],
-                    [0,4], [1,5], [2,6], [3,7]
-                ];
-                const cellCount = res + 2;
-                const cellCount2 = cellCount * cellCount;
-                const cellVertMap = _poc3CellVertMap.subarray(0, cellCount * cellCount * cellCount);
-                cellVertMap.fill(-1);
-                let vCount = 0;
-                let iCount = 0;
-                const cVals = _poc3CVals;
-                const cornerIdx = _poc3CornerIdx;
-
-                for (let cz = 0; cz < cellCount; cz++) {
-                    const zBase = cz * pRes2;
-                    for (let cy = 0; cy < cellCount; cy++) {
-                        const yzBase = zBase + cy * pRes;
-                        for (let cx = 0; cx < cellCount; cx++) {
-                            const i0 = yzBase + cx;
-                            const v0 = vox[i0];
-                            const v1 = vox[i0 + 1];
-                            const v2 = vox[i0 + pRes];
-                            const v3 = vox[i0 + pRes + 1];
-                            const i4 = i0 + pRes2;
-                            const v4 = vox[i4];
-                            const v5 = vox[i4 + 1];
-                            const v6 = vox[i4 + pRes];
-                            const v7 = vox[i4 + pRes + 1];
-
-                            const neg0 = v0 < 0, neg1 = v1 < 0, neg2 = v2 < 0, neg3 = v3 < 0;
-                            const neg4 = v4 < 0, neg5 = v5 < 0, neg6 = v6 < 0, neg7 = v7 < 0;
-                            if (
-                                neg0 === neg1 && neg0 === neg2 && neg0 === neg3 &&
-                                neg0 === neg4 && neg0 === neg5 && neg0 === neg6 && neg0 === neg7
-                            ) {
-                                continue;
-                            }
-
-                            cVals[0] = v0; cVals[1] = v1; cVals[2] = v2; cVals[3] = v3;
-                            cVals[4] = v4; cVals[5] = v5; cVals[6] = v6; cVals[7] = v7;
-                            cornerIdx[0] = i0; cornerIdx[1] = i0 + 1; cornerIdx[2] = i0 + pRes; cornerIdx[3] = i0 + pRes + 1;
-                            cornerIdx[4] = i4; cornerIdx[5] = i4 + 1; cornerIdx[6] = i4 + pRes; cornerIdx[7] = i4 + pRes + 1;
-
-                            let rockCount = 0;
-                            let oreCount = 0;
-                            let armorCount = 0;
-                            let maxCarveVal = -1e6;
-
-                            for (let c = 0; c < 8; c++) {
-                                const cIdx = cornerIdx[c];
-                                const cv = crv[cIdx];
-                                if (cv > maxCarveVal) maxCarveVal = cv;
-                                if (cVals[c] < 0) {
-                                    const m = mat[cIdx];
-                                    if (m === 3) armorCount++;
-                                    else if (m === 2) oreCount++;
-                                    else rockCount++;
-                                }
-                            }
-
-                            let vx = 0, vy = 0, vz = 0, edgeCount = 0;
-                            for (let e = 0; e < 12; e++) {
-                                const c1 = edges[e][0], c2 = edges[e][1];
-                                const ev1 = cVals[c1], ev2 = cVals[c2];
-                                if ((ev1 < 0) !== (ev2 < 0)) {
-                                    const denom = ev1 - ev2;
-                                    const t = Math.abs(denom) > 1e-6 ? ev1 / denom : 0.5;
-                                    const p1 = corners[c1], p2 = corners[c2];
-                                    vx += cx + p1[0] + t * (p2[0] - p1[0]);
-                                    vy += cy + p1[1] + t * (p2[1] - p1[1]);
-                                    vz += cz + p1[2] + t * (p2[2] - p1[2]);
-                                    edgeCount++;
-                                }
-                            }
-
-                            if (edgeCount === 0) continue;
-                            vx /= edgeCount; vy /= edgeCount; vz /= edgeCount;
-
-                            const wx = this.minBounds.x + (vx - 1) * SUBTERRANEAN_CELL_SIZE;
-                            const wy = this.minBounds.y + (vy - 1) * SUBTERRANEAN_CELL_SIZE;
-                            const wz = this.minBounds.z + (vz - 1) * SUBTERRANEAN_CELL_SIZE;
-
-                            const ipx = Math.max(1, Math.min(pRes - 2, Math.round(vx)));
-                            const ipy = Math.max(1, Math.min(pRes - 2, Math.round(vy)));
-                            const ipz = Math.max(1, Math.min(pRes - 2, Math.round(vz)));
-                            const gIdx = ipx + ipy * pRes + ipz * pRes2;
-                            const nx = vox[gIdx + 1] - vox[gIdx - 1];
-                            const ny = vox[gIdx + pRes] - vox[gIdx - pRes];
-                            const nz = vox[gIdx + pRes2] - vox[gIdx - pRes2];
-                            const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-                            let unx = 0, uny = 1, unz = 0;
-                            if (len > 1e-6) {
-                                unx = nx / len; uny = ny / len; unz = nz / len;
-                            }
-
-                            let domMat = 1;
-                            if (oreCount > rockCount && oreCount >= armorCount) domMat = 2;
-                            if (armorCount > 0) domMat = 3;
-
-                            let rCol, gCol, bCol;
-                            if (domMat === 3) {
-                                rCol = 0.12; gCol = 0.90; bCol = 0.98;
-                            } else if (domMat === 2) {
-                                rCol = 0.95; gCol = 0.70; bCol = 0.15;
-                            } else {
-                                rCol = 0.40; gCol = 0.44; bCol = 0.48;
-                            }
-
-                            const vIdx = vCount++;
-                            if (vCount * 3 > _poc3Verts.length) {
-                                const nextVerts = _poc3Verts.length * 2;
-                                const nv = new Float32Array(nextVerts); nv.set(_poc3Verts); _poc3Verts = nv;
-                                const nn = new Float32Array(nextVerts); nn.set(_poc3Norms); _poc3Norms = nn;
-                                const nc = new Float32Array(nextVerts); nc.set(_poc3Cols); _poc3Cols = nc;
-                                const nf = new Uint8Array(_poc3ExtFlag.length * 2); nf.set(_poc3ExtFlag); _poc3ExtFlag = nf;
-                            }
-                            cellVertMap[cx + cy * cellCount + cz * cellCount2] = vIdx;
-                            // Flag untouched exterior crust cells so we don't z-fight with smooth macro shell
-                            _poc3ExtFlag[vIdx] = maxCarveVal < -SUBTERRANEAN_CELL_SIZE * 0.85 ? 1 : 0;
-
-                            const vOff = vIdx * 3;
-                            _poc3Verts[vOff] = wx; _poc3Verts[vOff + 1] = wy; _poc3Verts[vOff + 2] = wz;
-                            _poc3Norms[vOff] = unx; _poc3Norms[vOff + 1] = uny; _poc3Norms[vOff + 2] = unz;
-                            _poc3Cols[vOff] = rCol; _poc3Cols[vOff + 1] = gCol; _poc3Cols[vOff + 2] = bCol;
-                        }
-                    }
+            applyMeshResult(scene, result) {
+                if (this.epoch !== worldEpoch || !result || result.cancelled) {
+                    return;
                 }
+                this.hasNearCarve = this.maxCarveInChunk >= -this.cellSize * 2.0;
 
-                const pushTriAligned = (i0, i1, i2) => {
-                    // Omit triangles strictly on untouched exterior crust (rendered smoothly by planetaryMacroShell)
-                    if (_poc3ExtFlag[i0] && _poc3ExtFlag[i1] && _poc3ExtFlag[i2]) {
-                        return;
-                    }
-                    const o0 = i0 * 3, o1 = i1 * 3, o2 = i2 * 3;
-                    const ax = _poc3Verts[o0], ay = _poc3Verts[o0 + 1], az = _poc3Verts[o0 + 2];
-                    const bx = _poc3Verts[o1], by = _poc3Verts[o1 + 1], bz = _poc3Verts[o1 + 2];
-                    const cx = _poc3Verts[o2], cy = _poc3Verts[o2 + 1], cz = _poc3Verts[o2 + 2];
-                    const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
-                    const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
-                    const gx = e1y * e2z - e1z * e2y;
-                    const gy = e1z * e2x - e1x * e2z;
-                    const gz = e1x * e2y - e1y * e2x;
-                    const nx = _poc3Norms[o0], ny = _poc3Norms[o0 + 1], nz = _poc3Norms[o0 + 2];
-                    if (iCount + 3 > _poc3Indices.length) {
-                        const ni = new Uint32Array(_poc3Indices.length * 2);
-                        ni.set(_poc3Indices);
-                        _poc3Indices = ni;
-                    }
-                    _poc3Indices[iCount] = i0;
-                    if (gx * nx + gy * ny + gz * nz >= 0.0) {
-                        _poc3Indices[iCount + 1] = i1;
-                        _poc3Indices[iCount + 2] = i2;
-                    } else {
-                        _poc3Indices[iCount + 1] = i2;
-                        _poc3Indices[iCount + 2] = i1;
-                    }
-                    iCount += 3;
-                };
-
-                // Grid edges quad stitching
-                for (let pz = 1; pz <= res; pz++) {
-                    const zBase = pz * pRes2;
-                    for (let py = 1; py <= res; py++) {
-                        const yzBase = zBase + py * pRes;
-                        for (let px = 1; px <= res; px++) {
-                            const dIdx = yzBase + px;
-                            const d0Neg = vox[dIdx] < 0;
-
-                            // X edge
-                            if (d0Neg !== (vox[dIdx + 1] < 0)) {
-                                const v0 = cellVertMap[px + (py - 1) * cellCount + (pz - 1) * cellCount2];
-                                const v1 = cellVertMap[px + py * cellCount + (pz - 1) * cellCount2];
-                                const v2 = cellVertMap[px + py * cellCount + pz * cellCount2];
-                                const v3 = cellVertMap[px + (py - 1) * cellCount + pz * cellCount2];
-                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    pushTriAligned(v0, v1, v2);
-                                    pushTriAligned(v0, v2, v3);
-                                }
-                            }
-
-                            // Y edge
-                            if (d0Neg !== (vox[dIdx + pRes] < 0)) {
-                                const v0 = cellVertMap[(px - 1) + py * cellCount + (pz - 1) * cellCount2];
-                                const v1 = cellVertMap[(px - 1) + py * cellCount + pz * cellCount2];
-                                const v2 = cellVertMap[px + py * cellCount + pz * cellCount2];
-                                const v3 = cellVertMap[px + py * cellCount + (pz - 1) * cellCount2];
-                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    pushTriAligned(v0, v2, v1);
-                                    pushTriAligned(v0, v3, v2);
-                                }
-                            }
-
-                            // Z edge
-                            if (d0Neg !== (vox[dIdx + pRes2] < 0)) {
-                                const v0 = cellVertMap[(px - 1) + (py - 1) * cellCount + pz * cellCount2];
-                                const v1 = cellVertMap[px + (py - 1) * cellCount + pz * cellCount2];
-                                const v2 = cellVertMap[px + py * cellCount + pz * cellCount2];
-                                const v3 = cellVertMap[(px - 1) + py * cellCount + pz * cellCount2];
-                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    pushTriAligned(v0, v1, v2);
-                                    pushTriAligned(v0, v2, v3);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                this.hasNearCarve = this.maxCarveInChunk >= -SUBTERRANEAN_CELL_SIZE * 2.0;
-
-                if (iCount === 0 || vCount === 0) {
+                const { positions, normals, colors, indices } = result;
+                if (!positions || !indices || positions.length === 0 || indices.length === 0) {
                     let allVoid = true;
                     const vArr = this.voxelData;
                     for (let i = 0; i < vArr.length; i++) {
@@ -746,17 +545,12 @@
                 }
                 this.isAllVoid = false;
 
-                const posArr = _poc3Verts.slice(0, vCount * 3);
-                const normArr = _poc3Norms.slice(0, vCount * 3);
-                const colArr = _poc3Cols.slice(0, vCount * 3);
-                const idxArr = _poc3Indices.slice(0, iCount);
-
                 if (!this.mesh) {
                     const geo = new THREE.BufferGeometry();
-                    geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
-                    geo.setAttribute('normal', new THREE.BufferAttribute(normArr, 3));
-                    geo.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
-                    geo.setIndex(new THREE.BufferAttribute(idxArr, 1));
+                    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+                    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                    geo.setIndex(new THREE.BufferAttribute(indices, 1));
                     geo.computeBoundingSphere();
                     geo.computeBoundingBox();
 
@@ -766,16 +560,89 @@
                     activeSubterraneanMeshes.push(this.mesh);
                 } else {
                     const geo = this.mesh.geometry;
-                    geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
-                    geo.setAttribute('normal', new THREE.BufferAttribute(normArr, 3));
-                    geo.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
-                    geo.setIndex(new THREE.BufferAttribute(idxArr, 1));
+                    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+                    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                    geo.setIndex(new THREE.BufferAttribute(indices, 1));
                     geo.attributes.position.needsUpdate = true;
                     geo.attributes.normal.needsUpdate = true;
                     geo.attributes.color.needsUpdate = true;
                     geo.computeBoundingSphere();
                     geo.computeBoundingBox();
                 }
+            }
+
+            async rebuild(scene) {
+                if (this.epoch !== worldEpoch || !this.voxelData) {
+                    this.needsRebuild = false;
+                    return { cancelled: true };
+                }
+                if (this.isGenerating) {
+                    this.needsRebuild = true;
+                    return null;
+                }
+                this.isGenerating = true;
+                this.needsRebuild = false;
+
+                let result = null;
+                let failed = false;
+                try {
+                    result = await workerPool.enqueue({
+                        epoch: this.epoch,
+                        buildPayload: () => {
+                            if (!this.voxelData || !this.materialData || !this.carveField) {
+                                return {
+                                    payload: {
+                                        mode: 'surface_nets',
+                                        halo: 1,
+                                        chunkId: this.key,
+                                        res: this.res,
+                                        voxelData: new Float32Array(0),
+                                        materialData: new Uint8Array(0),
+                                        carveField: new Float32Array(0),
+                                        minBounds: [this.minBounds.x, this.minBounds.y, this.minBounds.z],
+                                        cellSize: this.cellSize
+                                    },
+                                    transferables: []
+                                };
+                            }
+                            const voxelCopy = new Float32Array(this.voxelData);
+                            const matCopy = new Uint8Array(this.materialData);
+                            const carveCopy = new Float32Array(this.carveField);
+                            return {
+                                payload: {
+                                    mode: 'surface_nets',
+                                    halo: 1,
+                                    chunkId: this.key,
+                                    res: this.res,
+                                    voxelData: voxelCopy,
+                                    materialData: matCopy,
+                                    carveField: carveCopy,
+                                    minBounds: [this.minBounds.x, this.minBounds.y, this.minBounds.z],
+                                    cellSize: this.cellSize
+                                },
+                                transferables: [voxelCopy.buffer, matCopy.buffer, carveCopy.buffer]
+                            };
+                        }
+                    });
+                } catch (err) {
+                    failed = true;
+                    console.warn(`[PoC3] Chunk ${this.key} meshing failed:`, err);
+                } finally {
+                    this.isGenerating = false;
+                }
+
+                if (failed || !result || result.cancelled || this.epoch !== worldEpoch) {
+                    this.needsRebuild = false;
+                    return result || { cancelled: true };
+                }
+
+                this.applyMeshResult(scene, result);
+
+                if (this.needsRebuild && this.epoch === worldEpoch) {
+                    return await this.rebuild(scene);
+                }
+                return result;
             }
         }
 
@@ -882,148 +749,181 @@
             }
         }
 
-        function carveSpherePoC3(hitPoint, brushRadius) {
-            registerPortalHole(hitPoint, brushRadius);
-
-            const affected = ensureSubterraneanChunksAround(hitPoint, brushRadius);
-            const pRes = SUBTERRANEAN_CHUNK_RES + 3;
-            const pRes2 = pRes * pRes;
-            const pad = brushRadius + SUBTERRANEAN_CELL_SIZE * 4.0;
-            const invCell = 1.0 / SUBTERRANEAN_CELL_SIZE;
-            const protectedKeys = new Set();
-
-            for (let i = 0; i < affected.length; i++) {
-                const chunk = affected[i];
-                const minPX = Math.max(0, Math.floor((hitPoint.x - pad - chunk.minBounds.x) * invCell + 1));
-                const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + pad - chunk.minBounds.x) * invCell + 1));
-                const minPY = Math.max(0, Math.floor((hitPoint.y - pad - chunk.minBounds.y) * invCell + 1));
-                const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + pad - chunk.minBounds.y) * invCell + 1));
-                const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 1));
-                const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 1));
-                if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) {
-                    if (chunk.mesh === null && !chunk.hasArmor && !chunk.hasNearCarve) {
-                        subterraneanChunks.delete(chunk.key);
-                    } else {
-                        protectedKeys.add(chunk.key);
-                    }
-                    continue;
+        async function carveSpherePoC3(hitPoint, brushRadius) {
+            return enqueueSerializedOp(async (opEpoch) => {
+                if (opEpoch !== worldEpoch) {
+                    return { mainThreadMs: 0, cancelled: true };
                 }
+                const syncStart = performance.now();
+                registerPortalHole(hitPoint, brushRadius);
 
-                let modified = false;
-                const padSq = pad * pad;
-                const voxLim = brushRadius + SUBTERRANEAN_CELL_SIZE;
-                const voxLimSq = voxLim * voxLim;
-                for (let pz = minPZ; pz <= maxPZ; pz++) {
-                    const dz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.z;
-                    const dz2 = dz * dz;
-                    const zOff = pz * pRes2;
-                    for (let py = minPY; py <= maxPY; py++) {
-                        const dy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.y;
-                        const dyz2 = dz2 + dy * dy;
-                        if (dyz2 > padSq) continue;
-                        const yzOff = zOff + py * pRes;
-                        for (let px = minPX; px <= maxPX; px++) {
-                            const dx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.x;
-                            const dSq = dyz2 + dx * dx;
-                            if (dSq > padSq) continue;
-                            const dist = Math.sqrt(dSq);
-                            const carveD = brushRadius - dist;
-                            const idx = yzOff + px;
-                            if (carveD > chunk.carveField[idx]) {
-                                chunk.carveField[idx] = carveD;
-                                if (carveD > chunk.maxCarveInChunk) {
-                                    chunk.maxCarveInChunk = carveD;
-                                }
-                            }
-                            if (dSq <= voxLimSq) {
-                                if (carveD > chunk.voxelData[idx]) {
-                                    chunk.voxelData[idx] = carveD;
-                                    modified = true;
-                                }
-                            }
+                const affected = ensureSubterraneanChunksAround(hitPoint, brushRadius);
+                const pRes = SUBTERRANEAN_CHUNK_RES + 3;
+                const pRes2 = pRes * pRes;
+                const pad = brushRadius + SUBTERRANEAN_CELL_SIZE * 4.0;
+                const invCell = 1.0 / SUBTERRANEAN_CELL_SIZE;
+                const protectedKeys = new Set();
+                const modifiedChunks = [];
+                const rebuilds = [];
+
+                for (let i = 0; i < affected.length; i++) {
+                    const chunk = affected[i];
+                    const minPX = Math.max(0, Math.floor((hitPoint.x - pad - chunk.minBounds.x) * invCell + 1));
+                    const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + pad - chunk.minBounds.x) * invCell + 1));
+                    const minPY = Math.max(0, Math.floor((hitPoint.y - pad - chunk.minBounds.y) * invCell + 1));
+                    const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + pad - chunk.minBounds.y) * invCell + 1));
+                    const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 1));
+                    const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 1));
+                    if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) {
+                        if (chunk.mesh === null && !chunk.hasArmor && !chunk.hasNearCarve) {
+                            subterraneanChunks.delete(chunk.key);
+                        } else {
+                            protectedKeys.add(chunk.key);
                         }
+                        continue;
                     }
-                }
-                if (modified) {
-                    chunk.rebuild(sandbox.scene);
-                    if (chunk.isAllVoid && !chunk.hasArmor) {
-                        disposeChunkEntry(chunk);
-                        subterraneanChunks.delete(chunk.key);
-                        voidChunkKeys.add(chunk.key);
-                    } else if (chunk.mesh === null && !chunk.hasArmor && !chunk.hasNearCarve) {
-                        subterraneanChunks.delete(chunk.key);
-                    } else {
-                        protectedKeys.add(chunk.key);
-                    }
-                } else if (chunk.mesh === null && !chunk.hasArmor) {
-                    chunk.hasNearCarve = chunk.maxCarveInChunk >= -SUBTERRANEAN_CELL_SIZE * 2.0;
-                    if (!chunk.hasNearCarve) {
-                        subterraneanChunks.delete(chunk.key);
-                    } else {
-                        protectedKeys.add(chunk.key);
-                    }
-                } else {
-                    protectedKeys.add(chunk.key);
-                }
-            }
 
-            pruneSubterraneanChunks(protectedKeys);
-        }
-
-        function reinforceSpherePoC3(hitPoint, brushRadius) {
-            const pRes = SUBTERRANEAN_CHUNK_RES + 3;
-            const pRes2 = pRes * pRes;
-            const pad = brushRadius + SUBTERRANEAN_CELL_SIZE;
-            const invCell = 1.0 / SUBTERRANEAN_CELL_SIZE;
-            const minCX = Math.floor((hitPoint.x - pad) / SUBTERRANEAN_CHUNK_SIZE);
-            const maxCX = Math.floor((hitPoint.x + pad) / SUBTERRANEAN_CHUNK_SIZE);
-            const minCY = Math.floor((hitPoint.y - pad) / SUBTERRANEAN_CHUNK_SIZE);
-            const maxCY = Math.floor((hitPoint.y + pad) / SUBTERRANEAN_CHUNK_SIZE);
-            const minCZ = Math.floor((hitPoint.z - pad) / SUBTERRANEAN_CHUNK_SIZE);
-            const maxCZ = Math.floor((hitPoint.z + pad) / SUBTERRANEAN_CHUNK_SIZE);
-
-            for (let cz = minCZ; cz <= maxCZ; cz++) {
-                for (let cy = minCY; cy <= maxCY; cy++) {
-                    for (let cx = minCX; cx <= maxCX; cx++) {
-                        const chunk = subterraneanChunks.get(`${cx},${cy},${cz}`);
-                        if (!chunk) continue;
-
-                        const minPX = Math.max(0, Math.floor((hitPoint.x - pad - chunk.minBounds.x) * invCell + 1));
-                        const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + pad - chunk.minBounds.x) * invCell + 1));
-                        const minPY = Math.max(0, Math.floor((hitPoint.y - pad - chunk.minBounds.y) * invCell + 1));
-                        const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + pad - chunk.minBounds.y) * invCell + 1));
-                        const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 1));
-                        const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 1));
-                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
-
-                        let modified = false;
-                        const rSq = brushRadius * brushRadius;
-                        for (let pz = minPZ; pz <= maxPZ; pz++) {
-                            const dz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.z;
-                            const dz2 = dz * dz;
-                            const zOff = pz * pRes2;
-                            for (let py = minPY; py <= maxPY; py++) {
-                                const dy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.y;
-                                const dyz2 = dz2 + dy * dy;
-                                if (dyz2 > rSq) continue;
-                                const yzOff = zOff + py * pRes;
-                                for (let px = minPX; px <= maxPX; px++) {
-                                    const dx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.x;
-                                    const idx = yzOff + px;
-                                    if (dyz2 + dx * dx <= rSq && chunk.voxelData[idx] < 0) {
-                                        chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
-                                        chunk.hasArmor = true;
+                    let modified = false;
+                    const padSq = pad * pad;
+                    const voxLim = brushRadius + SUBTERRANEAN_CELL_SIZE;
+                    const voxLimSq = voxLim * voxLim;
+                    for (let pz = minPZ; pz <= maxPZ; pz++) {
+                        const dz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.z;
+                        const dz2 = dz * dz;
+                        const zOff = pz * pRes2;
+                        for (let py = minPY; py <= maxPY; py++) {
+                            const dy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.y;
+                            const dyz2 = dz2 + dy * dy;
+                            if (dyz2 > padSq) continue;
+                            const yzOff = zOff + py * pRes;
+                            for (let px = minPX; px <= maxPX; px++) {
+                                const dx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.x;
+                                const dSq = dyz2 + dx * dx;
+                                if (dSq > padSq) continue;
+                                const dist = Math.sqrt(dSq);
+                                const carveD = brushRadius - dist;
+                                const idx = yzOff + px;
+                                if (carveD > chunk.carveField[idx]) {
+                                    chunk.carveField[idx] = carveD;
+                                    if (carveD > chunk.maxCarveInChunk) {
+                                        chunk.maxCarveInChunk = carveD;
+                                    }
+                                }
+                                if (dSq <= voxLimSq) {
+                                    if (carveD > chunk.voxelData[idx]) {
+                                        chunk.voxelData[idx] = carveD;
                                         modified = true;
                                     }
                                 }
                             }
                         }
-                        if (modified) {
-                            chunk.rebuild(sandbox.scene);
+                    }
+                    if (modified) {
+                        chunk.hasNearCarve = chunk.maxCarveInChunk >= -SUBTERRANEAN_CELL_SIZE * 2.0;
+                        protectedKeys.add(chunk.key);
+                        modifiedChunks.push(chunk);
+                        rebuilds.push(chunk.rebuild(sandbox.scene));
+                    } else if (chunk.mesh === null && !chunk.hasArmor) {
+                        chunk.hasNearCarve = chunk.maxCarveInChunk >= -SUBTERRANEAN_CELL_SIZE * 2.0;
+                        if (!chunk.hasNearCarve) {
+                            subterraneanChunks.delete(chunk.key);
+                        } else {
+                            protectedKeys.add(chunk.key);
+                        }
+                    } else {
+                        protectedKeys.add(chunk.key);
+                    }
+                }
+
+                const mainThreadMs = performance.now() - syncStart;
+                await Promise.allSettled(rebuilds);
+                if (opEpoch !== worldEpoch) {
+                    return { mainThreadMs, cancelled: true };
+                }
+
+                for (let i = 0; i < modifiedChunks.length; i++) {
+                    const chunk = modifiedChunks[i];
+                    if (chunk.isAllVoid && !chunk.hasArmor) {
+                        disposeChunkEntry(chunk);
+                        subterraneanChunks.delete(chunk.key);
+                        voidChunkKeys.add(chunk.key);
+                        protectedKeys.delete(chunk.key);
+                    } else if (chunk.mesh === null && !chunk.hasArmor && !chunk.hasNearCarve) {
+                        subterraneanChunks.delete(chunk.key);
+                        protectedKeys.delete(chunk.key);
+                    }
+                }
+
+                pruneSubterraneanChunks(protectedKeys);
+                return { mainThreadMs };
+            });
+        }
+
+        async function reinforceSpherePoC3(hitPoint, brushRadius) {
+            return enqueueSerializedOp(async (opEpoch) => {
+                if (opEpoch !== worldEpoch) {
+                    return { mainThreadMs: 0, cancelled: true };
+                }
+                const syncStart = performance.now();
+                const pRes = SUBTERRANEAN_CHUNK_RES + 3;
+                const pRes2 = pRes * pRes;
+                const pad = brushRadius + SUBTERRANEAN_CELL_SIZE;
+                const invCell = 1.0 / SUBTERRANEAN_CELL_SIZE;
+                const minCX = Math.floor((hitPoint.x - pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const maxCX = Math.floor((hitPoint.x + pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const minCY = Math.floor((hitPoint.y - pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const maxCY = Math.floor((hitPoint.y + pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const minCZ = Math.floor((hitPoint.z - pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const maxCZ = Math.floor((hitPoint.z + pad) / SUBTERRANEAN_CHUNK_SIZE);
+                const rebuilds = [];
+
+                for (let cz = minCZ; cz <= maxCZ; cz++) {
+                    for (let cy = minCY; cy <= maxCY; cy++) {
+                        for (let cx = minCX; cx <= maxCX; cx++) {
+                            const chunk = subterraneanChunks.get(`${cx},${cy},${cz}`);
+                            if (!chunk) continue;
+
+                            const minPX = Math.max(0, Math.floor((hitPoint.x - pad - chunk.minBounds.x) * invCell + 1));
+                            const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + pad - chunk.minBounds.x) * invCell + 1));
+                            const minPY = Math.max(0, Math.floor((hitPoint.y - pad - chunk.minBounds.y) * invCell + 1));
+                            const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + pad - chunk.minBounds.y) * invCell + 1));
+                            const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 1));
+                            const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 1));
+                            if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+
+                            let modified = false;
+                            const rSq = brushRadius * brushRadius;
+                            for (let pz = minPZ; pz <= maxPZ; pz++) {
+                                const dz = chunk.minBounds.z + (pz - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.z;
+                                const dz2 = dz * dz;
+                                const zOff = pz * pRes2;
+                                for (let py = minPY; py <= maxPY; py++) {
+                                    const dy = chunk.minBounds.y + (py - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.y;
+                                    const dyz2 = dz2 + dy * dy;
+                                    if (dyz2 > rSq) continue;
+                                    const yzOff = zOff + py * pRes;
+                                    for (let px = minPX; px <= maxPX; px++) {
+                                        const dx = chunk.minBounds.x + (px - 1) * SUBTERRANEAN_CELL_SIZE - hitPoint.x;
+                                        const idx = yzOff + px;
+                                        if (dyz2 + dx * dx <= rSq && chunk.voxelData[idx] < 0) {
+                                            chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
+                                            chunk.hasArmor = true;
+                                            modified = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if (modified) {
+                                rebuilds.push(chunk.rebuild(sandbox.scene));
+                            }
                         }
                     }
                 }
-            }
+
+                const mainThreadMs = performance.now() - syncStart;
+                await Promise.allSettled(rebuilds);
+                return { mainThreadMs };
+            });
         }
 
         function computeMacroCollarInset() {
@@ -1038,7 +938,7 @@
             MACRO_COLLAR_INSET = computeMacroCollarInset();
         }
 
-        function buildStarterTunnelPoC3() {
+        async function buildStarterTunnelPoC3(myEpoch) {
             const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
             const surfPt = findSurfacePoint(
                 (wx, wy, wz) => Math.hypot(wx, wy, wz) - evalMacroRadiusAt(wx, wy, wz),
@@ -1046,12 +946,19 @@
                 currentRadius * 0.6,
                 currentRadius * 1.4
             );
-            carveSpherePoC3(surfPt, 175);
-            carveSpherePoC3(surfPt.clone().addScaledVector(tunnelDir, -135), 155);
-            reinforceSpherePoC3(surfPt.clone().addScaledVector(tunnelDir, -125), 195);
+            await carveSpherePoC3(surfPt, 175);
+            if (worldEpoch !== myEpoch) return;
+            await carveSpherePoC3(surfPt.clone().addScaledVector(tunnelDir, -135), 155);
+            if (worldEpoch !== myEpoch) return;
+            await reinforceSpherePoC3(surfPt.clone().addScaledVector(tunnelDir, -125), 195);
         }
 
-        function rebuildScenePoC3() {
+        async function rebuildAllPoC3() {
+            worldEpoch++;
+            const myEpoch = worldEpoch;
+            workerPool.setEpoch(worldEpoch);
+            opSerialChain = Promise.resolve();
+
             clearPortalGrid();
             activeSubterraneanMeshes.forEach(m => {
                 sandbox.scene.remove(m);
@@ -1068,8 +975,8 @@
             cavernMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
 
             buildMacroCrust(sandbox.scene);
-            buildStarterTunnelPoC3();
-            if (typeof sandbox !== 'undefined' && sandbox) {
+            await buildStarterTunnelPoC3(myEpoch);
+            if (worldEpoch === myEpoch && typeof sandbox !== 'undefined' && sandbox) {
                 sandbox.updateCellSizeLabel();
             }
         }
@@ -1219,11 +1126,11 @@
             },
 
             onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
-                carveSpherePoC3(hitPoint, brushRadius);
+                return await carveSpherePoC3(hitPoint, brushRadius);
             },
 
             onReinforce: async (hitPoint, hitNormal, brushRadius) => {
-                reinforceSpherePoC3(hitPoint, brushRadius);
+                return await reinforceSpherePoC3(hitPoint, brushRadius);
             },
 
             checkMaterialAtHit: (point, hit) => {
@@ -1239,14 +1146,14 @@
                 return false;
             },
 
-            onScaleChange: (scaleKey, radius) => {
+            onScaleChange: async (scaleKey, radius) => {
                 currentRadius = radius;
-                rebuildScenePoC3();
+                await rebuildAllPoC3();
             },
 
-            onQualityChange: (qualityKey) => {
+            onQualityChange: async (qualityKey) => {
                 applyQualityConfigPoC3(qualityKey);
-                rebuildScenePoC3();
+                await rebuildAllPoC3();
             },
 
             onToggleWireframe: (enabled) => {
@@ -1264,8 +1171,8 @@
 
         currentRadius = sandbox.currentRadius;
         applyQualityConfigPoC3(sandbox.currentQuality);
-        rebuildScenePoC3();
         sandbox.updateCellSizeLabel();
+        rebuildAllPoC3();
     </script>
 </body>
 </html>
