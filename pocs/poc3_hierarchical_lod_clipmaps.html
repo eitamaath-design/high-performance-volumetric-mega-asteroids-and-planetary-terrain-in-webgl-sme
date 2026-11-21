@@ -13,6 +13,7 @@
         import * as THREE from './vendor/three.module.js';
         import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint } from './shared/planetary_base_sandbox.js';
         import { MeshingWorkerPool } from './shared/meshing_worker_pool.js';
+        import { ChunkBatchManager } from './shared/chunk_batch_manager.js';
 
         // --- Fast 3D Simplex-Style Noise ---
         class FastNoise3D {
@@ -125,10 +126,10 @@
         const MAX_SUBTERRANEAN_CHUNKS = 512;
 
         let worldEpoch = 0;
+        let chunkUseTick = 0;
         let opSerialChain = Promise.resolve();
         const subterraneanChunks = new Map();
         const voidChunkKeys = new Set();
-        const activeSubterraneanMeshes = [];
 
         // Bounded ESM Worker Pool (Option 3 + Option 1 Production Hybrid)
         const workerPool = new MeshingWorkerPool(new URL('workers/surface_nets_worker.js', window.location.href).href);
@@ -158,6 +159,8 @@
             hasPortals: false,
             radius: currentRadius
         });
+        const batchManager = new ChunkBatchManager(null, cavernMaterial);
+        window.__POC3_BATCH_MANAGER__ = batchManager;
 
         function evalMacroRadiusAt(wx, wy, wz) {
             const len = Math.sqrt(wx * wx + wy * wy + wz * wz) || 1.0;
@@ -407,11 +410,17 @@
                 this.key = `${cx},${cy},${cz}`;
                 this.minBounds = new THREE.Vector3(cx * SUBTERRANEAN_CHUNK_SIZE, cy * SUBTERRANEAN_CHUNK_SIZE, cz * SUBTERRANEAN_CHUNK_SIZE);
                 this.maxBounds = this.minBounds.clone().addScalar(SUBTERRANEAN_CHUNK_SIZE);
-                this.mesh = null;
+                this.center = new THREE.Vector3(
+                    this.minBounds.x + SUBTERRANEAN_CHUNK_SIZE * 0.5,
+                    this.minBounds.y + SUBTERRANEAN_CHUNK_SIZE * 0.5,
+                    this.minBounds.z + SUBTERRANEAN_CHUNK_SIZE * 0.5
+                );
+                this.hasMesh = false;
                 this.hasArmor = false;
                 this.isAllVoid = false;
                 this.hasNearCarve = false;
                 this.maxCarveInChunk = -this.cellSize * 4.0;
+                this.lastUsedTick = ++chunkUseTick;
                 this.isGenerating = false;
                 this.needsRebuild = false;
 
@@ -517,10 +526,11 @@
                 }
             }
 
-            applyMeshResult(scene, result) {
+            applyMeshResult(scene, result, options = {}) {
                 if (this.epoch !== worldEpoch || !result || result.cancelled) {
                     return;
                 }
+                const deferFlush = Boolean(options && options.deferFlush);
                 this.hasNearCarve = this.maxCarveInChunk >= -this.cellSize * 2.0;
 
                 const { positions, normals, colors, indices } = result;
@@ -534,45 +544,21 @@
                         }
                     }
                     this.isAllVoid = allVoid;
-                    if (this.mesh) {
-                        scene.remove(this.mesh);
-                        const idx = activeSubterraneanMeshes.indexOf(this.mesh);
-                        if (idx !== -1) activeSubterraneanMeshes.splice(idx, 1);
-                        this.mesh.geometry.dispose();
-                        this.mesh = null;
+                    if (this.hasMesh) {
+                        batchManager.removeChunk(this.key);
+                        this.hasMesh = false;
+                        if (!deferFlush) batchManager.flush(scene);
                     }
                     return;
                 }
                 this.isAllVoid = false;
-
-                if (!this.mesh) {
-                    const geo = new THREE.BufferGeometry();
-                    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-                    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-                    geo.setIndex(new THREE.BufferAttribute(indices, 1));
-                    geo.computeBoundingSphere();
-                    geo.computeBoundingBox();
-
-                    this.mesh = new THREE.Mesh(geo, cavernMaterial);
-                    this.mesh.userData = { chunk: this };
-                    scene.add(this.mesh);
-                    activeSubterraneanMeshes.push(this.mesh);
-                } else {
-                    const geo = this.mesh.geometry;
-                    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-                    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-                    geo.setIndex(new THREE.BufferAttribute(indices, 1));
-                    geo.attributes.position.needsUpdate = true;
-                    geo.attributes.normal.needsUpdate = true;
-                    geo.attributes.color.needsUpdate = true;
-                    geo.computeBoundingSphere();
-                    geo.computeBoundingBox();
-                }
+                batchManager.upsertChunk(this.key, this.center, positions, normals, colors, indices);
+                this.hasMesh = true;
+                this.lastUsedTick = ++chunkUseTick;
+                if (!deferFlush) batchManager.flush(scene);
             }
 
-            async rebuild(scene) {
+            async rebuild(scene, options = {}) {
                 if (this.epoch !== worldEpoch || !this.voxelData) {
                     this.needsRebuild = false;
                     return { cancelled: true };
@@ -637,10 +623,10 @@
                     return result || { cancelled: true };
                 }
 
-                this.applyMeshResult(scene, result);
+                this.applyMeshResult(scene, result, options);
 
                 if (this.needsRebuild && this.epoch === worldEpoch) {
-                    return await this.rebuild(scene);
+                    return await this.rebuild(scene, options);
                 }
                 return result;
             }
@@ -702,6 +688,8 @@
                             }
                             chunk = new SubterraneanChunk(cx, cy, cz);
                             subterraneanChunks.set(key, chunk);
+                        } else {
+                            chunk.lastUsedTick = ++chunkUseTick;
                         }
                         touched.push(chunk);
                     }
@@ -711,41 +699,42 @@
         }
 
         function disposeChunkEntry(chunk) {
-            if (chunk.mesh) {
-                sandbox.scene.remove(chunk.mesh);
-                const mIdx = activeSubterraneanMeshes.indexOf(chunk.mesh);
-                if (mIdx !== -1) activeSubterraneanMeshes.splice(mIdx, 1);
-                chunk.mesh.geometry.dispose();
-                chunk.mesh = null;
+            if (chunk.hasMesh) {
+                batchManager.removeChunk(chunk.key);
+                chunk.hasMesh = false;
             }
         }
 
         function pruneSubterraneanChunks(protectedKeys) {
             if (subterraneanChunks.size <= MAX_SUBTERRANEAN_CHUNKS) return;
 
+            const candidates = [];
             for (const [key, chunk] of subterraneanChunks) {
-                if (subterraneanChunks.size <= MAX_SUBTERRANEAN_CHUNKS) break;
-                if (protectedKeys.has(key)) continue;
-                if (chunk.mesh === null && !chunk.hasArmor) {
-                    subterraneanChunks.delete(key);
+                if (protectedKeys && protectedKeys.has(key)) continue;
+                candidates.push(chunk);
+            }
+            // Evict oldest unmodified non-armored chunks first (non-mesh -> mesh -> armored)
+            candidates.sort((a, b) => {
+                const pa = (a.hasArmor ? 2 : 0) + (a.hasMesh ? 1 : 0);
+                const pb = (b.hasArmor ? 2 : 0) + (b.hasMesh ? 1 : 0);
+                if (pa !== pb) return pa - pb;
+                return a.lastUsedTick - b.lastUsedTick;
+            });
+
+            for (let i = 0; i < candidates.length && subterraneanChunks.size > MAX_SUBTERRANEAN_CHUNKS; i++) {
+                const chunk = candidates[i];
+                disposeChunkEntry(chunk);
+                subterraneanChunks.delete(chunk.key);
+            }
+
+            // Hard cap fallback if protected set itself exceeds MAX_SUBTERRANEAN_CHUNKS
+            if (subterraneanChunks.size > MAX_SUBTERRANEAN_CHUNKS) {
+                const allChunks = Array.from(subterraneanChunks.values()).sort((a, b) => a.lastUsedTick - b.lastUsedTick);
+                for (let i = 0; i < allChunks.length && subterraneanChunks.size > MAX_SUBTERRANEAN_CHUNKS; i++) {
+                    const chunk = allChunks[i];
+                    disposeChunkEntry(chunk);
+                    subterraneanChunks.delete(chunk.key);
                 }
-            }
-
-            if (subterraneanChunks.size <= MAX_SUBTERRANEAN_CHUNKS) return;
-
-            for (const [key, chunk] of subterraneanChunks) {
-                if (subterraneanChunks.size <= MAX_SUBTERRANEAN_CHUNKS) break;
-                if (protectedKeys.has(key)) continue;
-                disposeChunkEntry(chunk);
-                subterraneanChunks.delete(key);
-            }
-
-            if (subterraneanChunks.size <= MAX_SUBTERRANEAN_CHUNKS) return;
-
-            for (const [key, chunk] of subterraneanChunks) {
-                if (subterraneanChunks.size <= MAX_SUBTERRANEAN_CHUNKS) break;
-                disposeChunkEntry(chunk);
-                subterraneanChunks.delete(key);
             }
         }
 
@@ -775,7 +764,7 @@
                     const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 1));
                     const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 1));
                     if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) {
-                        if (chunk.mesh === null && !chunk.hasArmor && !chunk.hasNearCarve) {
+                        if (!chunk.hasMesh && !chunk.hasArmor && !chunk.hasNearCarve) {
                             subterraneanChunks.delete(chunk.key);
                         } else {
                             protectedKeys.add(chunk.key);
@@ -820,10 +809,11 @@
                     }
                     if (modified) {
                         chunk.hasNearCarve = chunk.maxCarveInChunk >= -SUBTERRANEAN_CELL_SIZE * 2.0;
+                        chunk.lastUsedTick = ++chunkUseTick;
                         protectedKeys.add(chunk.key);
                         modifiedChunks.push(chunk);
-                        rebuilds.push(chunk.rebuild(sandbox.scene));
-                    } else if (chunk.mesh === null && !chunk.hasArmor) {
+                        rebuilds.push(chunk.rebuild(sandbox.scene, { deferFlush: true }));
+                    } else if (!chunk.hasMesh && !chunk.hasArmor) {
                         chunk.hasNearCarve = chunk.maxCarveInChunk >= -SUBTERRANEAN_CELL_SIZE * 2.0;
                         if (!chunk.hasNearCarve) {
                             subterraneanChunks.delete(chunk.key);
@@ -848,13 +838,14 @@
                         subterraneanChunks.delete(chunk.key);
                         voidChunkKeys.add(chunk.key);
                         protectedKeys.delete(chunk.key);
-                    } else if (chunk.mesh === null && !chunk.hasArmor && !chunk.hasNearCarve) {
+                    } else if (!chunk.hasMesh && !chunk.hasArmor && !chunk.hasNearCarve) {
                         subterraneanChunks.delete(chunk.key);
                         protectedKeys.delete(chunk.key);
                     }
                 }
 
                 pruneSubterraneanChunks(protectedKeys);
+                batchManager.flush(sandbox.scene);
                 return { mainThreadMs };
             });
         }
@@ -914,7 +905,8 @@
                                 }
                             }
                             if (modified) {
-                                rebuilds.push(chunk.rebuild(sandbox.scene));
+                                chunk.lastUsedTick = ++chunkUseTick;
+                                rebuilds.push(chunk.rebuild(sandbox.scene, { deferFlush: true }));
                             }
                         }
                     }
@@ -922,6 +914,9 @@
 
                 const mainThreadMs = performance.now() - syncStart;
                 await Promise.allSettled(rebuilds);
+                if (opEpoch === worldEpoch) {
+                    batchManager.flush(sandbox.scene);
+                }
                 return { mainThreadMs };
             });
         }
@@ -960,11 +955,8 @@
             opSerialChain = Promise.resolve();
 
             clearPortalGrid();
-            activeSubterraneanMeshes.forEach(m => {
-                sandbox.scene.remove(m);
-                m.geometry.dispose();
-            });
-            activeSubterraneanMeshes.length = 0;
+            batchManager.setScene(sandbox.scene);
+            batchManager.clear();
             subterraneanChunks.clear();
             voidChunkKeys.clear();
 
@@ -989,19 +981,19 @@
             getCollisionMesh: () => {
                 const list = [];
                 if (planetaryMacroShell) list.push(planetaryMacroShell);
-                list.push(...activeSubterraneanMeshes);
+                list.push(...batchManager.getBatchedMeshes());
                 return list;
             },
             getVisualMesh: () => {
                 const list = [];
                 if (planetaryMacroShell) list.push(planetaryMacroShell);
-                list.push(...activeSubterraneanMeshes);
+                list.push(...batchManager.getBatchedMeshes());
                 return list;
             },
             auditVisualCollisionParity: (raycaster) => {
                 const visTargets = [];
                 if (planetaryMacroShell) visTargets.push(planetaryMacroShell);
-                visTargets.push(...activeSubterraneanMeshes);
+                visTargets.push(...batchManager.getBatchedMeshes());
                 const visHits = visTargets.length > 0 ? raycaster.intersectObjects(visTargets, false) : [];
                 let visHit = null;
                 for (let i = 0; i < visHits.length; i++) {
@@ -1025,8 +1017,9 @@
                 }
 
                 let bestSubHit = null;
-                if (activeSubterraneanMeshes.length > 0) {
-                    const subHits = raycaster.intersectObjects(activeSubterraneanMeshes, false);
+                const batchedSubMeshes = batchManager.getBatchedMeshes();
+                if (batchedSubMeshes.length > 0) {
+                    const subHits = raycaster.intersectObjects(batchedSubMeshes, false);
                     if (subHits.length > 0) bestSubHit = subHits[0];
                 }
 
@@ -1059,6 +1052,7 @@
 
                     let bestDist = Math.min(bestSubHit ? bestSubHit.distance : Infinity, raycaster.far);
                     let bestMacroHit = null;
+                    const backfaceCull = (macroCrustMaterial.side === THREE.FrontSide);
 
                     for (let i = 0; i < _rcHitCells.length; i++) {
                         const entry = _rcHitCells[i];
@@ -1077,7 +1071,7 @@
                             _rcTriB.fromBufferAttribute(posAttr, i1);
                             _rcTriC.fromBufferAttribute(posAttr, i2);
 
-                            const hitPt = ray.intersectTriangle(_rcTriA, _rcTriB, _rcTriC, false, _rcTriHit);
+                            const hitPt = ray.intersectTriangle(_rcTriA, _rcTriB, _rcTriC, backfaceCull, _rcTriHit);
                             if (!hitPt) continue;
 
                             const dist = ro.distanceTo(hitPt);
@@ -1110,7 +1104,7 @@
                 }
 
                 // Fallback when macroRaycastGrid is absent
-                const targets = [...activeSubterraneanMeshes];
+                const targets = [...batchManager.getBatchedMeshes()];
                 if (planetaryMacroShell) targets.push(planetaryMacroShell);
                 const hits = raycaster.intersectObjects(targets, false);
 
@@ -1164,10 +1158,14 @@
             onToggleXRay: (enabled, plane) => {
                 macroCrustMaterial.clippingPlanes = enabled ? [plane] : [];
                 cavernMaterial.clippingPlanes = enabled ? [plane] : [];
+                const targetSide = enabled ? THREE.DoubleSide : THREE.FrontSide;
+                if (macroCrustMaterial.side !== targetSide) macroCrustMaterial.side = targetSide;
+                if (cavernMaterial.side !== targetSide) cavernMaterial.side = targetSide;
                 macroCrustMaterial.needsUpdate = true;
                 cavernMaterial.needsUpdate = true;
             }
         });
+        batchManager.setScene(sandbox.scene);
 
         currentRadius = sandbox.currentRadius;
         applyQualityConfigPoC3(sandbox.currentQuality);

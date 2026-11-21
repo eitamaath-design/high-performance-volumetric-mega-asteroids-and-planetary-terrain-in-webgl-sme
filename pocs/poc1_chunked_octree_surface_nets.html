@@ -13,6 +13,7 @@
         import * as THREE from './vendor/three.module.js';
         import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint } from './shared/planetary_base_sandbox.js';
         import { MeshingWorkerPool } from './shared/meshing_worker_pool.js';
+        import { ChunkBatchManager } from './shared/chunk_batch_manager.js';
 
         // --- Fast 3D Simplex-Style Noise for Procedural Asteroid Form ---
         class FastNoise3D {
@@ -74,6 +75,8 @@
         const QUALITY_PRESETS_POC1 = { low: 12, medium: 18, high: 24, ultra: 30 };
         const FINE_CELL_LIMIT = 20.0;
         const MAX_SUBDIV_LEVEL = 4;
+        const MAX_ACTIVE_CHUNKS = 512;
+        let chunkUseTick = 0;
         let currentRadius = 2800;
         let CHUNK_RES = 24; // Configurable by quality tier (12..30 cells per chunk)
         let CHUNK_SIZE = 1260;
@@ -94,7 +97,6 @@
 
         // Sparse Hierarchical Octree Chunks + Lossless CSG History
         const chunkMap = new Map(); // key '0:gx,gy,gz' => root VoxelChunk
-        const activeChunkMeshes = [];
         const editHistory = [];
         let opSerialChain = Promise.resolve();
         const _poc1CoarseGrid = new Float32Array(9 * 9 * 9);
@@ -124,6 +126,8 @@
 
         // Procedural 3D Triplanar Rock + Ore + Hex Titanium Bulkhead Material
         const chunkMaterial = createTriplanarAsteroidMaterial({ vertexColors: true, radius: currentRadius });
+        const batchManager = new ChunkBatchManager(null, chunkMaterial);
+        window.__POC1_BATCH_MANAGER__ = batchManager;
 
         function nodeIntersectsSphere(node, cx, cy, cz, r) {
             const halo = 2.0 * node.cellSize;
@@ -198,6 +202,11 @@
                 this.key = `${level}:${gx},${gy},${gz}`;
                 this.minBounds = new THREE.Vector3(gx * size, gy * size, gz * size);
                 this.maxBounds = this.minBounds.clone().addScalar(size);
+                this.center = new THREE.Vector3(
+                    this.minBounds.x + size * 0.5,
+                    this.minBounds.y + size * 0.5,
+                    this.minBounds.z + size * 0.5
+                );
 
                 this.children = null;
                 this.state = 'uninit'; // 'surface' | 'solid' | 'void'
@@ -205,7 +214,9 @@
                 this.voxelData = null;
                 this.materialData = null;
 
-                this.mesh = null;
+                this.hasMesh = false;
+                this.hasArmor = false;
+                this.lastUsedTick = ++chunkUseTick;
                 this.isGenerating = false;
                 this.needsRebuild = false;
 
@@ -427,6 +438,7 @@
                                     const vIdx = yzOff + px;
                                     if (dx * dx + dy * dy + dz * dz <= rSq && this.voxelData[vIdx] < 0.0) {
                                         this.materialData[vIdx] = 3;
+                                        this.hasArmor = true;
                                     }
                                 }
                             }
@@ -450,47 +462,41 @@
                 }
             }
 
-            applyMeshResult(scene, result) {
+            applyMeshResult(scene, result, options = {}) {
                 if (this.children !== null || this.epoch !== worldEpoch || !result || result.cancelled) {
                     return;
                 }
+                const deferFlush = Boolean(options && options.deferFlush);
                 const { positions, normals, colors, indices } = result;
                 if (!positions || !indices || positions.length === 0 || indices.length === 0) {
-                    if (this.mesh) {
-                        scene.remove(this.mesh);
-                        const mIdx = activeChunkMeshes.indexOf(this.mesh);
-                        if (mIdx !== -1) activeChunkMeshes.splice(mIdx, 1);
-                        this.mesh.geometry.dispose();
-                        this.mesh = null;
+                    if (this.hasMesh) {
+                        batchManager.removeChunk(this.key);
+                        this.hasMesh = false;
                     }
+                    // Empty-void chunk disposal when unarmored leaf has no solid voxels left
+                    if (this.voxelData && !this.hasArmor) {
+                        let hasNeg = false;
+                        const vArr = this.voxelData;
+                        for (let i = 0; i < vArr.length; i++) {
+                            if (vArr[i] < 0.0) {
+                                hasNeg = true;
+                                break;
+                            }
+                        }
+                        if (!hasNeg) {
+                            this.state = 'void';
+                            this.voxelData = null;
+                            this.materialData = null;
+                        }
+                    }
+                    if (!deferFlush) batchManager.flush(scene);
                     return;
                 }
 
-                if (!this.mesh) {
-                    const geo = new THREE.BufferGeometry();
-                    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-                    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-                    geo.setIndex(new THREE.BufferAttribute(indices, 1));
-                    geo.computeBoundingSphere();
-                    geo.computeBoundingBox();
-
-                    this.mesh = new THREE.Mesh(geo, chunkMaterial);
-                    this.mesh.userData = { chunk: this };
-                    scene.add(this.mesh);
-                    activeChunkMeshes.push(this.mesh);
-                } else {
-                    const geo = this.mesh.geometry;
-                    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-                    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-                    geo.setIndex(new THREE.BufferAttribute(indices, 1));
-                    geo.attributes.position.needsUpdate = true;
-                    geo.attributes.normal.needsUpdate = true;
-                    geo.attributes.color.needsUpdate = true;
-                    geo.computeBoundingSphere();
-                    geo.computeBoundingBox();
-                }
+                batchManager.upsertChunk(this.key, this.center, positions, normals, colors, indices);
+                this.hasMesh = true;
+                this.lastUsedTick = ++chunkUseTick;
+                if (!deferFlush) batchManager.flush(scene);
             }
 
             async rebuildMesh(scene, options = {}) {
@@ -563,12 +569,58 @@
                     return { chunk: this, result };
                 }
 
-                this.applyMeshResult(scene, result);
+                this.applyMeshResult(scene, result, options);
 
                 if (this.needsRebuild && this.epoch === worldEpoch && this.children === null) {
                     return await this.rebuildMesh(scene, options);
                 }
                 return result;
+            }
+        }
+
+        function enforceChunkCacheLimitPoC1(protectedKeys) {
+            const leaves = collectLeaves();
+            const active = [];
+            for (let i = 0; i < leaves.length; i++) {
+                const l = leaves[i];
+                if (l.voxelData !== null || l.hasMesh) {
+                    active.push(l);
+                }
+            }
+            if (active.length <= MAX_ACTIVE_CHUNKS) return;
+
+            const candidates = [];
+            for (let i = 0; i < active.length; i++) {
+                const l = active[i];
+                if (protectedKeys && protectedKeys.has(l.key)) continue;
+                if (l.hasArmor) continue;
+                candidates.push(l);
+            }
+            candidates.sort((a, b) => {
+                const am = a.hasMesh ? 1 : 0;
+                const bm = b.hasMesh ? 1 : 0;
+                if (am !== bm) return am - bm;
+                return a.lastUsedTick - b.lastUsedTick;
+            });
+
+            let excess = active.length - MAX_ACTIVE_CHUNKS;
+            let removedFromBatch = false;
+            for (let i = 0; i < candidates.length && excess > 0; i++) {
+                const l = candidates[i];
+                l.voxelData = null;
+                l.materialData = null;
+                if (l.hasMesh) {
+                    batchManager.removeChunk(l.key);
+                    l.hasMesh = false;
+                    removedFromBatch = true;
+                }
+                if (l.level === 0 && l.children === null) {
+                    chunkMap.delete(l.key);
+                }
+                excess--;
+            }
+            if (removedFromBatch) {
+                batchManager.flush(sandbox.scene);
             }
         }
 
@@ -589,11 +641,8 @@
             opSerialChain = Promise.resolve();
             editHistory.length = 0;
 
-            activeChunkMeshes.forEach(m => {
-                scene.remove(m);
-                m.geometry.dispose();
-            });
-            activeChunkMeshes.length = 0;
+            batchManager.setScene(scene);
+            batchManager.clear();
             chunkMap.clear();
 
             CHUNK_SIZE = currentRadius * 0.45;
@@ -619,7 +668,7 @@
                             if (chunk.state !== 'void') {
                                 chunkMap.set(chunk.key, chunk);
                                 if (chunk.state === 'surface') {
-                                    initialRebuilds.push(chunk.rebuildMesh(scene));
+                                    initialRebuilds.push(chunk.rebuildMesh(scene, { deferFlush: true }));
                                 }
                             }
                         }
@@ -627,6 +676,7 @@
                 }
             }
             await Promise.allSettled(initialRebuilds);
+            batchManager.flush(scene);
         }
 
         function enqueueSerializedOp(fn) {
@@ -639,10 +689,10 @@
             return next;
         }
 
-        function splitChunkNode(node, op, retiredMeshes, splitNodes, newLeaves) {
-            if (node.mesh) {
-                retiredMeshes.push(node.mesh);
-                node.mesh = null;
+        function splitChunkNode(node, op, retiredKeys, splitNodes, newLeaves) {
+            if (node.hasMesh) {
+                retiredKeys.push(node.key);
+                node.hasMesh = false;
             }
             node.needsRebuild = false;
             node.voxelData = null;
@@ -674,7 +724,7 @@
                             child.level < MAX_SUBDIV_LEVEL &&
                             nodeBoxIntersectsSphere(child, op.x, op.y, op.z, splitPad(child, op.radius))
                         ) {
-                            splitChunkNode(child, op, retiredMeshes, splitNodes, newLeaves);
+                            splitChunkNode(child, op, retiredKeys, splitNodes, newLeaves);
                         } else {
                             child.initVoxels();
                             newLeaves.push(child);
@@ -729,10 +779,11 @@
                 const minCZ = Math.floor((op.z - effPad) / CHUNK_SIZE);
                 const maxCZ = Math.floor((op.z + effPad) / CHUNK_SIZE);
 
-                const retiredMeshes = [];
+                const retiredKeys = [];
                 const splitNodes = [];
                 const newLeaves = [];
                 const rebuildLeaves = new Set();
+                const protectedKeys = new Set();
 
                 function visitForCarve(node, isNewlyCreatedRoot) {
                     const reachPad = Math.max(op.radius + node.cellSize * 2.5, splitPad(node, op.radius));
@@ -752,7 +803,7 @@
                         node.level < MAX_SUBDIV_LEVEL &&
                         nodeBoxIntersectsSphere(node, op.x, op.y, op.z, splitPad(node, op.radius))
                     ) {
-                        splitChunkNode(node, op, retiredMeshes, splitNodes, newLeaves);
+                        splitChunkNode(node, op, retiredKeys, splitNodes, newLeaves);
                         return;
                     }
 
@@ -833,7 +884,7 @@
                                     nodeBoxIntersectsSphere(root, op.x, op.y, op.z, splitPad(root, op.radius))
                                 ) {
                                     chunkMap.set(key, root);
-                                    splitChunkNode(root, op, retiredMeshes, splitNodes, newLeaves);
+                                    splitChunkNode(root, op, retiredKeys, splitNodes, newLeaves);
                                     continue;
                                 }
                                 root.initVoxels();
@@ -861,6 +912,8 @@
                 const deferredRebuilds = [];
                 for (const leaf of rebuildLeaves) {
                     if (leaf.state === 'surface' && leaf.children === null) {
+                        leaf.lastUsedTick = ++chunkUseTick;
+                        protectedKeys.add(leaf.key);
                         deferredRebuilds.push(leaf.rebuildMesh(sandbox.scene, { deferSwap: true }));
                     }
                 }
@@ -871,19 +924,17 @@
                     return { mainThreadMs, cancelled: true };
                 }
 
-                for (let i = 0; i < retiredMeshes.length; i++) {
-                    const rm = retiredMeshes[i];
-                    sandbox.scene.remove(rm);
-                    const mIdx = activeChunkMeshes.indexOf(rm);
-                    if (mIdx !== -1) activeChunkMeshes.splice(mIdx, 1);
-                    rm.geometry.dispose();
+                for (let i = 0; i < retiredKeys.length; i++) {
+                    batchManager.removeChunk(retiredKeys[i]);
                 }
                 for (let i = 0; i < settled.length; i++) {
                     const entry = settled[i];
                     if (entry.status === 'fulfilled' && entry.value && entry.value.chunk && entry.value.result) {
-                        entry.value.chunk.applyMeshResult(sandbox.scene, entry.value.result);
+                        entry.value.chunk.applyMeshResult(sandbox.scene, entry.value.result, { deferFlush: true });
                     }
                 }
+                batchManager.flush(sandbox.scene);
+                enforceChunkCacheLimitPoC1(protectedKeys);
                 return { mainThreadMs };
             });
         }
@@ -905,10 +956,11 @@
                 const minCZ = Math.floor((op.z - effPad) / CHUNK_SIZE);
                 const maxCZ = Math.floor((op.z + effPad) / CHUNK_SIZE);
 
-                const retiredMeshes = [];
+                const retiredKeys = [];
                 const splitNodes = [];
                 const newLeaves = [];
                 const rebuildLeaves = new Set();
+                const protectedKeys = new Set();
 
                 function visitForReinforce(node) {
                     const reachPad = Math.max(op.radius + node.cellSize * 2.0, splitPad(node, op.radius));
@@ -926,10 +978,10 @@
                     if (
                         node.cellSize > FINE_CELL_LIMIT &&
                         node.level < MAX_SUBDIV_LEVEL &&
-                        node.mesh !== null &&
+                        node.hasMesh &&
                         nodeBoxIntersectsSphere(node, op.x, op.y, op.z, splitPad(node, op.radius))
                     ) {
-                        splitChunkNode(node, op, retiredMeshes, splitNodes, newLeaves);
+                        splitChunkNode(node, op, retiredKeys, splitNodes, newLeaves);
                         return;
                     }
 
@@ -957,6 +1009,7 @@
                                 const idx = yzOff + px;
                                 if (dx * dx + dy * dy + dz * dz <= rSq && node.voxelData[idx] < 0.0) {
                                     node.materialData[idx] = 3; // Reinforced Titanium Bulkhead
+                                    node.hasArmor = true;
                                     modified = true;
                                 }
                             }
@@ -991,6 +1044,8 @@
                 const deferredRebuilds = [];
                 for (const leaf of rebuildLeaves) {
                     if (leaf.state === 'surface' && leaf.children === null) {
+                        leaf.lastUsedTick = ++chunkUseTick;
+                        protectedKeys.add(leaf.key);
                         deferredRebuilds.push(leaf.rebuildMesh(sandbox.scene, { deferSwap: true }));
                     }
                 }
@@ -1001,19 +1056,17 @@
                     return { mainThreadMs, cancelled: true };
                 }
 
-                for (let i = 0; i < retiredMeshes.length; i++) {
-                    const rm = retiredMeshes[i];
-                    sandbox.scene.remove(rm);
-                    const mIdx = activeChunkMeshes.indexOf(rm);
-                    if (mIdx !== -1) activeChunkMeshes.splice(mIdx, 1);
-                    rm.geometry.dispose();
+                for (let i = 0; i < retiredKeys.length; i++) {
+                    batchManager.removeChunk(retiredKeys[i]);
                 }
                 for (let i = 0; i < settled.length; i++) {
                     const entry = settled[i];
                     if (entry.status === 'fulfilled' && entry.value && entry.value.chunk && entry.value.result) {
-                        entry.value.chunk.applyMeshResult(sandbox.scene, entry.value.result);
+                        entry.value.chunk.applyMeshResult(sandbox.scene, entry.value.result, { deferFlush: true });
                     }
                 }
+                batchManager.flush(sandbox.scene);
+                enforceChunkCacheLimitPoC1(protectedKeys);
                 return { mainThreadMs };
             });
         }
@@ -1046,14 +1099,14 @@
             pocId: 'poc1',
             pocTitle: 'Option 1: Chunked Surface Nets + Workers',
             defaultRadius: currentRadius,
-            getCollisionMesh: () => activeChunkMeshes,
-            getVisualMesh: () => activeChunkMeshes,
+            getCollisionMesh: () => batchManager.getBatchedMeshes(),
+            getVisualMesh: () => batchManager.getBatchedMeshes(),
             getCellSize: () => {
                 const leaves = collectLeaves();
                 let activeMinCell = CELL_SIZE;
                 for (let i = 0; i < leaves.length; i++) {
                     const l = leaves[i];
-                    if ((l.state === 'surface' || l.mesh !== null) && l.cellSize < activeMinCell) {
+                    if ((l.state === 'surface' || l.hasMesh) && l.cellSize < activeMinCell) {
                         activeMinCell = l.cellSize;
                     }
                 }
@@ -1103,9 +1156,14 @@
 
             onToggleXRay: (enabled, plane) => {
                 chunkMaterial.clippingPlanes = enabled ? [plane] : [];
+                const targetSide = enabled ? THREE.DoubleSide : THREE.FrontSide;
+                if (chunkMaterial.side !== targetSide) {
+                    chunkMaterial.side = targetSide;
+                }
                 chunkMaterial.needsUpdate = true;
             }
         });
+        batchManager.setScene(sandbox.scene);
 
         function evalNoiseOffsetPoC1(wx, wy, wz) {
             const freq = 0.0014 * (2800.0 / currentRadius);

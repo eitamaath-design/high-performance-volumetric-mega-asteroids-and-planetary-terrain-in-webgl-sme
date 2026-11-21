@@ -13,6 +13,7 @@
         import * as THREE from './vendor/three.module.js';
         import { PlanetaryBaseSandbox, createTriplanarAsteroidMaterial, findSurfacePoint } from './shared/planetary_base_sandbox.js';
         import { MeshingWorkerPool } from './shared/meshing_worker_pool.js';
+        import { ChunkBatchManager } from './shared/chunk_batch_manager.js';
 
         // --- Fast 3D Simplex-Style Noise ---
         class FastNoise3D {
@@ -92,7 +93,6 @@
         let worldEpoch = 0;
 
         const svoLeafMap = new Map();
-        const activeLeafMeshes = [];
         const editHistory = [];
         let opSerialChain = Promise.resolve();
         const _poc2CoarseGrid = new Float32Array(5 * 5 * 5);
@@ -122,6 +122,8 @@
         window.__POC2_GET_LEAVES__ = () => collectLeaves();
 
         const leafMaterial = createTriplanarAsteroidMaterial({ vertexColors: true, radius: currentRadius });
+        const batchManager = new ChunkBatchManager(null, leafMaterial);
+        window.__POC2_BATCH_MANAGER__ = batchManager;
 
         function enqueueSerializedOp(fn) {
             const capturedEpoch = worldEpoch;
@@ -210,10 +212,16 @@
                 this.maxX = this.minX + size;
                 this.maxY = this.minY + size;
                 this.maxZ = this.minZ + size;
+                this.center = new THREE.Vector3(
+                    this.minX + size * 0.5,
+                    this.minY + size * 0.5,
+                    this.minZ + size * 0.5
+                );
                 this.children = null;
                 this.state = 'uninit'; // 'surface' | 'solid' | 'void'
                 this.extendFlags = { x: false, y: false, z: false };
-                this.mesh = null;
+                this.hasMesh = false;
+                this.hasArmor = false;
                 this.isGenerating = false;
                 this.needsRebuild = false;
 
@@ -452,6 +460,7 @@
                                     const dIdx = yzOff + x;
                                     if (dx * dx + dy * dy + dz * dz <= rSq && this.density[dIdx] < 0.0) {
                                         this.material[dIdx] = 3;
+                                        this.hasArmor = true;
                                     }
                                 }
                             }
@@ -483,47 +492,39 @@
                 return this.material[x + y * this.pRes + z * this.pRes2];
             }
 
-            applyMeshResult(scene, result) {
+            applyMeshResult(scene, result, options = {}) {
                 if (this.children !== null || this.epoch !== worldEpoch || !result || result.cancelled) {
                     return;
                 }
+                const deferFlush = Boolean(options && options.deferFlush);
                 const { positions, normals, colors, indices } = result;
                 if (!positions || !indices || positions.length === 0 || indices.length === 0) {
-                    if (this.mesh) {
-                        scene.remove(this.mesh);
-                        const idx = activeLeafMeshes.indexOf(this.mesh);
-                        if (idx !== -1) activeLeafMeshes.splice(idx, 1);
-                        this.mesh.geometry.dispose();
-                        this.mesh = null;
+                    if (this.hasMesh) {
+                        batchManager.removeChunk(this.key);
+                        this.hasMesh = false;
                     }
+                    if (this.density && !this.hasArmor) {
+                        let hasNeg = false;
+                        const dArr = this.density;
+                        for (let i = 0; i < dArr.length; i++) {
+                            if (dArr[i] < 0.0) {
+                                hasNeg = true;
+                                break;
+                            }
+                        }
+                        if (!hasNeg) {
+                            this.state = 'void';
+                            this.density = null;
+                            this.material = null;
+                        }
+                    }
+                    if (!deferFlush) batchManager.flush(scene);
                     return;
                 }
 
-                if (!this.mesh) {
-                    const geo = new THREE.BufferGeometry();
-                    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-                    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-                    geo.setIndex(new THREE.BufferAttribute(indices, 1));
-                    geo.computeBoundingSphere();
-                    geo.computeBoundingBox();
-
-                    this.mesh = new THREE.Mesh(geo, leafMaterial);
-                    this.mesh.userData = { leaf: this };
-                    scene.add(this.mesh);
-                    activeLeafMeshes.push(this.mesh);
-                } else {
-                    const geo = this.mesh.geometry;
-                    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-                    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-                    geo.setIndex(new THREE.BufferAttribute(indices, 1));
-                    geo.attributes.position.needsUpdate = true;
-                    geo.attributes.normal.needsUpdate = true;
-                    geo.attributes.color.needsUpdate = true;
-                    geo.computeBoundingSphere();
-                    geo.computeBoundingBox();
-                }
+                batchManager.upsertChunk(this.key, this.center, positions, normals, colors, indices);
+                this.hasMesh = true;
+                if (!deferFlush) batchManager.flush(scene);
             }
 
             // Adaptive QEF Dual Contouring offloaded to unified MeshingWorkerPool (mode: 'dual_contour')
@@ -531,12 +532,10 @@
                 const deferSwap = Boolean(options && options.deferSwap);
                 if (this.children !== null || this.epoch !== worldEpoch || this.state !== 'surface' || !this.density) {
                     this.needsRebuild = false;
-                    if (this.children === null && this.epoch === worldEpoch && this.mesh && !deferSwap) {
-                        scene.remove(this.mesh);
-                        const idx = activeLeafMeshes.indexOf(this.mesh);
-                        if (idx !== -1) activeLeafMeshes.splice(idx, 1);
-                        this.mesh.geometry.dispose();
-                        this.mesh = null;
+                    if (this.children === null && this.epoch === worldEpoch && this.hasMesh && !deferSwap) {
+                        batchManager.removeChunk(this.key);
+                        this.hasMesh = false;
+                        if (!(options && options.deferFlush)) batchManager.flush(scene);
                     }
                     return { cancelled: true };
                 }
@@ -605,7 +604,7 @@
                     return { leaf: this, result };
                 }
 
-                this.applyMeshResult(scene, result);
+                this.applyMeshResult(scene, result, options);
 
                 if (this.needsRebuild && this.epoch === worldEpoch && this.children === null) {
                     return await this.rebuildMesh(scene, options);
@@ -629,11 +628,8 @@
             workerPool.setEpoch(worldEpoch);
             opSerialChain = Promise.resolve();
             editHistory.length = 0;
-            activeLeafMeshes.forEach(m => {
-                scene.remove(m);
-                m.geometry.dispose();
-            });
-            activeLeafMeshes.length = 0;
+            batchManager.setScene(scene);
+            batchManager.clear();
             svoLeafMap.clear();
 
             LEAF_SIZE = currentRadius * 0.48;
@@ -659,7 +655,7 @@
                             if (leaf.state !== 'void') {
                                 svoLeafMap.set(leaf.key, leaf);
                                 if (leaf.state === 'surface') {
-                                    initialRebuilds.push(leaf.rebuildMesh(scene));
+                                    initialRebuilds.push(leaf.rebuildMesh(scene, { deferFlush: true }));
                                 }
                             }
                         }
@@ -667,12 +663,13 @@
                 }
             }
             await Promise.allSettled(initialRebuilds);
+            batchManager.flush(scene);
         }
 
-        function splitLeafNode(node, op, retiredMeshes, splitNodes, newLeaves) {
-            if (node.mesh) {
-                retiredMeshes.push(node.mesh);
-                node.mesh = null;
+        function splitLeafNode(node, op, retiredKeys, splitNodes, newLeaves) {
+            if (node.hasMesh) {
+                retiredKeys.push(node.key);
+                node.hasMesh = false;
             }
             node.needsRebuild = false;
             node.density = null;
@@ -704,7 +701,7 @@
                             child.level < MAX_SUBDIV_LEVEL &&
                             nodeBoxIntersectsSphere(child, op.x, op.y, op.z, splitPad(child, op.radius))
                         ) {
-                            splitLeafNode(child, op, retiredMeshes, splitNodes, newLeaves);
+                            splitLeafNode(child, op, retiredKeys, splitNodes, newLeaves);
                         } else {
                             child.initField();
                             newLeaves.push(child);
@@ -759,7 +756,7 @@
                 const minLZ = Math.floor((op.z - effPad) / LEAF_SIZE);
                 const maxLZ = Math.floor((op.z + effPad) / LEAF_SIZE);
 
-                const retiredMeshes = [];
+                const retiredKeys = [];
                 const splitNodes = [];
                 const newLeaves = [];
                 const recontourLeaves = new Set();
@@ -782,7 +779,7 @@
                         node.level < MAX_SUBDIV_LEVEL &&
                         nodeBoxIntersectsSphere(node, op.x, op.y, op.z, splitPad(node, op.radius))
                     ) {
-                        splitLeafNode(node, op, retiredMeshes, splitNodes, newLeaves);
+                        splitLeafNode(node, op, retiredKeys, splitNodes, newLeaves);
                         return;
                     }
 
@@ -863,7 +860,7 @@
                                     nodeBoxIntersectsSphere(root, op.x, op.y, op.z, splitPad(root, op.radius))
                                 ) {
                                     svoLeafMap.set(key, root);
-                                    splitLeafNode(root, op, retiredMeshes, splitNodes, newLeaves);
+                                    splitLeafNode(root, op, retiredKeys, splitNodes, newLeaves);
                                     continue;
                                 }
                                 root.initField();
@@ -901,19 +898,16 @@
                     return { mainThreadMs, cancelled: true };
                 }
 
-                for (let i = 0; i < retiredMeshes.length; i++) {
-                    const rm = retiredMeshes[i];
-                    sandbox.scene.remove(rm);
-                    const mIdx = activeLeafMeshes.indexOf(rm);
-                    if (mIdx !== -1) activeLeafMeshes.splice(mIdx, 1);
-                    rm.geometry.dispose();
+                for (let i = 0; i < retiredKeys.length; i++) {
+                    batchManager.removeChunk(retiredKeys[i]);
                 }
                 for (let i = 0; i < settled.length; i++) {
                     const entry = settled[i];
                     if (entry.status === 'fulfilled' && entry.value && entry.value.leaf && entry.value.result) {
-                        entry.value.leaf.applyMeshResult(sandbox.scene, entry.value.result);
+                        entry.value.leaf.applyMeshResult(sandbox.scene, entry.value.result, { deferFlush: true });
                     }
                 }
+                batchManager.flush(sandbox.scene);
                 return { mainThreadMs };
             });
         }
@@ -935,7 +929,7 @@
                 const minLZ = Math.floor((op.z - effPad) / LEAF_SIZE);
                 const maxLZ = Math.floor((op.z + effPad) / LEAF_SIZE);
 
-                const retiredMeshes = [];
+                const retiredKeys = [];
                 const splitNodes = [];
                 const newLeaves = [];
                 const recontourLeaves = new Set();
@@ -956,10 +950,10 @@
                     if (
                         node.cellSize > FINE_CELL_LIMIT &&
                         node.level < MAX_SUBDIV_LEVEL &&
-                        node.mesh !== null &&
+                        node.hasMesh &&
                         nodeBoxIntersectsSphere(node, op.x, op.y, op.z, splitPad(node, op.radius))
                     ) {
-                        splitLeafNode(node, op, retiredMeshes, splitNodes, newLeaves);
+                        splitLeafNode(node, op, retiredKeys, splitNodes, newLeaves);
                         return;
                     }
 
@@ -987,6 +981,7 @@
                                 const idx = yzOff + x;
                                 if (dx * dx + dy * dy + dz * dz <= rSq && node.density[idx] < 0.0) {
                                     node.material[idx] = 3; // Reinforced Titanium Bulkhead
+                                    node.hasArmor = true;
                                     modified = true;
                                 }
                             }
@@ -1031,19 +1026,16 @@
                     return { mainThreadMs, cancelled: true };
                 }
 
-                for (let i = 0; i < retiredMeshes.length; i++) {
-                    const rm = retiredMeshes[i];
-                    sandbox.scene.remove(rm);
-                    const mIdx = activeLeafMeshes.indexOf(rm);
-                    if (mIdx !== -1) activeLeafMeshes.splice(mIdx, 1);
-                    rm.geometry.dispose();
+                for (let i = 0; i < retiredKeys.length; i++) {
+                    batchManager.removeChunk(retiredKeys[i]);
                 }
                 for (let i = 0; i < settled.length; i++) {
                     const entry = settled[i];
                     if (entry.status === 'fulfilled' && entry.value && entry.value.leaf && entry.value.result) {
-                        entry.value.leaf.applyMeshResult(sandbox.scene, entry.value.result);
+                        entry.value.leaf.applyMeshResult(sandbox.scene, entry.value.result, { deferFlush: true });
                     }
                 }
+                batchManager.flush(sandbox.scene);
                 return { mainThreadMs };
             });
         }
@@ -1076,14 +1068,14 @@
             pocId: 'poc2',
             pocTitle: 'Option 2: QEF Dual Contouring SVO',
             defaultRadius: currentRadius,
-            getCollisionMesh: () => activeLeafMeshes,
-            getVisualMesh: () => activeLeafMeshes,
+            getCollisionMesh: () => batchManager.getBatchedMeshes(),
+            getVisualMesh: () => batchManager.getBatchedMeshes(),
             getCellSize: () => {
                 const leaves = collectLeaves();
                 let activeMinCell = CELL_SIZE;
                 for (let i = 0; i < leaves.length; i++) {
                     const l = leaves[i];
-                    if ((l.state === 'surface' || l.mesh !== null) && l.cellSize < activeMinCell) {
+                    if ((l.state === 'surface' || l.hasMesh) && l.cellSize < activeMinCell) {
                         activeMinCell = l.cellSize;
                     }
                 }
@@ -1133,9 +1125,14 @@
 
             onToggleXRay: (enabled, plane) => {
                 leafMaterial.clippingPlanes = enabled ? [plane] : [];
+                const targetSide = enabled ? THREE.DoubleSide : THREE.FrontSide;
+                if (leafMaterial.side !== targetSide) {
+                    leafMaterial.side = targetSide;
+                }
                 leafMaterial.needsUpdate = true;
             }
         });
+        batchManager.setScene(sandbox.scene);
 
         currentRadius = sandbox.currentRadius;
         applyQualityPoC2(sandbox.currentQuality);

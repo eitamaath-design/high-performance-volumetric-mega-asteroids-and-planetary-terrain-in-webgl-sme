@@ -40,16 +40,19 @@ export function createTriplanarAsteroidMaterial(options = {}) {
         uPortalDomainHalf: { value: defaultRadius * 1.30 }
     };
 
+    const defaultSide = options.side !== undefined ? options.side : THREE.FrontSide;
     const mat = new THREE.MeshStandardMaterial({
         color: vertexColors ? 0xffffff : 0x7c8490,
         vertexColors,
         roughness: 0.78,
         metalness: 0.18,
         flatShading: false,
-        side: THREE.DoubleSide
+        side: defaultSide
     });
 
     mat.userData.shaderUniforms = uniforms;
+    mat.userData.isTriplanarAsteroidMaterial = true;
+    mat.userData.defaultSide = defaultSide;
     mat.customProgramCacheKey = () => `triplanar-asteroid-${vertexColors ? 'vc' : 'nc'}-${hasPortals ? 'portals' : 'solid'}`;
 
     mat.onBeforeCompile = (shader) => {
@@ -202,8 +205,10 @@ export function createTriplanarAsteroidMaterial(options = {}) {
         const colorReplace = `
             vec3 triPos = vTriWorldPos;
             vec3 triNorm = normalize(vTriWorldNorm);
+            float triCamDist = length(cameraPosition - triPos);
+            float triMicroAtten = 1.0 - smoothstep(uAsteroidRadius * 0.65, uAsteroidRadius * 2.5, triCamDist);
             float fbmMacro = triFbm(triPos * 0.006);
-            float fbmMicro = triFbm(triPos * 0.028);
+            float fbmMicro = triMicroAtten > 0.01 ? mix(0.5, triFbm(triPos * 0.028), triMicroAtten) : 0.5;
             float rDist = length(triPos);
             float strata = 0.5 + 0.5 * sin(rDist * 0.045 + fbmMacro * 6.0);
             float depthShade = smoothstep(uAsteroidRadius * 0.25, uAsteroidRadius * 1.05, rDist);
@@ -240,19 +245,20 @@ export function createTriplanarAsteroidMaterial(options = {}) {
 
         const normalReplace = `
             #include <normal_fragment_maps>
-            float bumpWeight = (1.0 - triIsArmor) * 0.55;
-            vec3 dPdx = dFdx(triPos);
-            vec3 dPdy = dFdy(triPos);
-            float bumpH = fbmMicro + 0.35 * fbmMacro;
-            float dBdx = dFdx(bumpH);
-            float dBdy = dFdy(bumpH);
-            vec3 surfGrad = cross(normal, cross(dPdx, dPdy));
-            vec3 r1 = cross(dPdy, normal);
-            vec3 r2 = cross(normal, dPdx);
-            float det = dot(dPdx, r1);
-            if (abs(det) > 1e-8) {
-                vec3 bumpN = sign(det) * (dBdx * r1 + dBdy * r2);
-                normal = normalize(abs(det) * normal - bumpWeight * 24.0 * bumpN);
+            float bumpWeight = (1.0 - triIsArmor) * 0.55 * triMicroAtten;
+            if (bumpWeight > 0.01) {
+                vec3 dPdx = dFdx(triPos);
+                vec3 dPdy = dFdy(triPos);
+                float bumpH = fbmMicro + 0.35 * fbmMacro;
+                float dBdx = dFdx(bumpH);
+                float dBdy = dFdy(bumpH);
+                vec3 r1 = cross(dPdy, normal);
+                vec3 r2 = cross(normal, dPdx);
+                float det = dot(dPdx, r1);
+                if (abs(det) > 1e-8) {
+                    vec3 bumpN = sign(det) * (dBdx * r1 + dBdy * r2);
+                    normal = normalize(abs(det) * normal - bumpWeight * 24.0 * bumpN);
+                }
             }
         `;
 
@@ -1195,6 +1201,35 @@ export class PlanetaryBaseSandbox {
             this.renderer.clippingPlanes = [this.clipPlane];
         } else {
             this.renderer.clippingPlanes = [];
+        }
+
+        // Dynamically switch terrain/asteroid materials to DoubleSide during X-Ray slicing
+        // and back to FrontSide when X-Ray is disabled (only flagging needsUpdate when side changes)
+        const terrainMats = new Set();
+        const collectMats = (obj) => {
+            if (!obj || !obj.material) return;
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+            for (let i = 0; i < mats.length; i++) {
+                const m = mats[i];
+                if (m && m.userData && m.userData.isTriplanarAsteroidMaterial) {
+                    terrainMats.add(m);
+                }
+            }
+        };
+        if (this.scene) {
+            this.scene.traverse(collectMats);
+        }
+        if (this.config.getVisualMesh) {
+            const vis = this.config.getVisualMesh();
+            if (Array.isArray(vis)) vis.forEach(collectMats);
+            else if (vis) collectMats(vis);
+        }
+        for (const mat of terrainMats) {
+            const targetSide = this.isXRay ? THREE.DoubleSide : (mat.userData.defaultSide !== undefined ? mat.userData.defaultSide : THREE.FrontSide);
+            if (mat.side !== targetSide) {
+                mat.side = targetSide;
+                mat.needsUpdate = true;
+            }
         }
 
         if (this.config.onToggleXRay) {
