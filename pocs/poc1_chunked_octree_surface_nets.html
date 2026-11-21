@@ -16,30 +16,52 @@
 
         // --- Fast 3D Simplex-Style Noise for Procedural Asteroid Form ---
         class FastNoise3D {
-            constructor(seed = 1337) { this.seed = seed; }
+            constructor(seed = 1337) {
+                this.seed = seed;
+                this._octCache = [
+                    { valid: false, X: 0, Y: 0, Z: 0, c000: 0, c100: 0, c010: 0, c110: 0, c001: 0, c101: 0, c011: 0, c111: 0 },
+                    { valid: false, X: 0, Y: 0, Z: 0, c000: 0, c100: 0, c010: 0, c110: 0, c001: 0, c101: 0, c011: 0, c111: 0 },
+                    { valid: false, X: 0, Y: 0, Z: 0, c000: 0, c100: 0, c010: 0, c110: 0, c001: 0, c101: 0, c011: 0, c111: 0 }
+                ];
+            }
             hash(x, y, z) {
                 const s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + this.seed) * 43758.5453123;
                 return s - Math.floor(s);
             }
-            noise(x, y, z) {
+            noiseOct(x, y, z, oct) {
                 const X = Math.floor(x), Y = Math.floor(y), Z = Math.floor(z);
                 const xd = x - X, yd = y - Y, zd = z - Z;
                 const u = xd * xd * (3.0 - 2.0 * xd);
                 const v = yd * yd * (3.0 - 2.0 * yd);
                 const w = zd * zd * (3.0 - 2.0 * zd);
-                const c000 = this.hash(X, Y, Z), c100 = this.hash(X+1, Y, Z);
-                const c010 = this.hash(X, Y+1, Z), c110 = this.hash(X+1, Y+1, Z);
-                const c001 = this.hash(X, Y, Z+1), c101 = this.hash(X+1, Y, Z+1);
-                const c011 = this.hash(X, Y+1, Z+1), c111 = this.hash(X+1, Y+1, Z+1);
-                const x00 = c000*(1-u)+c100*u, x10 = c010*(1-u)+c110*u;
-                const x01 = c001*(1-u)+c101*u, x11 = c011*(1-u)+c111*u;
+                const cache = this._octCache[oct];
+                if (!cache || !cache.valid || cache.X !== X || cache.Y !== Y || cache.Z !== Z) {
+                    const c000 = this.hash(X, Y, Z), c100 = this.hash(X+1, Y, Z);
+                    const c010 = this.hash(X, Y+1, Z), c110 = this.hash(X+1, Y+1, Z);
+                    const c001 = this.hash(X, Y, Z+1), c101 = this.hash(X+1, Y, Z+1);
+                    const c011 = this.hash(X, Y+1, Z+1), c111 = this.hash(X+1, Y+1, Z+1);
+                    if (!cache) {
+                        const x00 = c000*(1-u)+c100*u, x10 = c010*(1-u)+c110*u;
+                        const x01 = c001*(1-u)+c101*u, x11 = c011*(1-u)+c111*u;
+                        const y0 = x00*(1-v)+x10*v, y1 = x01*(1-v)+x11*v;
+                        return y0*(1-w)+y1*w;
+                    }
+                    cache.valid = true; cache.X = X; cache.Y = Y; cache.Z = Z;
+                    cache.c000 = c000; cache.c100 = c100; cache.c010 = c010; cache.c110 = c110;
+                    cache.c001 = c001; cache.c101 = c101; cache.c011 = c011; cache.c111 = c111;
+                }
+                const x00 = cache.c000*(1-u)+cache.c100*u, x10 = cache.c010*(1-u)+cache.c110*u;
+                const x01 = cache.c001*(1-u)+cache.c101*u, x11 = cache.c011*(1-u)+cache.c111*u;
                 const y0 = x00*(1-v)+x10*v, y1 = x01*(1-v)+x11*v;
                 return y0*(1-w)+y1*w;
+            }
+            noise(x, y, z) {
+                return this.noiseOct(x, y, z, 0);
             }
             fbm(x, y, z, octaves = 3) {
                 let val = 0, amp = 0.5, freq = 1.0;
                 for (let i = 0; i < octaves; i++) {
-                    val += this.noise(x * freq, y * freq, z * freq) * amp;
+                    val += this.noiseOct(x * freq, y * freq, z * freq, i) * amp;
                     freq *= 2.0; amp *= 0.5;
                 }
                 return val;
@@ -50,124 +72,390 @@
 
         // --- Option 1 Constants ---
         const QUALITY_PRESETS_POC1 = { low: 12, medium: 18, high: 24, ultra: 30 };
+        const FINE_CELL_LIMIT = 20.0;
+        const MAX_SUBDIV_LEVEL = 4;
         let currentRadius = 2800;
         let CHUNK_RES = 24; // Configurable by quality tier (12..30 cells per chunk)
         let CHUNK_SIZE = 1260;
         let CELL_SIZE = CHUNK_SIZE / CHUNK_RES;
+
+        function computeFineCellSize(macroCell) {
+            let c = macroCell;
+            let lvl = 0;
+            while (c > FINE_CELL_LIMIT && lvl < MAX_SUBDIV_LEVEL) {
+                c *= 0.5;
+                lvl++;
+            }
+            return c;
+        }
+
+        let FINE_CELL_SIZE = computeFineCellSize(CELL_SIZE);
         let worldEpoch = 0;
 
-        // Sparse Chunks Map
-        const chunkMap = new Map(); // key 'cx,cy,cz' => VoxelChunk
+        // Sparse Hierarchical Octree Chunks + Lossless CSG History
+        const chunkMap = new Map(); // key '0:gx,gy,gz' => root VoxelChunk
         const activeChunkMeshes = [];
+        const editHistory = [];
+        let opSerialChain = Promise.resolve();
+        const _poc1CoarseGrid = new Float32Array(9 * 9 * 9);
+
+        function collectLeaves() {
+            const leaves = [];
+            const stack = Array.from(chunkMap.values());
+            while (stack.length > 0) {
+                const node = stack.pop();
+                if (!node) continue;
+                if (node.children !== null) {
+                    for (let i = 0; i < 8; i++) {
+                        stack.push(node.children[i]);
+                    }
+                } else {
+                    leaves.push(node);
+                }
+            }
+            return leaves;
+        }
 
         // Bounded ESM Worker Pool (2..4 workers, epoch cancellation, crash recovery)
         const workerPool = new MeshingWorkerPool(new URL('workers/surface_nets_worker.js', window.location.href).href);
         window.__POC1_WORKER_POOL__ = workerPool;
         window.__POC1_CHUNKS__ = chunkMap;
+        window.__POC1_GET_LEAVES__ = () => collectLeaves();
 
         // Procedural 3D Triplanar Rock + Ore + Hex Titanium Bulkhead Material
         const chunkMaterial = createTriplanarAsteroidMaterial({ vertexColors: true, radius: currentRadius });
 
+        function nodeIntersectsSphere(node, cx, cy, cz, r) {
+            const halo = 2.0 * node.cellSize;
+            const minX = node.minBounds.x - halo;
+            const maxX = node.maxBounds.x + halo;
+            const minY = node.minBounds.y - halo;
+            const maxY = node.maxBounds.y + halo;
+            const minZ = node.minBounds.z - halo;
+            const maxZ = node.maxBounds.z + halo;
+            const dx = cx < minX ? minX - cx : (cx > maxX ? cx - maxX : 0);
+            const dy = cy < minY ? minY - cy : (cy > maxY ? cy - maxY : 0);
+            const dz = cz < minZ ? minZ - cz : (cz > maxZ ? cz - maxZ : 0);
+            return (dx * dx + dy * dy + dz * dz) <= r * r;
+        }
+
+        function nodeBoxIntersectsSphere(node, cx, cy, cz, r) {
+            const minX = node.minBounds.x;
+            const maxX = node.maxBounds.x;
+            const minY = node.minBounds.y;
+            const maxY = node.maxBounds.y;
+            const minZ = node.minBounds.z;
+            const maxZ = node.maxBounds.z;
+            const dx = cx < minX ? minX - cx : (cx > maxX ? cx - maxX : 0);
+            const dy = cy < minY ? minY - cy : (cy > maxY ? cy - maxY : 0);
+            const dz = cz < minZ ? minZ - cz : (cz > maxZ ? cz - maxZ : 0);
+            return (dx * dx + dy * dy + dz * dz) <= r * r;
+        }
+
+        function splitPad(node, opRadius) {
+            return opRadius + Math.max(45.0, Math.min(node.cellSize * 1.1, FINE_CELL_SIZE * 4.0));
+        }
+
+        function findCoveringNode(gx, gy, gz, level) {
+            const rx = gx >> level;
+            const ry = gy >> level;
+            const rz = gz >> level;
+            let node = chunkMap.get(`0:${rx},${ry},${rz}`);
+            if (!node) return null;
+            for (let l = 0; l < level; l++) {
+                if (!node.children) return node;
+                const shift = level - 1 - l;
+                const ox = (gx >> shift) & 1;
+                const oy = (gy >> shift) & 1;
+                const oz = (gz >> shift) & 1;
+                node = node.children[ox + oy * 2 + oz * 4];
+                if (!node) return null;
+            }
+            return node;
+        }
+
+        function computeDesiredExtendFlags(node) {
+            const nx = findCoveringNode(node.gx + 1, node.gy, node.gz, node.level);
+            const ny = findCoveringNode(node.gx, node.gy + 1, node.gz, node.level);
+            const nz = findCoveringNode(node.gx, node.gy, node.gz + 1, node.level);
+            return {
+                x: Boolean(nx && nx.children !== null),
+                y: Boolean(ny && ny.children !== null),
+                z: Boolean(nz && nz.children !== null)
+            };
+        }
+
         class VoxelChunk {
-            constructor(cx, cy, cz, epoch) {
-                this.cx = cx;
-                this.cy = cy;
-                this.cz = cz;
+            constructor(gx, gy, gz, level, size, epoch, deferInit = false) {
+                this.gx = gx;
+                this.gy = gy;
+                this.gz = gz;
+                this.level = level;
+                this.size = size;
                 this.epoch = epoch;
                 this.res = CHUNK_RES;
-                this.cellSize = CELL_SIZE;
-                this.key = `${cx},${cy},${cz}`;
-                this.minBounds = new THREE.Vector3(cx * CHUNK_SIZE, cy * CHUNK_SIZE, cz * CHUNK_SIZE);
-                this.maxBounds = this.minBounds.clone().addScalar(CHUNK_SIZE);
+                this.cellSize = size / this.res;
+                this.key = `${level}:${gx},${gy},${gz}`;
+                this.minBounds = new THREE.Vector3(gx * size, gy * size, gz * size);
+                this.maxBounds = this.minBounds.clone().addScalar(size);
 
-                const pRes = this.res + 5;
-                const totalVoxels = pRes * pRes * pRes;
-                this.voxelData = new Float32Array(totalVoxels);
-                this.materialData = new Uint8Array(totalVoxels);
+                this.children = null;
+                this.state = 'uninit'; // 'surface' | 'solid' | 'void'
+                this.extendFlags = { x: false, y: false, z: false };
+                this.voxelData = null;
+                this.materialData = null;
 
                 this.mesh = null;
                 this.isGenerating = false;
                 this.needsRebuild = false;
 
-                this.initVoxels();
+                if (!deferInit) {
+                    this.initVoxels();
+                }
+            }
+
+            isDefinitelyVoid() {
+                const pRes = this.res + 5;
+                const halfSpan = (pRes - 1) * this.cellSize * 0.5;
+                const ccx = this.minBounds.x - 2.0 * this.cellSize + halfSpan;
+                const ccy = this.minBounds.y - 2.0 * this.cellSize + halfSpan;
+                const ccz = this.minBounds.z - 2.0 * this.cellSize + halfSpan;
+                const cDist = Math.sqrt(ccx * ccx + ccy * ccy + ccz * ccz);
+                const halfDiag = halfSpan * 1.732051;
+                return (cDist - halfDiag > currentRadius * 1.18);
             }
 
             initVoxels() {
                 const pRes = this.res + 5;
+                const pRes2 = pRes * pRes;
                 const minCrustR = currentRadius * 0.85;
                 const maxCrustR = currentRadius * 1.18;
                 const oreFreq = 0.0055 * (2800.0 / currentRadius);
+
+                const halfSpan = (pRes - 1) * this.cellSize * 0.5;
+                const ccx = this.minBounds.x - 2.0 * this.cellSize + halfSpan;
+                const ccy = this.minBounds.y - 2.0 * this.cellSize + halfSpan;
+                const ccz = this.minBounds.z - 2.0 * this.cellSize + halfSpan;
+                const cDist = Math.sqrt(ccx * ccx + ccy * ccy + ccz * ccz);
+                const halfDiag = halfSpan * 1.732051;
+
+                if (cDist - halfDiag > maxCrustR) {
+                    this.state = 'void';
+                    this.voxelData = null;
+                    this.materialData = null;
+                    return;
+                }
+
+                const touchesCrust = (cDist + halfDiag >= minCrustR) && (cDist - halfDiag <= maxCrustR);
+
+                if (cDist + halfDiag < minCrustR) {
+                    let hasEdit = false;
+                    for (let i = 0; i < editHistory.length; i++) {
+                        const op = editHistory[i];
+                        if (nodeIntersectsSphere(this, op.x, op.y, op.z, op.radius + this.cellSize * 2.5)) {
+                            hasEdit = true;
+                            break;
+                        }
+                    }
+                    if (!hasEdit) {
+                        this.state = 'solid';
+                        this.voxelData = null;
+                        this.materialData = null;
+                        return;
+                    }
+                }
+
+                const useCoarseNoise = (this.level >= 2) && touchesCrust;
+                const GRID = 9;
+                const GRID2 = GRID * GRID;
+                const span = pRes - 1;
+                if (useCoarseNoise) {
+                    let gIdx = 0;
+                    let minOff = Infinity;
+                    let maxOff = -Infinity;
+                    for (let gz = 0; gz < GRID; gz++) {
+                        const wz = this.minBounds.z + ((gz / 8.0) * span - 2) * this.cellSize;
+                        for (let gy = 0; gy < GRID; gy++) {
+                            const wy = this.minBounds.y + ((gy / 8.0) * span - 2) * this.cellSize;
+                            for (let gx = 0; gx < GRID; gx++) {
+                                const wx = this.minBounds.x + ((gx / 8.0) * span - 2) * this.cellSize;
+                                const nVal = evalNoiseOffsetPoC1(wx, wy, wz);
+                                _poc1CoarseGrid[gIdx++] = nVal;
+                                if (nVal < minOff) minOff = nVal;
+                                if (nVal > maxOff) maxOff = nVal;
+                            }
+                        }
+                    }
+                    if (cDist - halfDiag > currentRadius + maxOff + 20.0) {
+                        this.state = 'void';
+                        this.voxelData = null;
+                        this.materialData = null;
+                        return;
+                    }
+                    if (cDist + halfDiag < currentRadius + minOff - 20.0) {
+                        let hasEdit = false;
+                        for (let i = 0; i < editHistory.length; i++) {
+                            const op = editHistory[i];
+                            if (nodeIntersectsSphere(this, op.x, op.y, op.z, op.radius + this.cellSize * 2.5)) {
+                                hasEdit = true;
+                                break;
+                            }
+                        }
+                        if (!hasEdit) {
+                            this.state = 'solid';
+                            this.voxelData = null;
+                            this.materialData = null;
+                            return;
+                        }
+                    }
+                }
+
+                const totalVoxels = pRes * pRes * pRes;
+                this.voxelData = new Float32Array(totalVoxels);
+                this.materialData = new Uint8Array(totalVoxels);
+
+                const invSpan8 = 8.0 / span;
+                const oreFreqZ = oreFreq;
+                const oreFreqY = oreFreq * 0.36;
                 let idx = 0;
                 for (let pz = 0; pz < pRes; pz++) {
                     const wz = this.minBounds.z + (pz - 2) * this.cellSize;
+                    const cosOreZ = Math.cos(wz * oreFreqZ);
+                    const checkOreZ = Math.abs(cosOreZ) > 0.78;
+                    let iz0 = 0, tz = 0.0;
+                    if (useCoarseNoise) {
+                        const fz = pz * invSpan8;
+                        iz0 = Math.min(7, Math.floor(fz));
+                        tz = fz - iz0;
+                    }
                     for (let py = 0; py < pRes; py++) {
                         const wy = this.minBounds.y + (py - 2) * this.cellSize;
+                        const wyOreOff = wy * oreFreqY;
+                        let iy0 = 0, ty = 0.0;
+                        if (useCoarseNoise) {
+                            const fy = py * invSpan8;
+                            iy0 = Math.min(7, Math.floor(fy));
+                            ty = fy - iy0;
+                        }
                         for (let px = 0; px < pRes; px++) {
                             const wx = this.minBounds.x + (px - 2) * this.cellSize;
                             const rDist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-                            const d = (rDist < minCrustR || rDist > maxCrustR) ? (rDist - currentRadius) : evalDensityPoC1(wx, wy, wz);
-                            this.voxelData[idx] = d;
-
-                            if (d < -this.cellSize && Math.sin(wx * oreFreq + wy * oreFreq * 0.36) * Math.cos(wz * oreFreq) > 0.78) {
-                                this.materialData[idx] = 2; // Ore vein
+                            let d;
+                            if (!touchesCrust || rDist < minCrustR || rDist > maxCrustR) {
+                                d = rDist - currentRadius;
+                            } else if (useCoarseNoise) {
+                                const fx = px * invSpan8;
+                                const ix0 = Math.min(7, Math.floor(fx));
+                                const tx = fx - ix0;
+                                const base = ix0 + iy0 * GRID + iz0 * GRID2;
+                                const c000 = _poc1CoarseGrid[base];
+                                const c100 = _poc1CoarseGrid[base + 1];
+                                const c010 = _poc1CoarseGrid[base + GRID];
+                                const c110 = _poc1CoarseGrid[base + GRID + 1];
+                                const c001 = _poc1CoarseGrid[base + GRID2];
+                                const c101 = _poc1CoarseGrid[base + GRID2 + 1];
+                                const c011 = _poc1CoarseGrid[base + GRID2 + GRID];
+                                const c111 = _poc1CoarseGrid[base + GRID2 + GRID + 1];
+                                const x00 = c000 + (c100 - c000) * tx;
+                                const x10 = c010 + (c110 - c010) * tx;
+                                const x01 = c001 + (c101 - c001) * tx;
+                                const x11 = c011 + (c111 - c011) * tx;
+                                const y0 = x00 + (x10 - x00) * ty;
+                                const y1 = x01 + (x11 - x01) * ty;
+                                const nOff = y0 + (y1 - y0) * tz;
+                                d = rDist - (currentRadius + nOff);
                             } else {
-                                this.materialData[idx] = 1; // Native rock
+                                d = evalDensityPoC1(wx, wy, wz);
                             }
+                            this.voxelData[idx] = d;
+                            this.materialData[idx] = (checkOreZ && d < -this.cellSize && Math.sin(wx * oreFreq + wyOreOff) * cosOreZ > 0.78) ? 2 : 1;
                             idx++;
                         }
                     }
                 }
+
+                // Replay intersecting editHistory ops chronologically within clamped leaf AABBs
+                const invCell = 1.0 / this.cellSize;
+                for (let eIdx = 0; eIdx < editHistory.length; eIdx++) {
+                    const op = editHistory[eIdx];
+                    if (op.type === 'carve') {
+                        const pad = op.radius + this.cellSize * 2.5;
+                        const padSq = pad * pad;
+                        const minPX = Math.max(0, Math.floor((op.x - pad - this.minBounds.x) * invCell + 2));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((op.x + pad - this.minBounds.x) * invCell + 2));
+                        const minPY = Math.max(0, Math.floor((op.y - pad - this.minBounds.y) * invCell + 2));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((op.y + pad - this.minBounds.y) * invCell + 2));
+                        const minPZ = Math.max(0, Math.floor((op.z - pad - this.minBounds.z) * invCell + 2));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + pad - this.minBounds.z) * invCell + 2));
+                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+                        for (let pz = minPZ; pz <= maxPZ; pz++) {
+                            const dz = this.minBounds.z + (pz - 2) * this.cellSize - op.z;
+                            const zOff = pz * pRes2;
+                            for (let py = minPY; py <= maxPY; py++) {
+                                const dy = this.minBounds.y + (py - 2) * this.cellSize - op.y;
+                                const yzOff = zOff + py * pRes;
+                                for (let px = minPX; px <= maxPX; px++) {
+                                    const dx = this.minBounds.x + (px - 2) * this.cellSize - op.x;
+                                    const dSq = dx * dx + dy * dy + dz * dz;
+                                    if (dSq <= padSq) {
+                                        const carveD = op.radius - Math.sqrt(dSq);
+                                        const vIdx = yzOff + px;
+                                        if (carveD > this.voxelData[vIdx]) {
+                                            this.voxelData[vIdx] = carveD;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if (op.type === 'reinforce') {
+                        const rSq = op.radius * op.radius;
+                        const minPX = Math.max(0, Math.floor((op.x - op.radius - this.minBounds.x) * invCell + 2));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((op.x + op.radius - this.minBounds.x) * invCell + 2));
+                        const minPY = Math.max(0, Math.floor((op.y - op.radius - this.minBounds.y) * invCell + 2));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((op.y + op.radius - this.minBounds.y) * invCell + 2));
+                        const minPZ = Math.max(0, Math.floor((op.z - op.radius - this.minBounds.z) * invCell + 2));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + op.radius - this.minBounds.z) * invCell + 2));
+                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+                        for (let pz = minPZ; pz <= maxPZ; pz++) {
+                            const dz = this.minBounds.z + (pz - 2) * this.cellSize - op.z;
+                            const zOff = pz * pRes2;
+                            for (let py = minPY; py <= maxPY; py++) {
+                                const dy = this.minBounds.y + (py - 2) * this.cellSize - op.y;
+                                const yzOff = zOff + py * pRes;
+                                for (let px = minPX; px <= maxPX; px++) {
+                                    const dx = this.minBounds.x + (px - 2) * this.cellSize - op.x;
+                                    const vIdx = yzOff + px;
+                                    if (dx * dx + dy * dy + dz * dz <= rSq && this.voxelData[vIdx] < 0.0) {
+                                        this.materialData[vIdx] = 3;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let hasNeg = false;
+                let hasPos = false;
+                for (let k = 0; k < totalVoxels; k++) {
+                    if (this.voxelData[k] < 0.0) hasNeg = true;
+                    else hasPos = true;
+                    if (hasNeg && hasPos) break;
+                }
+                if (hasNeg && hasPos) {
+                    this.state = 'surface';
+                } else {
+                    this.state = hasNeg ? 'solid' : 'void';
+                    this.voxelData = null;
+                    this.materialData = null;
+                }
             }
 
-            async rebuildMesh(scene) {
-                if (this.isGenerating) {
-                    this.needsRebuild = true;
-                    return null;
+            applyMeshResult(scene, result) {
+                if (this.children !== null || this.epoch !== worldEpoch || !result || result.cancelled) {
+                    return;
                 }
-                if (this.epoch !== worldEpoch) {
-                    this.needsRebuild = false;
-                    return { cancelled: true };
-                }
-                this.isGenerating = true;
-                this.needsRebuild = false;
-
-                let result = null;
-                let failed = false;
-                try {
-                    result = await workerPool.enqueue({
-                        epoch: this.epoch,
-                        buildPayload: () => {
-                            const voxelCopy = new Float32Array(this.voxelData);
-                            const matCopy = new Uint8Array(this.materialData);
-                            return {
-                                payload: {
-                                    chunkId: this.key,
-                                    res: this.res,
-                                    voxelData: voxelCopy,
-                                    materialData: matCopy,
-                                    minBounds: [this.minBounds.x, this.minBounds.y, this.minBounds.z],
-                                    cellSize: this.cellSize
-                                },
-                                transferables: [voxelCopy.buffer, matCopy.buffer]
-                            };
-                        }
-                    });
-                } catch (err) {
-                    failed = true;
-                    console.warn(`[PoC1] Chunk ${this.key} meshing failed:`, err);
-                } finally {
-                    this.isGenerating = false;
-                }
-
-                // Discard failed, cancelled, or stale results from previous epochs
-                if (failed || !result || result.cancelled || this.epoch !== worldEpoch) {
-                    this.needsRebuild = false;
-                    return result || { cancelled: true };
-                }
-
                 const { positions, normals, colors, indices } = result;
-
-                if (positions.length === 0 || indices.length === 0) {
+                if (!positions || !indices || positions.length === 0 || indices.length === 0) {
                     if (this.mesh) {
                         scene.remove(this.mesh);
                         const mIdx = activeChunkMeshes.indexOf(this.mesh);
@@ -175,7 +463,10 @@
                         this.mesh.geometry.dispose();
                         this.mesh = null;
                     }
-                } else if (!this.mesh) {
+                    return;
+                }
+
+                if (!this.mesh) {
                     const geo = new THREE.BufferGeometry();
                     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
                     geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
@@ -200,19 +491,92 @@
                     geo.computeBoundingSphere();
                     geo.computeBoundingBox();
                 }
+            }
 
-                if (this.needsRebuild && this.epoch === worldEpoch) {
-                    return await this.rebuildMesh(scene);
+            async rebuildMesh(scene, options = {}) {
+                const deferSwap = Boolean(options && options.deferSwap);
+                if (this.children !== null || this.epoch !== worldEpoch || this.state !== 'surface' || !this.voxelData) {
+                    this.needsRebuild = false;
+                    return { cancelled: true };
+                }
+                if (this.isGenerating) {
+                    this.needsRebuild = true;
+                    return null;
+                }
+                this.isGenerating = true;
+                this.needsRebuild = false;
+
+                let result = null;
+                let failed = false;
+                try {
+                    result = await workerPool.enqueue({
+                        epoch: this.epoch,
+                        buildPayload: () => {
+                            if (!this.voxelData || !this.materialData || this.children !== null) {
+                                return {
+                                    payload: {
+                                        chunkId: this.key,
+                                        res: this.res,
+                                        voxelData: new Float32Array(0),
+                                        materialData: new Uint8Array(0),
+                                        minBounds: [this.minBounds.x, this.minBounds.y, this.minBounds.z],
+                                        cellSize: this.cellSize,
+                                        extendPosX: false,
+                                        extendPosY: false,
+                                        extendPosZ: false
+                                    },
+                                    transferables: []
+                                };
+                            }
+                            const voxelCopy = new Float32Array(this.voxelData);
+                            const matCopy = new Uint8Array(this.materialData);
+                            return {
+                                payload: {
+                                    chunkId: this.key,
+                                    res: this.res,
+                                    voxelData: voxelCopy,
+                                    materialData: matCopy,
+                                    minBounds: [this.minBounds.x, this.minBounds.y, this.minBounds.z],
+                                    cellSize: this.cellSize,
+                                    extendPosX: this.extendFlags.x,
+                                    extendPosY: this.extendFlags.y,
+                                    extendPosZ: this.extendFlags.z
+                                },
+                                transferables: [voxelCopy.buffer, matCopy.buffer]
+                            };
+                        }
+                    });
+                } catch (err) {
+                    failed = true;
+                    console.warn(`[PoC1] Chunk ${this.key} meshing failed:`, err);
+                } finally {
+                    this.isGenerating = false;
+                }
+
+                // Discard failed, cancelled, split, or stale results from previous epochs
+                if (failed || !result || result.cancelled || this.children !== null || this.epoch !== worldEpoch) {
+                    this.needsRebuild = false;
+                    return result || { cancelled: true };
+                }
+
+                if (deferSwap) {
+                    return { chunk: this, result };
+                }
+
+                this.applyMeshResult(scene, result);
+
+                if (this.needsRebuild && this.epoch === worldEpoch && this.children === null) {
+                    return await this.rebuildMesh(scene, options);
                 }
                 return result;
             }
         }
 
-        function getOrCreateChunk(cx, cy, cz) {
-            const key = `${cx},${cy},${cz}`;
+        function getOrCreateRootChunk(gx, gy, gz) {
+            const key = `0:${gx},${gy},${gz}`;
             let chunk = chunkMap.get(key);
             if (!chunk) {
-                chunk = new VoxelChunk(cx, cy, cz, worldEpoch);
+                chunk = new VoxelChunk(gx, gy, gz, 0, CHUNK_SIZE, worldEpoch);
                 chunkMap.set(key, chunk);
             }
             return chunk;
@@ -222,6 +586,9 @@
         async function initAsteroidChunks(scene) {
             worldEpoch++;
             workerPool.setEpoch(worldEpoch);
+            opSerialChain = Promise.resolve();
+            editHistory.length = 0;
+
             activeChunkMeshes.forEach(m => {
                 scene.remove(m);
                 m.geometry.dispose();
@@ -231,6 +598,7 @@
 
             CHUNK_SIZE = currentRadius * 0.45;
             CELL_SIZE = CHUNK_SIZE / CHUNK_RES;
+            FINE_CELL_SIZE = computeFineCellSize(CELL_SIZE);
             chunkMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
 
             const boundChunks = Math.ceil((currentRadius * 1.25) / CHUNK_SIZE);
@@ -242,12 +610,18 @@
             for (let cz = -boundChunks; cz <= boundChunks; cz++) {
                 for (let cy = -boundChunks; cy <= boundChunks; cy++) {
                     for (let cx = -boundChunks; cx <= boundChunks; cx++) {
-                        const center = new THREE.Vector3((cx + 0.5) * CHUNK_SIZE, (cy + 0.5) * CHUNK_SIZE, (cz + 0.5) * CHUNK_SIZE);
-                        const d = center.length();
+                        const centerX = (cx + 0.5) * CHUNK_SIZE;
+                        const centerY = (cy + 0.5) * CHUNK_SIZE;
+                        const centerZ = (cz + 0.5) * CHUNK_SIZE;
+                        const d = Math.sqrt(centerX * centerX + centerY * centerY + centerZ * centerZ);
                         if (d < maxShellR + halfDiag && d > minShellR - halfDiag) {
-                            const chunk = new VoxelChunk(cx, cy, cz, worldEpoch);
-                            chunkMap.set(chunk.key, chunk);
-                            initialRebuilds.push(chunk.rebuildMesh(scene));
+                            const chunk = new VoxelChunk(cx, cy, cz, 0, CHUNK_SIZE, worldEpoch);
+                            if (chunk.state !== 'void') {
+                                chunkMap.set(chunk.key, chunk);
+                                if (chunk.state === 'surface') {
+                                    initialRebuilds.push(chunk.rebuildMesh(scene));
+                                }
+                            }
                         }
                     }
                 }
@@ -255,143 +629,400 @@
             await Promise.allSettled(initialRebuilds);
         }
 
-        async function carveSpherePoC1(hitPoint, brushRadius) {
-            const syncStart = performance.now();
-            const pRes = CHUNK_RES + 5;
-            const pRes2 = pRes * pRes;
-            const pad = brushRadius + CELL_SIZE * 2.5;
-            const padSq = pad * pad;
-            const effPad = brushRadius + CELL_SIZE * 3.5;
-            const invCell = 1.0 / CELL_SIZE;
-            const minCX = Math.floor((hitPoint.x - effPad) / CHUNK_SIZE);
-            const maxCX = Math.floor((hitPoint.x + effPad) / CHUNK_SIZE);
-            const minCY = Math.floor((hitPoint.y - effPad) / CHUNK_SIZE);
-            const maxCY = Math.floor((hitPoint.y + effPad) / CHUNK_SIZE);
-            const minCZ = Math.floor((hitPoint.z - effPad) / CHUNK_SIZE);
-            const maxCZ = Math.floor((hitPoint.z + effPad) / CHUNK_SIZE);
+        function enqueueSerializedOp(fn) {
+            const capturedEpoch = worldEpoch;
+            const next = opSerialChain.then(
+                () => fn(capturedEpoch),
+                () => fn(capturedEpoch)
+            );
+            opSerialChain = next.catch(() => {});
+            return next;
+        }
 
-            const rebuilds = [];
-            for (let cz = minCZ; cz <= maxCZ; cz++) {
-                const cMinZ = cz * CHUNK_SIZE - 2 * CELL_SIZE;
-                const cMaxZ = cz * CHUNK_SIZE + (CHUNK_RES + 2) * CELL_SIZE;
-                const dz = hitPoint.z < cMinZ ? cMinZ - hitPoint.z : (hitPoint.z > cMaxZ ? hitPoint.z - cMaxZ : 0);
-                const dz2 = dz * dz;
-                if (dz2 > padSq) continue;
-                for (let cy = minCY; cy <= maxCY; cy++) {
-                    const cMinY = cy * CHUNK_SIZE - 2 * CELL_SIZE;
-                    const cMaxY = cy * CHUNK_SIZE + (CHUNK_RES + 2) * CELL_SIZE;
-                    const dy = hitPoint.y < cMinY ? cMinY - hitPoint.y : (hitPoint.y > cMaxY ? hitPoint.y - cMaxY : 0);
-                    const dyz2 = dz2 + dy * dy;
-                    if (dyz2 > padSq) continue;
-                    for (let cx = minCX; cx <= maxCX; cx++) {
-                        const cMinX = cx * CHUNK_SIZE - 2 * CELL_SIZE;
-                        const cMaxX = cx * CHUNK_SIZE + (CHUNK_RES + 2) * CELL_SIZE;
-                        const dx = hitPoint.x < cMinX ? cMinX - hitPoint.x : (hitPoint.x > cMaxX ? hitPoint.x - cMaxX : 0);
-                        if (dx * dx + dyz2 > padSq) continue;
+        function splitChunkNode(node, op, retiredMeshes, splitNodes, newLeaves) {
+            if (node.mesh) {
+                retiredMeshes.push(node.mesh);
+                node.mesh = null;
+            }
+            node.needsRebuild = false;
+            node.voxelData = null;
+            node.materialData = null;
+            node.children = new Array(8);
+            splitNodes.push(node);
 
-                        const chunk = getOrCreateChunk(cx, cy, cz);
-                        const minPX = Math.max(0, Math.floor((hitPoint.x - pad - chunk.minBounds.x) * invCell + 2));
-                        const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + pad - chunk.minBounds.x) * invCell + 2));
-                        const minPY = Math.max(0, Math.floor((hitPoint.y - pad - chunk.minBounds.y) * invCell + 2));
-                        const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + pad - chunk.minBounds.y) * invCell + 2));
-                        const minPZ = Math.max(0, Math.floor((hitPoint.z - pad - chunk.minBounds.z) * invCell + 2));
-                        const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + pad - chunk.minBounds.z) * invCell + 2));
-                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
-
-                        let modified = false;
-                        for (let pz = minPZ; pz <= maxPZ; pz++) {
-                            const wz = chunk.minBounds.z + (pz - 2) * CELL_SIZE;
-                            const zOff = pz * pRes2;
-                            for (let py = minPY; py <= maxPY; py++) {
-                                const wy = chunk.minBounds.y + (py - 2) * CELL_SIZE;
-                                const yzOff = zOff + py * pRes;
-                                for (let px = minPX; px <= maxPX; px++) {
-                                    const wx = chunk.minBounds.x + (px - 2) * CELL_SIZE;
-                                    const distToCenter = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
-                                    if (distToCenter <= pad) {
-                                        const carveD = brushRadius - distToCenter;
-                                        const idx = yzOff + px;
-                                        if (carveD > chunk.voxelData[idx]) {
-                                            chunk.voxelData[idx] = carveD;
-                                            modified = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if (modified) {
-                            rebuilds.push(chunk.rebuildMesh(sandbox.scene));
+            const halfSize = node.size * 0.5;
+            const childLevel = node.level + 1;
+            let cIdx = 0;
+            for (let oz = 0; oz < 2; oz++) {
+                for (let oy = 0; oy < 2; oy++) {
+                    for (let ox = 0; ox < 2; ox++) {
+                        const child = new VoxelChunk(
+                            node.gx * 2 + ox,
+                            node.gy * 2 + oy,
+                            node.gz * 2 + oz,
+                            childLevel,
+                            halfSize,
+                            node.epoch,
+                            true
+                        );
+                        node.children[cIdx++] = child;
+                        if (child.isDefinitelyVoid()) {
+                            child.state = 'void';
+                            newLeaves.push(child);
+                        } else if (
+                            child.cellSize > FINE_CELL_LIMIT &&
+                            child.level < MAX_SUBDIV_LEVEL &&
+                            nodeBoxIntersectsSphere(child, op.x, op.y, op.z, splitPad(child, op.radius))
+                        ) {
+                            splitChunkNode(child, op, retiredMeshes, splitNodes, newLeaves);
+                        } else {
+                            child.initVoxels();
+                            newLeaves.push(child);
                         }
                     }
                 }
             }
-            const mainThreadMs = performance.now() - syncStart;
-            await Promise.allSettled(rebuilds);
-            return { mainThreadMs };
         }
 
-        async function reinforceSpherePoC1(hitPoint, brushRadius) {
-            const syncStart = performance.now();
-            const pRes = CHUNK_RES + 5;
-            const pRes2 = pRes * pRes;
-            const effPad = brushRadius + CELL_SIZE * 3.5;
-            const invCell = 1.0 / CELL_SIZE;
-            const minCX = Math.floor((hitPoint.x - effPad) / CHUNK_SIZE);
-            const maxCX = Math.floor((hitPoint.x + effPad) / CHUNK_SIZE);
-            const minCY = Math.floor((hitPoint.y - effPad) / CHUNK_SIZE);
-            const maxCY = Math.floor((hitPoint.y + effPad) / CHUNK_SIZE);
-            const minCZ = Math.floor((hitPoint.z - effPad) / CHUNK_SIZE);
-            const maxCZ = Math.floor((hitPoint.z + effPad) / CHUNK_SIZE);
+        function updateNeighborExtendFlags(splitNodes, newLeafSet, rebuildLeaves) {
+            const checkedNeighbors = new Set();
+            for (let i = 0; i < splitNodes.length; i++) {
+                const p = splitNodes[i];
+                const dirs = [
+                    [p.gx - 1, p.gy, p.gz],
+                    [p.gx, p.gy - 1, p.gz],
+                    [p.gx, p.gy, p.gz - 1]
+                ];
+                for (let d = 0; d < 3; d++) {
+                    const nb = findCoveringNode(dirs[d][0], dirs[d][1], dirs[d][2], p.level);
+                    if (!nb || nb.children !== null || nb.state !== 'surface' || newLeafSet.has(nb) || checkedNeighbors.has(nb)) {
+                        continue;
+                    }
+                    checkedNeighbors.add(nb);
+                    const desired = computeDesiredExtendFlags(nb);
+                    if (
+                        desired.x !== nb.extendFlags.x ||
+                        desired.y !== nb.extendFlags.y ||
+                        desired.z !== nb.extendFlags.z
+                    ) {
+                        nb.extendFlags = desired;
+                        rebuildLeaves.add(nb);
+                    }
+                }
+            }
+        }
 
-            const rebuilds = [];
-            for (let cz = minCZ; cz <= maxCZ; cz++) {
-                for (let cy = minCY; cy <= maxCY; cy++) {
-                    for (let cx = minCX; cx <= maxCX; cx++) {
-                        const key = `${cx},${cy},${cz}`;
-                        const chunk = chunkMap.get(key);
-                        if (!chunk) continue;
+        async function carveSpherePoC1(hitPoint, brushRadius) {
+            return enqueueSerializedOp(async (opEpoch) => {
+                if (opEpoch !== worldEpoch) {
+                    return { mainThreadMs: 0, cancelled: true };
+                }
+                const syncStart = performance.now();
+                const op = { type: 'carve', x: hitPoint.x, y: hitPoint.y, z: hitPoint.z, radius: brushRadius };
+                editHistory.push(op);
 
-                        const minPX = Math.max(0, Math.floor((hitPoint.x - brushRadius - chunk.minBounds.x) * invCell + 2));
-                        const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + brushRadius - chunk.minBounds.x) * invCell + 2));
-                        const minPY = Math.max(0, Math.floor((hitPoint.y - brushRadius - chunk.minBounds.y) * invCell + 2));
-                        const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + brushRadius - chunk.minBounds.y) * invCell + 2));
-                        const minPZ = Math.max(0, Math.floor((hitPoint.z - brushRadius - chunk.minBounds.z) * invCell + 2));
-                        const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + brushRadius - chunk.minBounds.z) * invCell + 2));
-                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+                const effPad = brushRadius + Math.max(45.0, CELL_SIZE * 3.5);
+                const minCX = Math.floor((op.x - effPad) / CHUNK_SIZE);
+                const maxCX = Math.floor((op.x + effPad) / CHUNK_SIZE);
+                const minCY = Math.floor((op.y - effPad) / CHUNK_SIZE);
+                const maxCY = Math.floor((op.y + effPad) / CHUNK_SIZE);
+                const minCZ = Math.floor((op.z - effPad) / CHUNK_SIZE);
+                const maxCZ = Math.floor((op.z + effPad) / CHUNK_SIZE);
 
-                        let modified = false;
-                        for (let pz = minPZ; pz <= maxPZ; pz++) {
-                            const wz = chunk.minBounds.z + (pz - 2) * CELL_SIZE;
-                            const zOff = pz * pRes2;
-                            for (let py = minPY; py <= maxPY; py++) {
-                                const wy = chunk.minBounds.y + (py - 2) * CELL_SIZE;
-                                const yzOff = zOff + py * pRes;
-                                for (let px = minPX; px <= maxPX; px++) {
-                                    const wx = chunk.minBounds.x + (px - 2) * CELL_SIZE;
-                                    const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
+                const retiredMeshes = [];
+                const splitNodes = [];
+                const newLeaves = [];
+                const rebuildLeaves = new Set();
+
+                function visitForCarve(node, isNewlyCreatedRoot) {
+                    const reachPad = Math.max(op.radius + node.cellSize * 2.5, splitPad(node, op.radius));
+                    if (!nodeIntersectsSphere(node, op.x, op.y, op.z, reachPad)) return;
+
+                    if (node.children !== null) {
+                        for (let i = 0; i < 8; i++) {
+                            visitForCarve(node.children[i], false);
+                        }
+                        return;
+                    }
+
+                    if (node.state === 'void') return;
+
+                    if (
+                        node.cellSize > FINE_CELL_LIMIT &&
+                        node.level < MAX_SUBDIV_LEVEL &&
+                        nodeBoxIntersectsSphere(node, op.x, op.y, op.z, splitPad(node, op.radius))
+                    ) {
+                        splitChunkNode(node, op, retiredMeshes, splitNodes, newLeaves);
+                        return;
+                    }
+
+                    if (!nodeIntersectsSphere(node, op.x, op.y, op.z, op.radius + node.cellSize * 2.5)) {
+                        if (isNewlyCreatedRoot && node.state === 'surface') {
+                            rebuildLeaves.add(node);
+                        }
+                        return;
+                    }
+
+                    if (isNewlyCreatedRoot) {
+                        if (node.state === 'surface') {
+                            rebuildLeaves.add(node);
+                        }
+                        return;
+                    }
+
+                    if (node.state === 'solid') {
+                        node.initVoxels();
+                        if (node.state === 'surface') {
+                            rebuildLeaves.add(node);
+                        }
+                        return;
+                    }
+
+                    // Incremental clamped-AABB carve on existing fine 'surface' leaf
+                    const pRes = node.res + 5;
+                    const pRes2 = pRes * pRes;
+                    const pad = op.radius + node.cellSize * 2.5;
+                    const padSq = pad * pad;
+                    const invCell = 1.0 / node.cellSize;
+                    const minPX = Math.max(0, Math.floor((op.x - pad - node.minBounds.x) * invCell + 2));
+                    const maxPX = Math.min(pRes - 1, Math.ceil((op.x + pad - node.minBounds.x) * invCell + 2));
+                    const minPY = Math.max(0, Math.floor((op.y - pad - node.minBounds.y) * invCell + 2));
+                    const maxPY = Math.min(pRes - 1, Math.ceil((op.y + pad - node.minBounds.y) * invCell + 2));
+                    const minPZ = Math.max(0, Math.floor((op.z - pad - node.minBounds.z) * invCell + 2));
+                    const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + pad - node.minBounds.z) * invCell + 2));
+                    if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) return;
+
+                    let modified = false;
+                    for (let pz = minPZ; pz <= maxPZ; pz++) {
+                        const dz = node.minBounds.z + (pz - 2) * node.cellSize - op.z;
+                        const zOff = pz * pRes2;
+                        for (let py = minPY; py <= maxPY; py++) {
+                            const dy = node.minBounds.y + (py - 2) * node.cellSize - op.y;
+                            const yzOff = zOff + py * pRes;
+                            for (let px = minPX; px <= maxPX; px++) {
+                                const dx = node.minBounds.x + (px - 2) * node.cellSize - op.x;
+                                const dSq = dx * dx + dy * dy + dz * dz;
+                                if (dSq <= padSq) {
+                                    const carveD = op.radius - Math.sqrt(dSq);
                                     const idx = yzOff + px;
-                                    if (dist <= brushRadius && chunk.voxelData[idx] < 0) {
-                                        chunk.materialData[idx] = 3; // Reinforced Titanium Bulkhead
+                                    if (carveD > node.voxelData[idx]) {
+                                        node.voxelData[idx] = carveD;
                                         modified = true;
                                     }
                                 }
                             }
                         }
-                        if (modified) {
-                            rebuilds.push(chunk.rebuildMesh(sandbox.scene));
+                    }
+                    if (modified) {
+                        rebuildLeaves.add(node);
+                    }
+                }
+
+                for (let cz = minCZ; cz <= maxCZ; cz++) {
+                    for (let cy = minCY; cy <= maxCY; cy++) {
+                        for (let cx = minCX; cx <= maxCX; cx++) {
+                            const key = `0:${cx},${cy},${cz}`;
+                            let root = chunkMap.get(key);
+                            let isNewRoot = false;
+                            if (!root) {
+                                root = new VoxelChunk(cx, cy, cz, 0, CHUNK_SIZE, worldEpoch, true);
+                                if (root.isDefinitelyVoid()) continue;
+                                if (
+                                    root.cellSize > FINE_CELL_LIMIT &&
+                                    root.level < MAX_SUBDIV_LEVEL &&
+                                    nodeBoxIntersectsSphere(root, op.x, op.y, op.z, splitPad(root, op.radius))
+                                ) {
+                                    chunkMap.set(key, root);
+                                    splitChunkNode(root, op, retiredMeshes, splitNodes, newLeaves);
+                                    continue;
+                                }
+                                root.initVoxels();
+                                if (root.state === 'void') continue;
+                                chunkMap.set(key, root);
+                                isNewRoot = true;
+                            }
+                            visitForCarve(root, isNewRoot);
                         }
                     }
                 }
-            }
-            const mainThreadMs = performance.now() - syncStart;
-            await Promise.allSettled(rebuilds);
-            return { mainThreadMs };
+
+                const newLeafSet = new Set(newLeaves);
+                for (let i = 0; i < newLeaves.length; i++) {
+                    const nl = newLeaves[i];
+                    if (nl.state === 'surface') {
+                        nl.extendFlags = computeDesiredExtendFlags(nl);
+                        rebuildLeaves.add(nl);
+                    }
+                }
+                if (splitNodes.length > 0) {
+                    updateNeighborExtendFlags(splitNodes, newLeafSet, rebuildLeaves);
+                }
+
+                const deferredRebuilds = [];
+                for (const leaf of rebuildLeaves) {
+                    if (leaf.state === 'surface' && leaf.children === null) {
+                        deferredRebuilds.push(leaf.rebuildMesh(sandbox.scene, { deferSwap: true }));
+                    }
+                }
+
+                const mainThreadMs = performance.now() - syncStart;
+                const settled = await Promise.allSettled(deferredRebuilds);
+                if (opEpoch !== worldEpoch) {
+                    return { mainThreadMs, cancelled: true };
+                }
+
+                for (let i = 0; i < retiredMeshes.length; i++) {
+                    const rm = retiredMeshes[i];
+                    sandbox.scene.remove(rm);
+                    const mIdx = activeChunkMeshes.indexOf(rm);
+                    if (mIdx !== -1) activeChunkMeshes.splice(mIdx, 1);
+                    rm.geometry.dispose();
+                }
+                for (let i = 0; i < settled.length; i++) {
+                    const entry = settled[i];
+                    if (entry.status === 'fulfilled' && entry.value && entry.value.chunk && entry.value.result) {
+                        entry.value.chunk.applyMeshResult(sandbox.scene, entry.value.result);
+                    }
+                }
+                return { mainThreadMs };
+            });
+        }
+
+        async function reinforceSpherePoC1(hitPoint, brushRadius) {
+            return enqueueSerializedOp(async (opEpoch) => {
+                if (opEpoch !== worldEpoch) {
+                    return { mainThreadMs: 0, cancelled: true };
+                }
+                const syncStart = performance.now();
+                const op = { type: 'reinforce', x: hitPoint.x, y: hitPoint.y, z: hitPoint.z, radius: brushRadius };
+                editHistory.push(op);
+
+                const effPad = brushRadius + Math.max(45.0, CELL_SIZE * 3.5);
+                const minCX = Math.floor((op.x - effPad) / CHUNK_SIZE);
+                const maxCX = Math.floor((op.x + effPad) / CHUNK_SIZE);
+                const minCY = Math.floor((op.y - effPad) / CHUNK_SIZE);
+                const maxCY = Math.floor((op.y + effPad) / CHUNK_SIZE);
+                const minCZ = Math.floor((op.z - effPad) / CHUNK_SIZE);
+                const maxCZ = Math.floor((op.z + effPad) / CHUNK_SIZE);
+
+                const retiredMeshes = [];
+                const splitNodes = [];
+                const newLeaves = [];
+                const rebuildLeaves = new Set();
+
+                function visitForReinforce(node) {
+                    const reachPad = Math.max(op.radius + node.cellSize * 2.0, splitPad(node, op.radius));
+                    if (!nodeIntersectsSphere(node, op.x, op.y, op.z, reachPad)) return;
+
+                    if (node.children !== null) {
+                        for (let i = 0; i < 8; i++) {
+                            visitForReinforce(node.children[i]);
+                        }
+                        return;
+                    }
+
+                    if (node.state !== 'surface' || !node.voxelData) return;
+
+                    if (
+                        node.cellSize > FINE_CELL_LIMIT &&
+                        node.level < MAX_SUBDIV_LEVEL &&
+                        node.mesh !== null &&
+                        nodeBoxIntersectsSphere(node, op.x, op.y, op.z, splitPad(node, op.radius))
+                    ) {
+                        splitChunkNode(node, op, retiredMeshes, splitNodes, newLeaves);
+                        return;
+                    }
+
+                    const pRes = node.res + 5;
+                    const pRes2 = pRes * pRes;
+                    const invCell = 1.0 / node.cellSize;
+                    const rSq = op.radius * op.radius;
+                    const minPX = Math.max(0, Math.floor((op.x - op.radius - node.minBounds.x) * invCell + 2));
+                    const maxPX = Math.min(pRes - 1, Math.ceil((op.x + op.radius - node.minBounds.x) * invCell + 2));
+                    const minPY = Math.max(0, Math.floor((op.y - op.radius - node.minBounds.y) * invCell + 2));
+                    const maxPY = Math.min(pRes - 1, Math.ceil((op.y + op.radius - node.minBounds.y) * invCell + 2));
+                    const minPZ = Math.max(0, Math.floor((op.z - op.radius - node.minBounds.z) * invCell + 2));
+                    const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + op.radius - node.minBounds.z) * invCell + 2));
+                    if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) return;
+
+                    let modified = false;
+                    for (let pz = minPZ; pz <= maxPZ; pz++) {
+                        const dz = node.minBounds.z + (pz - 2) * node.cellSize - op.z;
+                        const zOff = pz * pRes2;
+                        for (let py = minPY; py <= maxPY; py++) {
+                            const dy = node.minBounds.y + (py - 2) * node.cellSize - op.y;
+                            const yzOff = zOff + py * pRes;
+                            for (let px = minPX; px <= maxPX; px++) {
+                                const dx = node.minBounds.x + (px - 2) * node.cellSize - op.x;
+                                const idx = yzOff + px;
+                                if (dx * dx + dy * dy + dz * dz <= rSq && node.voxelData[idx] < 0.0) {
+                                    node.materialData[idx] = 3; // Reinforced Titanium Bulkhead
+                                    modified = true;
+                                }
+                            }
+                        }
+                    }
+                    if (modified) {
+                        rebuildLeaves.add(node);
+                    }
+                }
+
+                for (let cz = minCZ; cz <= maxCZ; cz++) {
+                    for (let cy = minCY; cy <= maxCY; cy++) {
+                        for (let cx = minCX; cx <= maxCX; cx++) {
+                            const root = chunkMap.get(`0:${cx},${cy},${cz}`);
+                            if (root) visitForReinforce(root);
+                        }
+                    }
+                }
+
+                const newLeafSet = new Set(newLeaves);
+                for (let i = 0; i < newLeaves.length; i++) {
+                    const nl = newLeaves[i];
+                    if (nl.state === 'surface') {
+                        nl.extendFlags = computeDesiredExtendFlags(nl);
+                        rebuildLeaves.add(nl);
+                    }
+                }
+                if (splitNodes.length > 0) {
+                    updateNeighborExtendFlags(splitNodes, newLeafSet, rebuildLeaves);
+                }
+
+                const deferredRebuilds = [];
+                for (const leaf of rebuildLeaves) {
+                    if (leaf.state === 'surface' && leaf.children === null) {
+                        deferredRebuilds.push(leaf.rebuildMesh(sandbox.scene, { deferSwap: true }));
+                    }
+                }
+
+                const mainThreadMs = performance.now() - syncStart;
+                const settled = await Promise.allSettled(deferredRebuilds);
+                if (opEpoch !== worldEpoch) {
+                    return { mainThreadMs, cancelled: true };
+                }
+
+                for (let i = 0; i < retiredMeshes.length; i++) {
+                    const rm = retiredMeshes[i];
+                    sandbox.scene.remove(rm);
+                    const mIdx = activeChunkMeshes.indexOf(rm);
+                    if (mIdx !== -1) activeChunkMeshes.splice(mIdx, 1);
+                    rm.geometry.dispose();
+                }
+                for (let i = 0; i < settled.length; i++) {
+                    const entry = settled[i];
+                    if (entry.status === 'fulfilled' && entry.value && entry.value.chunk && entry.value.result) {
+                        entry.value.chunk.applyMeshResult(sandbox.scene, entry.value.result);
+                    }
+                }
+                return { mainThreadMs };
+            });
         }
 
         function applyQualityPoC1(qualityKey) {
             CHUNK_RES = QUALITY_PRESETS_POC1[qualityKey] || 24;
             CHUNK_SIZE = currentRadius * 0.45;
             CELL_SIZE = CHUNK_SIZE / CHUNK_RES;
+            FINE_CELL_SIZE = computeFineCellSize(CELL_SIZE);
         }
 
         async function rebuildAllPoC1() {
@@ -400,12 +1031,14 @@
             if (worldEpoch !== myEpoch) return;
             const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
             const surfPt = findSurfacePoint(evalDensityPoC1, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
-            const scaleFactor = currentRadius / 2800.0;
-            await carveSpherePoC1(surfPt, 220 * scaleFactor);
+            await carveSpherePoC1(surfPt, 200);
             if (worldEpoch !== myEpoch) return;
-            await carveSpherePoC1(surfPt.clone().addScaledVector(tunnelDir, -160 * scaleFactor), 200 * scaleFactor);
+            await carveSpherePoC1(surfPt.clone().addScaledVector(tunnelDir, -150), 180);
             if (worldEpoch !== myEpoch) return;
-            await reinforceSpherePoC1(surfPt.clone().addScaledVector(tunnelDir, -150 * scaleFactor), 250 * scaleFactor);
+            await reinforceSpherePoC1(surfPt.clone().addScaledVector(tunnelDir, -140), 220);
+            if (worldEpoch === myEpoch) {
+                sandbox.updateCellSizeLabel();
+            }
         }
 
         // Initialize Shared Sandbox
@@ -415,7 +1048,20 @@
             defaultRadius: currentRadius,
             getCollisionMesh: () => activeChunkMeshes,
             getVisualMesh: () => activeChunkMeshes,
-            getCellSize: () => `${CELL_SIZE.toFixed(1)}u (${CHUNK_RES}³)`,
+            getCellSize: () => {
+                const leaves = collectLeaves();
+                let activeMinCell = CELL_SIZE;
+                for (let i = 0; i < leaves.length; i++) {
+                    const l = leaves[i];
+                    if ((l.state === 'surface' || l.mesh !== null) && l.cellSize < activeMinCell) {
+                        activeMinCell = l.cellSize;
+                    }
+                }
+                if (activeMinCell < CELL_SIZE - 0.05) {
+                    return `${activeMinCell.toFixed(1)}u fine / ${CELL_SIZE.toFixed(1)}u macro (${CHUNK_RES}³)`;
+                }
+                return `${CELL_SIZE.toFixed(1)}u (${CHUNK_RES}³)`;
+            },
 
             onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
                 return await carveSpherePoC1(hitPoint, brushRadius);
@@ -440,7 +1086,9 @@
 
             onScaleChange: async (scaleKey, radius) => {
                 currentRadius = radius;
-                CELL_SIZE = (currentRadius * 0.45) / CHUNK_RES;
+                CHUNK_SIZE = currentRadius * 0.45;
+                CELL_SIZE = CHUNK_SIZE / CHUNK_RES;
+                FINE_CELL_SIZE = computeFineCellSize(CELL_SIZE);
                 await rebuildAllPoC1();
             },
 
@@ -459,11 +1107,14 @@
             }
         });
 
+        function evalNoiseOffsetPoC1(wx, wy, wz) {
+            const freq = 0.0014 * (2800.0 / currentRadius);
+            return (noise.fbm(wx * freq, wy * freq, wz * freq, 3) - 0.35) * (currentRadius * 0.24);
+        }
+
         function evalDensityPoC1(wx, wy, wz) {
             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-            const freq = 0.0014 * (2800.0 / currentRadius);
-            const n = (noise.fbm(wx * freq, wy * freq, wz * freq, 3) - 0.35) * (currentRadius * 0.24);
-            return dist - (currentRadius + n);
+            return dist - (currentRadius + evalNoiseOffsetPoC1(wx, wy, wz));
         }
 
         // Initial Build + Starter Demonstration Tunnel & Reinforced Alcove

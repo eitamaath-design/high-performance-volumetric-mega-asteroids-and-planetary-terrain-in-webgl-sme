@@ -15,30 +15,52 @@
 
         // --- Fast 3D Simplex-Style Noise ---
         class FastNoise3D {
-            constructor(seed = 1337) { this.seed = seed; }
+            constructor(seed = 1337) {
+                this.seed = seed;
+                this._octCache = [
+                    { valid: false, X: 0, Y: 0, Z: 0, c000: 0, c100: 0, c010: 0, c110: 0, c001: 0, c101: 0, c011: 0, c111: 0 },
+                    { valid: false, X: 0, Y: 0, Z: 0, c000: 0, c100: 0, c010: 0, c110: 0, c001: 0, c101: 0, c011: 0, c111: 0 },
+                    { valid: false, X: 0, Y: 0, Z: 0, c000: 0, c100: 0, c010: 0, c110: 0, c001: 0, c101: 0, c011: 0, c111: 0 }
+                ];
+            }
             hash(x, y, z) {
                 const s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + this.seed) * 43758.5453123;
                 return s - Math.floor(s);
             }
-            noise(x, y, z) {
+            noiseOct(x, y, z, oct) {
                 const X = Math.floor(x), Y = Math.floor(y), Z = Math.floor(z);
                 const xd = x - X, yd = y - Y, zd = z - Z;
                 const u = xd * xd * (3.0 - 2.0 * xd);
                 const v = yd * yd * (3.0 - 2.0 * yd);
                 const w = zd * zd * (3.0 - 2.0 * zd);
-                const c000 = this.hash(X, Y, Z), c100 = this.hash(X+1, Y, Z);
-                const c010 = this.hash(X, Y+1, Z), c110 = this.hash(X+1, Y+1, Z);
-                const c001 = this.hash(X, Y, Z+1), c101 = this.hash(X+1, Y, Z+1);
-                const c011 = this.hash(X, Y+1, Z+1), c111 = this.hash(X+1, Y+1, Z+1);
-                const x00 = c000*(1-u)+c100*u, x10 = c010*(1-u)+c110*u;
-                const x01 = c001*(1-u)+c101*u, x11 = c011*(1-u)+c111*u;
+                const cache = this._octCache[oct];
+                if (!cache || !cache.valid || cache.X !== X || cache.Y !== Y || cache.Z !== Z) {
+                    const c000 = this.hash(X, Y, Z), c100 = this.hash(X+1, Y, Z);
+                    const c010 = this.hash(X, Y+1, Z), c110 = this.hash(X+1, Y+1, Z);
+                    const c001 = this.hash(X, Y, Z+1), c101 = this.hash(X+1, Y, Z+1);
+                    const c011 = this.hash(X, Y+1, Z+1), c111 = this.hash(X+1, Y+1, Z+1);
+                    if (!cache) {
+                        const x00 = c000*(1-u)+c100*u, x10 = c010*(1-u)+c110*u;
+                        const x01 = c001*(1-u)+c101*u, x11 = c011*(1-u)+c111*u;
+                        const y0 = x00*(1-v)+x10*v, y1 = x01*(1-v)+x11*v;
+                        return y0*(1-w)+y1*w;
+                    }
+                    cache.valid = true; cache.X = X; cache.Y = Y; cache.Z = Z;
+                    cache.c000 = c000; cache.c100 = c100; cache.c010 = c010; cache.c110 = c110;
+                    cache.c001 = c001; cache.c101 = c101; cache.c011 = c011; cache.c111 = c111;
+                }
+                const x00 = cache.c000*(1-u)+cache.c100*u, x10 = cache.c010*(1-u)+cache.c110*u;
+                const x01 = cache.c001*(1-u)+cache.c101*u, x11 = cache.c011*(1-u)+cache.c111*u;
                 const y0 = x00*(1-v)+x10*v, y1 = x01*(1-v)+x11*v;
                 return y0*(1-w)+y1*w;
+            }
+            noise(x, y, z) {
+                return this.noiseOct(x, y, z, 0);
             }
             fbm(x, y, z, octaves = 3) {
                 let val = 0, amp = 0.5, freq = 1.0;
                 for (let i = 0; i < octaves; i++) {
-                    val += this.noise(x * freq, y * freq, z * freq) * amp;
+                    val += this.noiseOct(x * freq, y * freq, z * freq, i) * amp;
                     freq *= 2.0; amp *= 0.5;
                 }
                 return val;
@@ -48,13 +70,51 @@
         const noise = new FastNoise3D(4242);
 
         const QUALITY_PRESETS_POC2 = { low: 10, medium: 14, high: 20, ultra: 26 };
+        const FINE_CELL_LIMIT = 20.0;
+        const MAX_SUBDIV_LEVEL = 4;
         let currentRadius = 2800;
         let LEAF_RES = 20; // Configurable by quality tier (10..26 interior cells per SVO leaf)
         let LEAF_SIZE = 1344;
         let CELL_SIZE = LEAF_SIZE / LEAF_RES;
 
+        function computeFineCellSize(macroCell) {
+            let c = macroCell;
+            let lvl = 0;
+            while (c > FINE_CELL_LIMIT && lvl < MAX_SUBDIV_LEVEL) {
+                c *= 0.5;
+                lvl++;
+            }
+            return c;
+        }
+
+        let FINE_CELL_SIZE = computeFineCellSize(CELL_SIZE);
+
         const svoLeafMap = new Map();
         const activeLeafMeshes = [];
+        const editHistory = [];
+        const _poc2CoarseGrid = new Float32Array(5 * 5 * 5);
+        const _poc2SinOreX = new Float32Array(32);
+        const _dcCellVertMap = new Int32Array(32 * 32 * 32);
+
+        function collectLeaves() {
+            const leaves = [];
+            const stack = Array.from(svoLeafMap.values());
+            while (stack.length > 0) {
+                const node = stack.pop();
+                if (!node) continue;
+                if (node.children !== null) {
+                    for (let i = 0; i < 8; i++) {
+                        stack.push(node.children[i]);
+                    }
+                } else {
+                    leaves.push(node);
+                }
+            }
+            return leaves;
+        }
+
+        window.__POC2_LEAVES__ = svoLeafMap;
+        window.__POC2_GET_LEAVES__ = () => collectLeaves();
 
         const leafMaterial = createTriplanarAsteroidMaterial({ vertexColors: true, radius: currentRadius });
 
@@ -74,55 +134,381 @@
         // Preallocated zero-GC scratch buffers for Dual Contouring QEF edge extraction
         const edgePts = new Float32Array(36);
         const edgeNorms = new Float32Array(36);
+        const _dcCVals = new Float32Array(8);
+        const _dcCornerIdx = new Int32Array(8);
+        const _dcCornerX = new Uint8Array([0, 1, 0, 1, 0, 1, 0, 1]);
+        const _dcCornerY = new Uint8Array([0, 0, 1, 1, 0, 0, 1, 1]);
+        const _dcCornerZ = new Uint8Array([0, 0, 0, 0, 1, 1, 1, 1]);
+        const _dcEdgeC1 = new Uint8Array([0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]);
+        const _dcEdgeC2 = new Uint8Array([1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]);
+        let _dcVerts = new Float32Array(16384 * 3);
+        let _dcNorms = new Float32Array(16384 * 3);
+        let _dcCols = new Float32Array(16384 * 3);
+        let _dcIndices = new Uint32Array(65536 * 3);
+
+        function pushDcTriAligned(i0, i1, i2, iCount) {
+            const o0 = i0 * 3, o1 = i1 * 3, o2 = i2 * 3;
+            const ax = _dcVerts[o0], ay = _dcVerts[o0 + 1], az = _dcVerts[o0 + 2];
+            const bx = _dcVerts[o1], by = _dcVerts[o1 + 1], bz = _dcVerts[o1 + 2];
+            const cx = _dcVerts[o2], cy = _dcVerts[o2 + 1], cz = _dcVerts[o2 + 2];
+            const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+            const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+            const gx = e1y * e2z - e1z * e2y;
+            const gy = e1z * e2x - e1x * e2z;
+            const gz = e1x * e2y - e1y * e2x;
+            const nx = _dcNorms[o0], ny = _dcNorms[o0 + 1], nz = _dcNorms[o0 + 2];
+            if (iCount + 3 > _dcIndices.length) {
+                const ni = new Uint32Array(_dcIndices.length * 2);
+                ni.set(_dcIndices);
+                _dcIndices = ni;
+            }
+            _dcIndices[iCount] = i0;
+            if (gx * nx + gy * ny + gz * nz >= 0.0) {
+                _dcIndices[iCount + 1] = i1;
+                _dcIndices[iCount + 2] = i2;
+            } else {
+                _dcIndices[iCount + 1] = i2;
+                _dcIndices[iCount + 2] = i1;
+            }
+            return iCount + 3;
+        }
+
+        function nodeIntersectsSphere(node, cx, cy, cz, r) {
+            const halo = 2.0 * node.cellSize;
+            const minX = node.minX - halo;
+            const maxX = node.maxX + halo;
+            const minY = node.minY - halo;
+            const maxY = node.maxY + halo;
+            const minZ = node.minZ - halo;
+            const maxZ = node.maxZ + halo;
+            const dx = cx < minX ? minX - cx : (cx > maxX ? cx - maxX : 0);
+            const dy = cy < minY ? minY - cy : (cy > maxY ? cy - maxY : 0);
+            const dz = cz < minZ ? minZ - cz : (cz > maxZ ? cz - maxZ : 0);
+            return (dx * dx + dy * dy + dz * dz) <= r * r;
+        }
+
+        function nodeBoxIntersectsSphere(node, cx, cy, cz, r) {
+            const minX = node.minX;
+            const maxX = node.maxX;
+            const minY = node.minY;
+            const maxY = node.maxY;
+            const minZ = node.minZ;
+            const maxZ = node.maxZ;
+            const dx = cx < minX ? minX - cx : (cx > maxX ? cx - maxX : 0);
+            const dy = cy < minY ? minY - cy : (cy > maxY ? cy - maxY : 0);
+            const dz = cz < minZ ? minZ - cz : (cz > maxZ ? cz - maxZ : 0);
+            return (dx * dx + dy * dy + dz * dz) <= r * r;
+        }
+
+        function splitPad(node, opRadius) {
+            return opRadius + Math.max(20.0, Math.min(node.cellSize * 0.55, FINE_CELL_SIZE * 2.0));
+        }
+
+        function findCoveringNode(gx, gy, gz, level) {
+            const rx = gx >> level;
+            const ry = gy >> level;
+            const rz = gz >> level;
+            let node = svoLeafMap.get(`0:${rx},${ry},${rz}`);
+            if (!node) return null;
+            for (let l = 0; l < level; l++) {
+                if (!node.children) return node;
+                const shift = level - 1 - l;
+                const ox = (gx >> shift) & 1;
+                const oy = (gy >> shift) & 1;
+                const oz = (gz >> shift) & 1;
+                node = node.children[ox + oy * 2 + oz * 4];
+                if (!node) return null;
+            }
+            return node;
+        }
+
+        function computeDesiredExtendFlags(node) {
+            const nx = findCoveringNode(node.lx + 1, node.ly, node.lz, node.level);
+            const ny = findCoveringNode(node.lx, node.ly + 1, node.lz, node.level);
+            const nz = findCoveringNode(node.lx, node.ly, node.lz + 1, node.level);
+            return {
+                x: Boolean(nx && nx.children !== null),
+                y: Boolean(ny && ny.children !== null),
+                z: Boolean(nz && nz.children !== null)
+            };
+        }
 
         class SVOLeafNode {
-            constructor(lx, ly, lz) {
+            constructor(lx, ly, lz, level = 0, size = LEAF_SIZE, deferInit = false) {
                 this.lx = lx;
                 this.ly = ly;
                 this.lz = lz;
-                this.key = `${lx},${ly},${lz}`;
-                this.size = LEAF_SIZE;
-                this.cellSize = LEAF_SIZE / LEAF_RES;
-                this.minX = lx * LEAF_SIZE;
-                this.minY = ly * LEAF_SIZE;
-                this.minZ = lz * LEAF_SIZE;
+                this.level = level;
+                this.size = size;
+                this.res = LEAF_RES;
+                this.cellSize = size / this.res;
+                this.key = `${level}:${lx},${ly},${lz}`;
+                this.minX = lx * size;
+                this.minY = ly * size;
+                this.minZ = lz * size;
+                this.maxX = this.minX + size;
+                this.maxY = this.minY + size;
+                this.maxZ = this.minZ + size;
+                this.children = null;
+                this.state = 'uninit'; // 'surface' | 'solid' | 'void'
+                this.extendFlags = { x: false, y: false, z: false };
                 this.mesh = null;
 
-                // 2-voxel halo padding on both sides: (LEAF_RES + 5)^3 samples for [1..LEAF_RES+1] cells
-                const pRes = LEAF_RES + 5;
+                // 2-voxel halo padding on both sides: (LEAF_RES + 5)^3 samples for [1..LEAF_RES+2] cells
+                const pRes = this.res + 5;
                 this.pRes = pRes;
                 this.pRes2 = pRes * pRes;
-                const totalSamples = pRes * pRes * pRes;
-                this.density = new Float32Array(totalSamples);
-                this.material = new Uint8Array(totalSamples);
+                this.density = null;
+                this.material = null;
 
-                this.initField();
+                if (!deferInit) {
+                    this.initField();
+                }
+            }
+
+            isDefinitelyVoid() {
+                const pRes = this.pRes;
+                const halfSpan = (pRes - 1) * this.cellSize * 0.5;
+                const ccx = this.minX - 2.0 * this.cellSize + halfSpan;
+                const ccy = this.minY - 2.0 * this.cellSize + halfSpan;
+                const ccz = this.minZ - 2.0 * this.cellSize + halfSpan;
+                const cDist = Math.sqrt(ccx * ccx + ccy * ccy + ccz * ccz);
+                const halfDiag = halfSpan * 1.732051;
+                return (cDist - halfDiag > currentRadius * 1.16);
             }
 
             initField() {
                 const pRes = this.pRes;
+                const pRes2 = this.pRes2;
                 const minCrustR = currentRadius * 0.87;
                 const maxCrustR = currentRadius * 1.16;
                 const oreFreq = 0.007 * (2800.0 / currentRadius);
+
+                const halfSpan = (pRes - 1) * this.cellSize * 0.5;
+                const ccx = this.minX - 2.0 * this.cellSize + halfSpan;
+                const ccy = this.minY - 2.0 * this.cellSize + halfSpan;
+                const ccz = this.minZ - 2.0 * this.cellSize + halfSpan;
+                const cDist = Math.sqrt(ccx * ccx + ccy * ccy + ccz * ccz);
+                const halfDiag = halfSpan * 1.732051;
+
+                if (cDist - halfDiag > maxCrustR) {
+                    this.state = 'void';
+                    this.density = null;
+                    this.material = null;
+                    return;
+                }
+
+                const touchesCrust = (cDist + halfDiag >= minCrustR) && (cDist - halfDiag <= maxCrustR);
+
+                if (cDist + halfDiag < minCrustR) {
+                    let hasEdit = false;
+                    for (let i = 0; i < editHistory.length; i++) {
+                        const op = editHistory[i];
+                        if (nodeIntersectsSphere(this, op.x, op.y, op.z, op.radius + this.cellSize * 2.5)) {
+                            hasEdit = true;
+                            break;
+                        }
+                    }
+                    if (!hasEdit) {
+                        this.state = 'solid';
+                        this.density = null;
+                        this.material = null;
+                        return;
+                    }
+                }
+
+                const useCoarseNoise = (this.level >= 1) && touchesCrust;
+                const GRID = 5;
+                const GRIDM1 = 4;
+                const GRIDM2 = 3;
+                const GRID2 = 25;
+                const span = pRes - 1;
+                if (useCoarseNoise) {
+                    let gIdx = 0;
+                    let minOff = Infinity;
+                    let maxOff = -Infinity;
+                    const invGM1 = 0.25;
+                    for (let gz = 0; gz < GRID; gz++) {
+                        const wz = this.minZ + ((gz * invGM1) * span - 2) * this.cellSize;
+                        for (let gy = 0; gy < GRID; gy++) {
+                            const wy = this.minY + ((gy * invGM1) * span - 2) * this.cellSize;
+                            for (let gx = 0; gx < GRID; gx++) {
+                                const wx = this.minX + ((gx * invGM1) * span - 2) * this.cellSize;
+                                const nVal = evalNoiseOffsetPoC2(wx, wy, wz);
+                                _poc2CoarseGrid[gIdx++] = nVal;
+                                if (nVal < minOff) minOff = nVal;
+                                if (nVal > maxOff) maxOff = nVal;
+                            }
+                        }
+                    }
+                    const slack = this.level >= 2 ? 20.0 : 45.0;
+                    if (cDist - halfDiag > currentRadius + maxOff + slack) {
+                        this.state = 'void';
+                        this.density = null;
+                        this.material = null;
+                        return;
+                    }
+                    if (cDist + halfDiag < currentRadius + minOff - slack) {
+                        let hasEdit = false;
+                        for (let i = 0; i < editHistory.length; i++) {
+                            const op = editHistory[i];
+                            if (nodeIntersectsSphere(this, op.x, op.y, op.z, op.radius + this.cellSize * 2.5)) {
+                                hasEdit = true;
+                                break;
+                            }
+                        }
+                        if (!hasEdit) {
+                            this.state = 'solid';
+                            this.density = null;
+                            this.material = null;
+                            return;
+                        }
+                    }
+                }
+
+                const totalSamples = pRes * pRes * pRes;
+                this.density = new Float32Array(totalSamples);
+                this.material = new Uint8Array(totalSamples);
+                this.material.fill(1);
+
+                for (let px = 0; px < pRes; px++) {
+                    _poc2SinOreX[px] = Math.sin((this.minX + (px - 2) * this.cellSize) * oreFreq);
+                }
+
+                const invSpanG = GRIDM1 / span;
                 let idx = 0;
                 for (let pz = 0; pz < pRes; pz++) {
                     const wz = this.minZ + (pz - 2) * this.cellSize;
+                    const wz2 = wz * wz;
+                    let iz0 = 0, tz = 0.0;
+                    if (useCoarseNoise) {
+                        const fz = pz * invSpanG;
+                        iz0 = Math.min(GRIDM2, Math.floor(fz));
+                        tz = fz - iz0;
+                    }
                     for (let py = 0; py < pRes; py++) {
                         const wy = this.minY + (py - 2) * this.cellSize;
+                        const wyz2 = wz2 + wy * wy;
+                        const cosOreY = Math.cos(wy * oreFreq);
+                        const checkOreY = Math.abs(cosOreY) > 0.78;
+                        let iy0 = 0, ty = 0.0;
+                        if (useCoarseNoise) {
+                            const fy = py * invSpanG;
+                            iy0 = Math.min(GRIDM2, Math.floor(fy));
+                            ty = fy - iy0;
+                        }
                         for (let px = 0; px < pRes; px++) {
                             const wx = this.minX + (px - 2) * this.cellSize;
-                            const rDist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-                            const d = (rDist < minCrustR || rDist > maxCrustR) ? (rDist - currentRadius) : evalDensityPoC2(wx, wy, wz);
-                            this.density[idx] = d;
-
-                            if (d < -this.cellSize && Math.sin(wx * oreFreq) * Math.cos(wy * oreFreq) > 0.78) {
-                                this.material[idx] = 2; // Ore vein
+                            const rDist = Math.sqrt(wyz2 + wx * wx);
+                            let d;
+                            if (!touchesCrust || rDist < minCrustR || rDist > maxCrustR) {
+                                d = rDist - currentRadius;
+                            } else if (useCoarseNoise) {
+                                const fx = px * invSpanG;
+                                const ix0 = Math.min(GRIDM2, Math.floor(fx));
+                                const tx = fx - ix0;
+                                const base = ix0 + iy0 * GRID + iz0 * GRID2;
+                                const c000 = _poc2CoarseGrid[base];
+                                const c100 = _poc2CoarseGrid[base + 1];
+                                const c010 = _poc2CoarseGrid[base + GRID];
+                                const c110 = _poc2CoarseGrid[base + GRID + 1];
+                                const c001 = _poc2CoarseGrid[base + GRID2];
+                                const c101 = _poc2CoarseGrid[base + GRID2 + 1];
+                                const c011 = _poc2CoarseGrid[base + GRID2 + GRID];
+                                const c111 = _poc2CoarseGrid[base + GRID2 + GRID + 1];
+                                const x00 = c000 + (c100 - c000) * tx;
+                                const x10 = c010 + (c110 - c010) * tx;
+                                const x01 = c001 + (c101 - c001) * tx;
+                                const x11 = c011 + (c111 - c011) * tx;
+                                const y0 = x00 + (x10 - x00) * ty;
+                                const y1 = x01 + (x11 - x01) * ty;
+                                const nOff = y0 + (y1 - y0) * tz;
+                                d = rDist - (currentRadius + nOff);
                             } else {
-                                this.material[idx] = 1; // Rock
+                                d = evalDensityPoC2(wx, wy, wz);
+                            }
+                            this.density[idx] = d;
+                            if (checkOreY && d < -this.cellSize && _poc2SinOreX[px] * cosOreY > 0.78) {
+                                this.material[idx] = 2;
                             }
                             idx++;
                         }
                     }
+                }
+
+                // Replay intersecting editHistory ops chronologically within clamped leaf AABBs
+                const invCell = 1.0 / this.cellSize;
+                for (let eIdx = 0; eIdx < editHistory.length; eIdx++) {
+                    const op = editHistory[eIdx];
+                    if (op.type === 'carve') {
+                        const pad = op.radius + this.cellSize * 2.5;
+                        const padSq = pad * pad;
+                        const minPX = Math.max(0, Math.floor((op.x - pad - this.minX) * invCell + 2));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((op.x + pad - this.minX) * invCell + 2));
+                        const minPY = Math.max(0, Math.floor((op.y - pad - this.minY) * invCell + 2));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((op.y + pad - this.minY) * invCell + 2));
+                        const minPZ = Math.max(0, Math.floor((op.z - pad - this.minZ) * invCell + 2));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + pad - this.minZ) * invCell + 2));
+                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+                        for (let z = minPZ; z <= maxPZ; z++) {
+                            const dz = this.minZ + (z - 2) * this.cellSize - op.z;
+                            const zOff = z * pRes2;
+                            for (let y = minPY; y <= maxPY; y++) {
+                                const dy = this.minY + (y - 2) * this.cellSize - op.y;
+                                const yzOff = zOff + y * pRes;
+                                for (let x = minPX; x <= maxPX; x++) {
+                                    const dx = this.minX + (x - 2) * this.cellSize - op.x;
+                                    const dSq = dx * dx + dy * dy + dz * dz;
+                                    if (dSq <= padSq) {
+                                        const carveD = op.radius - Math.sqrt(dSq);
+                                        const dIdx = yzOff + x;
+                                        if (carveD > this.density[dIdx]) {
+                                            this.density[dIdx] = carveD;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if (op.type === 'reinforce') {
+                        const rSq = op.radius * op.radius;
+                        const minPX = Math.max(0, Math.floor((op.x - op.radius - this.minX) * invCell + 2));
+                        const maxPX = Math.min(pRes - 1, Math.ceil((op.x + op.radius - this.minX) * invCell + 2));
+                        const minPY = Math.max(0, Math.floor((op.y - op.radius - this.minY) * invCell + 2));
+                        const maxPY = Math.min(pRes - 1, Math.ceil((op.y + op.radius - this.minY) * invCell + 2));
+                        const minPZ = Math.max(0, Math.floor((op.z - op.radius - this.minZ) * invCell + 2));
+                        const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + op.radius - this.minZ) * invCell + 2));
+                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+                        for (let z = minPZ; z <= maxPZ; z++) {
+                            const dz = this.minZ + (z - 2) * this.cellSize - op.z;
+                            const zOff = z * pRes2;
+                            for (let y = minPY; y <= maxPY; y++) {
+                                const dy = this.minY + (y - 2) * this.cellSize - op.y;
+                                const yzOff = zOff + y * pRes;
+                                for (let x = minPX; x <= maxPX; x++) {
+                                    const dx = this.minX + (x - 2) * this.cellSize - op.x;
+                                    const dIdx = yzOff + x;
+                                    if (dx * dx + dy * dy + dz * dz <= rSq && this.density[dIdx] < 0.0) {
+                                        this.material[dIdx] = 3;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let hasNeg = false;
+                let hasPos = false;
+                for (let k = 0; k < totalSamples; k++) {
+                    if (this.density[k] < 0.0) hasNeg = true;
+                    else hasPos = true;
+                    if (hasNeg && hasPos) break;
+                }
+                if (hasNeg && hasPos) {
+                    this.state = 'surface';
+                } else {
+                    this.state = hasNeg ? 'solid' : 'void';
+                    this.density = null;
+                    this.material = null;
                 }
             }
 
@@ -134,64 +520,102 @@
                 return this.material[x + y * this.pRes + z * this.pRes2];
             }
 
-            // Adaptive QEF Dual Contouring extraction with 2-voxel halo overlap (zero leaf boundary seams)
+            // Adaptive QEF Dual Contouring extraction with 2-voxel halo overlap & LOD boundary sealing
             extractDualContour(scene) {
+                if (this.children !== null) return;
+                if (this.state !== 'surface' || !this.density) {
+                    if (this.mesh) {
+                        scene.remove(this.mesh);
+                        const idx = activeLeafMeshes.indexOf(this.mesh);
+                        if (idx !== -1) activeLeafMeshes.splice(idx, 1);
+                        this.mesh.geometry.dispose();
+                        this.mesh = null;
+                    }
+                    return;
+                }
+
                 const pRes = this.pRes;
-                const cellCount = LEAF_RES + 3;
+                const pRes2 = this.pRes2;
+                const density = this.density;
+                const material = this.material;
+                const res = this.res;
+                const endX = this.extendFlags.x ? res + 2 : res + 1;
+                const endY = this.extendFlags.y ? res + 2 : res + 1;
+                const endZ = this.extendFlags.z ? res + 2 : res + 1;
+                const cellCount = res + 4;
                 const cellCount2 = cellCount * cellCount;
-                const vertices = [];
-                const normals = [];
-                const colors = [];
-                const indices = [];
+                let vCount = 0;
+                let iCount = 0;
 
-                const cellVertMap = new Int32Array(cellCount * cellCount * cellCount).fill(-1);
-                const cellKey = (cx, cy, cz) => cx + cy * cellCount + cz * cellCount2;
+                const cellVertMap = _dcCellVertMap.subarray(0, cellCount * cellCount * cellCount);
+                cellVertMap.fill(-1);
 
-                const cVals = new Float32Array(8);
+                const cVals = _dcCVals;
+                const cornerIdx = _dcCornerIdx;
+                let minCX = endX, maxCX = 1;
+                let minCY = endY, maxCY = 1;
+                let minCZ = endZ, maxCZ = 1;
 
-                // Step 1: Solve regularized QEF for each dual cell [1 .. LEAF_RES + 1]
-                for (let cz = 1; cz <= LEAF_RES + 1; cz++) {
-                    for (let cy = 1; cy <= LEAF_RES + 1; cy++) {
-                        for (let cx = 1; cx <= LEAF_RES + 1; cx++) {
-                            let mask = 0;
+                // Step 1: Solve regularized QEF for each dual cell [1 .. end]
+                for (let cz = 1; cz <= endZ; cz++) {
+                    const zBase = cz * pRes2;
+                    for (let cy = 1; cy <= endY; cy++) {
+                        const yzBase = zBase + cy * pRes;
+                        for (let cx = 1; cx <= endX; cx++) {
+                            const i0 = yzBase + cx;
+                            const v0 = density[i0];
+                            const v1 = density[i0 + 1];
+                            const v2 = density[i0 + pRes];
+                            const v3 = density[i0 + pRes + 1];
+                            const i4 = i0 + pRes2;
+                            const v4 = density[i4];
+                            const v5 = density[i4 + 1];
+                            const v6 = density[i4 + pRes];
+                            const v7 = density[i4 + pRes + 1];
+
+                            const neg0 = v0 < 0, neg1 = v1 < 0, neg2 = v2 < 0, neg3 = v3 < 0;
+                            const neg4 = v4 < 0, neg5 = v5 < 0, neg6 = v6 < 0, neg7 = v7 < 0;
+                            if (
+                                neg0 === neg1 && neg0 === neg2 && neg0 === neg3 &&
+                                neg0 === neg4 && neg0 === neg5 && neg0 === neg6 && neg0 === neg7
+                            ) {
+                                continue;
+                            }
+
+                            cVals[0] = v0; cVals[1] = v1; cVals[2] = v2; cVals[3] = v3;
+                            cVals[4] = v4; cVals[5] = v5; cVals[6] = v6; cVals[7] = v7;
+                            cornerIdx[0] = i0; cornerIdx[1] = i0 + 1; cornerIdx[2] = i0 + pRes; cornerIdx[3] = i0 + pRes + 1;
+                            cornerIdx[4] = i4; cornerIdx[5] = i4 + 1; cornerIdx[6] = i4 + pRes; cornerIdx[7] = i4 + pRes + 1;
+
                             let rockCount = 0;
                             let oreCount = 0;
                             let armorCount = 0;
-
                             for (let c = 0; c < 8; c++) {
-                                const px = cx + corners[c][0];
-                                const py = cy + corners[c][1];
-                                const pz = cz + corners[c][2];
-                                const v = this.getD(px, py, pz);
-                                cVals[c] = v;
-                                if (v < 0) {
-                                    mask |= (1 << c);
-                                    const m = this.getMat(px, py, pz);
+                                if (cVals[c] < 0) {
+                                    const m = material[cornerIdx[c]];
                                     if (m === 3) armorCount++;
                                     else if (m === 2) oreCount++;
                                     else rockCount++;
                                 }
                             }
 
-                            if (mask === 0 || mask === 255) continue;
-
                             let edgeCount = 0;
                             let mx = 0, my = 0, mz = 0;
 
                             for (let e = 0; e < 12; e++) {
-                                const c1 = cellEdges[e][0];
-                                const c2 = cellEdges[e][1];
-                                const v1 = cVals[c1];
-                                const v2 = cVals[c2];
+                                const c1 = _dcEdgeC1[e];
+                                const c2 = _dcEdgeC2[e];
+                                const ev1 = cVals[c1];
+                                const ev2 = cVals[c2];
 
-                                if ((v1 < 0) !== (v2 < 0)) {
-                                    const denom = v1 - v2;
-                                    const t = Math.abs(denom) > 1e-6 ? v1 / denom : 0.5;
-                                    const p1 = corners[c1];
-                                    const p2 = corners[c2];
-                                    const ix = cx + p1[0] + t * (p2[0] - p1[0]);
-                                    const iy = cy + p1[1] + t * (p2[1] - p1[1]);
-                                    const iz = cz + p1[2] + t * (p2[2] - p1[2]);
+                                if ((ev1 < 0) !== (ev2 < 0)) {
+                                    const denom = ev1 - ev2;
+                                    const t = Math.abs(denom) > 1e-6 ? ev1 / denom : 0.5;
+                                    const p1x = _dcCornerX[c1], p1y = _dcCornerY[c1], p1z = _dcCornerZ[c1];
+                                    const p2x = _dcCornerX[c2], p2y = _dcCornerY[c2], p2z = _dcCornerZ[c2];
+                                    const ix = cx + p1x + t * (p2x - p1x);
+                                    const iy = cy + p1y + t * (p2y - p1y);
+                                    const iz = cz + p1z + t * (p2z - p1z);
 
                                     const px = this.minX + (ix - 2) * this.cellSize;
                                     const py = this.minY + (iy - 2) * this.cellSize;
@@ -202,12 +626,13 @@
                                     edgePts[off + 2] = pz;
                                     mx += px; my += py; mz += pz;
 
-                                    const gpx = Math.max(1, Math.min(pRes - 2, Math.round(ix)));
-                                    const gpy = Math.max(1, Math.min(pRes - 2, Math.round(iy)));
-                                    const gpz = Math.max(1, Math.min(pRes - 2, Math.round(iz)));
-                                    let nx = this.getD(gpx + 1, gpy, gpz) - this.getD(gpx - 1, gpy, gpz);
-                                    let ny = this.getD(gpx, gpy + 1, gpz) - this.getD(gpx, gpy - 1, gpz);
-                                    let nz = this.getD(gpx, gpy, gpz + 1) - this.getD(gpx, gpy, gpz - 1);
+                                    const gpx = cx + (p2x !== p1x ? (t >= 0.5 ? 1 : 0) : p1x);
+                                    const gpy = cy + (p2y !== p1y ? (t >= 0.5 ? 1 : 0) : p1y);
+                                    const gpz = cz + (p2z !== p1z ? (t >= 0.5 ? 1 : 0) : p1z);
+                                    const gIdx = gpx + gpy * pRes + gpz * pRes2;
+                                    let nx = density[gIdx + 1] - density[gIdx - 1];
+                                    let ny = density[gIdx + pRes] - density[gIdx - pRes];
+                                    let nz = density[gIdx + pRes2] - density[gIdx - pRes2];
                                     const nLenSq = nx * nx + ny * ny + nz * nz;
                                     if (nLenSq > 1e-10) {
                                         const invLen = 1.0 / Math.sqrt(nLenSq);
@@ -229,9 +654,9 @@
                             // Stable regularized QEF gradient descent (zero-allocation scalar math)
                             let qx = mx, qy = my, qz = mz;
                             const lambda = 0.12;
-                            const stepSize = 0.25;
+                            const stepSize = 0.35;
 
-                            for (let iter = 0; iter < 8; iter++) {
+                            for (let iter = 0; iter < 3; iter++) {
                                 let gx = 0, gy = 0, gz = 0;
                                 for (let p = 0; p < edgeCount; p++) {
                                     const off = p * 3;
@@ -294,83 +719,29 @@
                                 bCol = 0.50 + 0.10 * strata;
                             }
 
-                            const vIdx = vertices.length / 3;
-                            cellVertMap[cellKey(cx, cy, cz)] = vIdx;
-
-                            vertices.push(qx, qy, qz);
-                            normals.push(anx, any, anz);
-                            colors.push(rCol, gCol, bCol);
+                            const vIdx = vCount++;
+                            if (vCount * 3 > _dcVerts.length) {
+                                const nextCap = _dcVerts.length * 2;
+                                const nv = new Float32Array(nextCap); nv.set(_dcVerts); _dcVerts = nv;
+                                const nn = new Float32Array(nextCap); nn.set(_dcNorms); _dcNorms = nn;
+                                const nc = new Float32Array(nextCap); nc.set(_dcCols); _dcCols = nc;
+                            }
+                            cellVertMap[cx + cy * cellCount + cz * cellCount2] = vIdx;
+                            if (cx < minCX) minCX = cx;
+                            if (cx > maxCX) maxCX = cx;
+                            if (cy < minCY) minCY = cy;
+                            if (cy > maxCY) maxCY = cy;
+                            if (cz < minCZ) minCZ = cz;
+                            if (cz > maxCZ) maxCZ = cz;
+                            const vOff = vIdx * 3;
+                            _dcVerts[vOff] = qx; _dcVerts[vOff + 1] = qy; _dcVerts[vOff + 2] = qz;
+                            _dcNorms[vOff] = anx; _dcNorms[vOff + 1] = any; _dcNorms[vOff + 2] = anz;
+                            _dcCols[vOff] = rCol; _dcCols[vOff + 1] = gCol; _dcCols[vOff + 2] = bCol;
                         }
                     }
                 }
 
-                // Orient every triangle along SDF gradient normal to prevent back-face culling
-                const pushTriAligned = (i0, i1, i2) => {
-                    const ax = vertices[i0 * 3], ay = vertices[i0 * 3 + 1], az = vertices[i0 * 3 + 2];
-                    const bx = vertices[i1 * 3], by = vertices[i1 * 3 + 1], bz = vertices[i1 * 3 + 2];
-                    const cx = vertices[i2 * 3], cy = vertices[i2 * 3 + 1], cz = vertices[i2 * 3 + 2];
-                    const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
-                    const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
-                    const gx = e1y * e2z - e1z * e2y;
-                    const gy = e1z * e2x - e1x * e2z;
-                    const gz = e1x * e2y - e1y * e2x;
-                    const nx = normals[i0 * 3], ny = normals[i0 * 3 + 1], nz = normals[i0 * 3 + 2];
-                    if (gx * nx + gy * ny + gz * nz >= 0.0) {
-                        indices.push(i0, i1, i2);
-                    } else {
-                        indices.push(i0, i2, i1);
-                    }
-                };
-
-                // Step 2: Emit quads across [2 .. LEAF_RES + 1] interior & shared boundary edges
-                for (let pz = 2; pz <= LEAF_RES + 1; pz++) {
-                    for (let py = 2; py <= LEAF_RES + 1; py++) {
-                        for (let px = 2; px <= LEAF_RES + 1; px++) {
-                            const d0 = this.getD(px, py, pz);
-
-                            // X-axis edge
-                            const dX = this.getD(px + 1, py, pz);
-                            if ((d0 < 0) !== (dX < 0)) {
-                                const v0 = cellVertMap[cellKey(px, py - 1, pz - 1)];
-                                const v1 = cellVertMap[cellKey(px, py, pz - 1)];
-                                const v2 = cellVertMap[cellKey(px, py, pz)];
-                                const v3 = cellVertMap[cellKey(px, py - 1, pz)];
-                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    pushTriAligned(v0, v1, v2);
-                                    pushTriAligned(v0, v2, v3);
-                                }
-                            }
-
-                            // Y-axis edge
-                            const dY = this.getD(px, py + 1, pz);
-                            if ((d0 < 0) !== (dY < 0)) {
-                                const v0 = cellVertMap[cellKey(px - 1, py, pz - 1)];
-                                const v1 = cellVertMap[cellKey(px, py, pz - 1)];
-                                const v2 = cellVertMap[cellKey(px, py, pz)];
-                                const v3 = cellVertMap[cellKey(px - 1, py, pz)];
-                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    pushTriAligned(v0, v2, v1);
-                                    pushTriAligned(v0, v3, v2);
-                                }
-                            }
-
-                            // Z-axis edge
-                            const dZ = this.getD(px, py, pz + 1);
-                            if ((d0 < 0) !== (dZ < 0)) {
-                                const v0 = cellVertMap[cellKey(px - 1, py - 1, pz)];
-                                const v1 = cellVertMap[cellKey(px, py - 1, pz)];
-                                const v2 = cellVertMap[cellKey(px, py, pz)];
-                                const v3 = cellVertMap[cellKey(px - 1, py, pz)];
-                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
-                                    pushTriAligned(v0, v1, v2);
-                                    pushTriAligned(v0, v2, v3);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (indices.length === 0 || vertices.length === 0) {
+                if (vCount === 0) {
                     if (this.mesh) {
                         scene.remove(this.mesh);
                         const idx = activeLeafMeshes.indexOf(this.mesh);
@@ -381,12 +752,89 @@
                     return;
                 }
 
+                const sMinX = minCX > 2 ? minCX : 2;
+                const sMaxX = maxCX + 1 < endX ? maxCX + 1 : endX;
+                const sMinY = minCY > 2 ? minCY : 2;
+                const sMaxY = maxCY + 1 < endY ? maxCY + 1 : endY;
+                const sMinZ = minCZ > 2 ? minCZ : 2;
+                const sMaxZ = maxCZ + 1 < endZ ? maxCZ + 1 : endZ;
+
+                // Step 2: Emit quads across [sMin .. sMax] interior & boundary-sealing edges
+                for (let pz = sMinZ; pz <= sMaxZ; pz++) {
+                    const zBase = pz * pRes2;
+                    const cZBase = pz * cellCount2;
+                    const cZPrev = cZBase - cellCount2;
+                    for (let py = sMinY; py <= sMaxY; py++) {
+                        const yzBase = zBase + py * pRes;
+                        const cYZBase = cZBase + py * cellCount;
+                        const cYPrevZ = cYZBase - cellCount;
+                        const cYZPrev = cZPrev + py * cellCount;
+                        const cYPrevZPrev = cYZPrev - cellCount;
+                        for (let px = sMinX; px <= sMaxX; px++) {
+                            const dIdx = yzBase + px;
+                            const d0Neg = density[dIdx] < 0;
+
+                            // X-axis edge
+                            if (d0Neg !== (density[dIdx + 1] < 0)) {
+                                const v0 = cellVertMap[px + cYPrevZPrev];
+                                const v1 = cellVertMap[px + cYZPrev];
+                                const v2 = cellVertMap[px + cYZBase];
+                                const v3 = cellVertMap[px + cYPrevZ];
+                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
+                                    iCount = pushDcTriAligned(v0, v1, v2, iCount);
+                                    iCount = pushDcTriAligned(v0, v2, v3, iCount);
+                                }
+                            }
+
+                            // Y-axis edge
+                            if (d0Neg !== (density[dIdx + pRes] < 0)) {
+                                const v0 = cellVertMap[(px - 1) + cYZPrev];
+                                const v1 = cellVertMap[px + cYZPrev];
+                                const v2 = cellVertMap[px + cYZBase];
+                                const v3 = cellVertMap[(px - 1) + cYZBase];
+                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
+                                    iCount = pushDcTriAligned(v0, v2, v1, iCount);
+                                    iCount = pushDcTriAligned(v0, v3, v2, iCount);
+                                }
+                            }
+
+                            // Z-axis edge
+                            if (d0Neg !== (density[dIdx + pRes2] < 0)) {
+                                const v0 = cellVertMap[(px - 1) + cYPrevZ];
+                                const v1 = cellVertMap[px + cYPrevZ];
+                                const v2 = cellVertMap[px + cYZBase];
+                                const v3 = cellVertMap[(px - 1) + cYZBase];
+                                if (v0 !== -1 && v1 !== -1 && v2 !== -1 && v3 !== -1) {
+                                    iCount = pushDcTriAligned(v0, v1, v2, iCount);
+                                    iCount = pushDcTriAligned(v0, v2, v3, iCount);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (iCount === 0 || vCount === 0) {
+                    if (this.mesh) {
+                        scene.remove(this.mesh);
+                        const idx = activeLeafMeshes.indexOf(this.mesh);
+                        if (idx !== -1) activeLeafMeshes.splice(idx, 1);
+                        this.mesh.geometry.dispose();
+                        this.mesh = null;
+                    }
+                    return;
+                }
+
+                const posArr = _dcVerts.slice(0, vCount * 3);
+                const normArr = _dcNorms.slice(0, vCount * 3);
+                const colArr = _dcCols.slice(0, vCount * 3);
+                const idxArr = _dcIndices.slice(0, iCount);
+
                 if (!this.mesh) {
                     const geo = new THREE.BufferGeometry();
-                    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertices), 3));
-                    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normals), 3));
-                    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
-                    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+                    geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+                    geo.setAttribute('normal', new THREE.BufferAttribute(normArr, 3));
+                    geo.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
+                    geo.setIndex(new THREE.BufferAttribute(idxArr, 1));
                     geo.computeBoundingSphere();
                     geo.computeBoundingBox();
 
@@ -396,10 +844,10 @@
                     activeLeafMeshes.push(this.mesh);
                 } else {
                     const geo = this.mesh.geometry;
-                    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertices), 3));
-                    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normals), 3));
-                    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
-                    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+                    geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+                    geo.setAttribute('normal', new THREE.BufferAttribute(normArr, 3));
+                    geo.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
+                    geo.setIndex(new THREE.BufferAttribute(idxArr, 1));
                     geo.attributes.position.needsUpdate = true;
                     geo.attributes.normal.needsUpdate = true;
                     geo.attributes.color.needsUpdate = true;
@@ -409,24 +857,18 @@
             }
         }
 
-        function getOrCreateLeaf(lx, ly, lz) {
-            const key = `${lx},${ly},${lz}`;
-            let leaf = svoLeafMap.get(key);
-            if (!leaf) {
-                leaf = new SVOLeafNode(lx, ly, lz);
-                svoLeafMap.set(key, leaf);
-            }
-            return leaf;
+        function evalNoiseOffsetPoC2(wx, wy, wz) {
+            const freq = 0.0015 * (2800.0 / currentRadius);
+            return (noise.fbm(wx * freq, wy * freq, wz * freq, 3) - 0.35) * (currentRadius * 0.22);
         }
 
         function evalDensityPoC2(wx, wy, wz) {
             const dist = Math.sqrt(wx * wx + wy * wy + wz * wz);
-            const freq = 0.0015 * (2800.0 / currentRadius);
-            const n = (noise.fbm(wx * freq, wy * freq, wz * freq, 3) - 0.35) * (currentRadius * 0.22);
-            return dist - (currentRadius + n);
+            return dist - (currentRadius + evalNoiseOffsetPoC2(wx, wy, wz));
         }
 
         function initSVO(scene) {
+            editHistory.length = 0;
             activeLeafMeshes.forEach(m => {
                 scene.remove(m);
                 m.geometry.dispose();
@@ -436,6 +878,7 @@
 
             LEAF_SIZE = currentRadius * 0.48;
             CELL_SIZE = LEAF_SIZE / LEAF_RES;
+            FINE_CELL_SIZE = computeFineCellSize(CELL_SIZE);
             leafMaterial.userData.shaderUniforms.uAsteroidRadius.value = currentRadius;
 
             const bound = Math.ceil((currentRadius * 1.25) / LEAF_SIZE);
@@ -446,137 +889,343 @@
             for (let lz = -bound; lz <= bound; lz++) {
                 for (let ly = -bound; ly <= bound; ly++) {
                     for (let lx = -bound; lx <= bound; lx++) {
-                        const center = new THREE.Vector3((lx + 0.5) * LEAF_SIZE, (ly + 0.5) * LEAF_SIZE, (lz + 0.5) * LEAF_SIZE);
-                        const dist = center.length();
+                        const centerX = (lx + 0.5) * LEAF_SIZE;
+                        const centerY = (ly + 0.5) * LEAF_SIZE;
+                        const centerZ = (lz + 0.5) * LEAF_SIZE;
+                        const dist = Math.sqrt(centerX * centerX + centerY * centerY + centerZ * centerZ);
                         if (dist < maxShellR + halfDiag && dist > minShellR - halfDiag) {
-                            const leaf = new SVOLeafNode(lx, ly, lz);
-                            svoLeafMap.set(leaf.key, leaf);
-                            leaf.extractDualContour(scene);
+                            const leaf = new SVOLeafNode(lx, ly, lz, 0, LEAF_SIZE);
+                            if (leaf.state !== 'void') {
+                                svoLeafMap.set(leaf.key, leaf);
+                                if (leaf.state === 'surface') {
+                                    leaf.extractDualContour(scene);
+                                }
+                            }
                         }
+                    }
+                }
+            }
+        }
+
+        function splitLeafNode(node, op, splitNodes, newLeaves) {
+            // Synchronously remove and dispose parent mesh so activeLeafMeshes contains active leaves only
+            if (node.mesh) {
+                sandbox.scene.remove(node.mesh);
+                const mIdx = activeLeafMeshes.indexOf(node.mesh);
+                if (mIdx !== -1) activeLeafMeshes.splice(mIdx, 1);
+                node.mesh.geometry.dispose();
+                node.mesh = null;
+            }
+            node.density = null;
+            node.material = null;
+            node.children = new Array(8);
+            splitNodes.push(node);
+
+            const halfSize = node.size * 0.5;
+            const childLevel = node.level + 1;
+            let cIdx = 0;
+            for (let oz = 0; oz < 2; oz++) {
+                for (let oy = 0; oy < 2; oy++) {
+                    for (let ox = 0; ox < 2; ox++) {
+                        const child = new SVOLeafNode(
+                            node.lx * 2 + ox,
+                            node.ly * 2 + oy,
+                            node.lz * 2 + oz,
+                            childLevel,
+                            halfSize,
+                            true
+                        );
+                        node.children[cIdx++] = child;
+                        if (child.isDefinitelyVoid()) {
+                            child.state = 'void';
+                            newLeaves.push(child);
+                        } else if (
+                            child.cellSize > FINE_CELL_LIMIT &&
+                            child.level < MAX_SUBDIV_LEVEL &&
+                            nodeBoxIntersectsSphere(child, op.x, op.y, op.z, splitPad(child, op.radius))
+                        ) {
+                            splitLeafNode(child, op, splitNodes, newLeaves);
+                        } else {
+                            child.initField();
+                            newLeaves.push(child);
+                        }
+                    }
+                }
+            }
+        }
+
+        function updateNeighborExtendFlags(splitNodes, newLeafSet, recontourLeaves) {
+            const checkedNeighbors = new Set();
+            for (let i = 0; i < splitNodes.length; i++) {
+                const p = splitNodes[i];
+                const dirs = [
+                    [p.lx - 1, p.ly, p.lz],
+                    [p.lx, p.ly - 1, p.lz],
+                    [p.lx, p.ly, p.lz - 1]
+                ];
+                for (let d = 0; d < 3; d++) {
+                    const nb = findCoveringNode(dirs[d][0], dirs[d][1], dirs[d][2], p.level);
+                    if (!nb || nb.children !== null || nb.state !== 'surface' || newLeafSet.has(nb) || checkedNeighbors.has(nb)) {
+                        continue;
+                    }
+                    checkedNeighbors.add(nb);
+                    const desired = computeDesiredExtendFlags(nb);
+                    if (
+                        desired.x !== nb.extendFlags.x ||
+                        desired.y !== nb.extendFlags.y ||
+                        desired.z !== nb.extendFlags.z
+                    ) {
+                        nb.extendFlags = desired;
+                        recontourLeaves.add(nb);
                     }
                 }
             }
         }
 
         function carveSpherePoC2(hitPoint, brushRadius) {
-            const effPad = brushRadius + CELL_SIZE * 3.5;
-            const pad = brushRadius + CELL_SIZE * 2.5;
-            const padSq = pad * pad;
-            const minLX = Math.floor((hitPoint.x - effPad) / LEAF_SIZE);
-            const maxLX = Math.floor((hitPoint.x + effPad) / LEAF_SIZE);
-            const minLY = Math.floor((hitPoint.y - effPad) / LEAF_SIZE);
-            const maxLY = Math.floor((hitPoint.y + effPad) / LEAF_SIZE);
-            const minLZ = Math.floor((hitPoint.z - effPad) / LEAF_SIZE);
-            const maxLZ = Math.floor((hitPoint.z + effPad) / LEAF_SIZE);
+            const op = { type: 'carve', x: hitPoint.x, y: hitPoint.y, z: hitPoint.z, radius: brushRadius };
+            editHistory.push(op);
 
-            for (let lz = minLZ; lz <= maxLZ; lz++) {
-                const lMinZ = lz * LEAF_SIZE - 2 * CELL_SIZE;
-                const lMaxZ = lz * LEAF_SIZE + (LEAF_RES + 2) * CELL_SIZE;
-                const dz = hitPoint.z < lMinZ ? lMinZ - hitPoint.z : (hitPoint.z > lMaxZ ? hitPoint.z - lMaxZ : 0);
-                const dz2 = dz * dz;
-                if (dz2 > padSq) continue;
-                for (let ly = minLY; ly <= maxLY; ly++) {
-                    const lMinY = ly * LEAF_SIZE - 2 * CELL_SIZE;
-                    const lMaxY = ly * LEAF_SIZE + (LEAF_RES + 2) * CELL_SIZE;
-                    const dy = hitPoint.y < lMinY ? lMinY - hitPoint.y : (hitPoint.y > lMaxY ? hitPoint.y - lMaxY : 0);
-                    const dyz2 = dz2 + dy * dy;
-                    if (dyz2 > padSq) continue;
-                    for (let lx = minLX; lx <= maxLX; lx++) {
-                        const lMinX = lx * LEAF_SIZE - 2 * CELL_SIZE;
-                        const lMaxX = lx * LEAF_SIZE + (LEAF_RES + 2) * CELL_SIZE;
-                        const dx = hitPoint.x < lMinX ? lMinX - hitPoint.x : (hitPoint.x > lMaxX ? hitPoint.x - lMaxX : 0);
-                        if (dx * dx + dyz2 > padSq) continue;
+            const effPad = brushRadius + Math.max(45.0, CELL_SIZE * 3.5);
+            const minLX = Math.floor((op.x - effPad) / LEAF_SIZE);
+            const maxLX = Math.floor((op.x + effPad) / LEAF_SIZE);
+            const minLY = Math.floor((op.y - effPad) / LEAF_SIZE);
+            const maxLY = Math.floor((op.y + effPad) / LEAF_SIZE);
+            const minLZ = Math.floor((op.z - effPad) / LEAF_SIZE);
+            const maxLZ = Math.floor((op.z + effPad) / LEAF_SIZE);
 
-                        const leaf = getOrCreateLeaf(lx, ly, lz);
-                        const pRes = leaf.pRes;
-                        const pRes2 = leaf.pRes2;
-                        const leafPad = brushRadius + leaf.cellSize * 2.5;
-                        const invCell = 1.0 / leaf.cellSize;
-                        const minPX = Math.max(0, Math.floor((hitPoint.x - leafPad - leaf.minX) * invCell + 2));
-                        const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + leafPad - leaf.minX) * invCell + 2));
-                        const minPY = Math.max(0, Math.floor((hitPoint.y - leafPad - leaf.minY) * invCell + 2));
-                        const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + leafPad - leaf.minY) * invCell + 2));
-                        const minPZ = Math.max(0, Math.floor((hitPoint.z - leafPad - leaf.minZ) * invCell + 2));
-                        const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + leafPad - leaf.minZ) * invCell + 2));
-                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
+            const splitNodes = [];
+            const newLeaves = [];
+            const recontourLeaves = new Set();
 
-                        let modified = false;
-                        for (let z = minPZ; z <= maxPZ; z++) {
-                            const wz = leaf.minZ + (z - 2) * leaf.cellSize;
-                            const zOff = z * pRes2;
-                            for (let y = minPY; y <= maxPY; y++) {
-                                const wy = leaf.minY + (y - 2) * leaf.cellSize;
-                                const yzOff = zOff + y * pRes;
-                                for (let x = minPX; x <= maxPX; x++) {
-                                    const wx = leaf.minX + (x - 2) * leaf.cellSize;
-                                    const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
-                                    if (dist <= leafPad) {
-                                        const carveD = brushRadius - dist;
-                                        const idx = yzOff + x;
-                                        if (carveD > leaf.density[idx]) {
-                                            leaf.density[idx] = carveD;
-                                            modified = true;
-                                        }
-                                    }
+            function visitForCarve(node, isNewlyCreatedRoot) {
+                const reachPad = Math.max(op.radius + node.cellSize * 2.5, splitPad(node, op.radius));
+                if (!nodeIntersectsSphere(node, op.x, op.y, op.z, reachPad)) return;
+
+                if (node.children !== null) {
+                    for (let i = 0; i < 8; i++) {
+                        visitForCarve(node.children[i], false);
+                    }
+                    return;
+                }
+
+                if (node.state === 'void') return;
+
+                if (
+                    node.cellSize > FINE_CELL_LIMIT &&
+                    node.level < MAX_SUBDIV_LEVEL &&
+                    nodeBoxIntersectsSphere(node, op.x, op.y, op.z, splitPad(node, op.radius))
+                ) {
+                    splitLeafNode(node, op, splitNodes, newLeaves);
+                    return;
+                }
+
+                if (!nodeIntersectsSphere(node, op.x, op.y, op.z, op.radius + node.cellSize * 2.5)) {
+                    if (isNewlyCreatedRoot && node.state === 'surface') {
+                        recontourLeaves.add(node);
+                    }
+                    return;
+                }
+
+                if (isNewlyCreatedRoot) {
+                    if (node.state === 'surface') {
+                        recontourLeaves.add(node);
+                    }
+                    return;
+                }
+
+                if (node.state === 'solid') {
+                    node.initField();
+                    if (node.state === 'surface') {
+                        recontourLeaves.add(node);
+                    }
+                    return;
+                }
+
+                // Incremental clamped-AABB carve on existing fine 'surface' leaf
+                const pRes = node.pRes;
+                const pRes2 = node.pRes2;
+                const leafPad = op.radius + node.cellSize * 2.5;
+                const leafPadSq = leafPad * leafPad;
+                const invCell = 1.0 / node.cellSize;
+                const minPX = Math.max(0, Math.floor((op.x - leafPad - node.minX) * invCell + 2));
+                const maxPX = Math.min(pRes - 1, Math.ceil((op.x + leafPad - node.minX) * invCell + 2));
+                const minPY = Math.max(0, Math.floor((op.y - leafPad - node.minY) * invCell + 2));
+                const maxPY = Math.min(pRes - 1, Math.ceil((op.y + leafPad - node.minY) * invCell + 2));
+                const minPZ = Math.max(0, Math.floor((op.z - leafPad - node.minZ) * invCell + 2));
+                const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + leafPad - node.minZ) * invCell + 2));
+                if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) return;
+
+                let modified = false;
+                for (let z = minPZ; z <= maxPZ; z++) {
+                    const dz = node.minZ + (z - 2) * node.cellSize - op.z;
+                    const zOff = z * pRes2;
+                    for (let y = minPY; y <= maxPY; y++) {
+                        const dy = node.minY + (y - 2) * node.cellSize - op.y;
+                        const yzOff = zOff + y * pRes;
+                        for (let x = minPX; x <= maxPX; x++) {
+                            const dx = node.minX + (x - 2) * node.cellSize - op.x;
+                            const dSq = dx * dx + dy * dy + dz * dz;
+                            if (dSq <= leafPadSq) {
+                                const carveD = op.radius - Math.sqrt(dSq);
+                                const idx = yzOff + x;
+                                if (carveD > node.density[idx]) {
+                                    node.density[idx] = carveD;
+                                    modified = true;
                                 }
                             }
                         }
-                        if (modified) {
-                            leaf.extractDualContour(sandbox.scene);
-                        }
                     }
+                }
+                if (modified) {
+                    recontourLeaves.add(node);
+                }
+            }
+
+            for (let lz = minLZ; lz <= maxLZ; lz++) {
+                for (let ly = minLY; ly <= maxLY; ly++) {
+                    for (let lx = minLX; lx <= maxLX; lx++) {
+                        const key = `0:${lx},${ly},${lz}`;
+                        let root = svoLeafMap.get(key);
+                        let isNewRoot = false;
+                        if (!root) {
+                            root = new SVOLeafNode(lx, ly, lz, 0, LEAF_SIZE, true);
+                            if (root.isDefinitelyVoid()) continue;
+                            if (
+                                root.cellSize > FINE_CELL_LIMIT &&
+                                root.level < MAX_SUBDIV_LEVEL &&
+                                nodeBoxIntersectsSphere(root, op.x, op.y, op.z, splitPad(root, op.radius))
+                            ) {
+                                svoLeafMap.set(key, root);
+                                splitLeafNode(root, op, splitNodes, newLeaves);
+                                continue;
+                            }
+                            root.initField();
+                            if (root.state === 'void') continue;
+                            svoLeafMap.set(key, root);
+                            isNewRoot = true;
+                        }
+                        visitForCarve(root, isNewRoot);
+                    }
+                }
+            }
+
+            const newLeafSet = new Set(newLeaves);
+            for (let i = 0; i < newLeaves.length; i++) {
+                const nl = newLeaves[i];
+                if (nl.state === 'surface') {
+                    nl.extendFlags = computeDesiredExtendFlags(nl);
+                    recontourLeaves.add(nl);
+                }
+            }
+            if (splitNodes.length > 0) {
+                updateNeighborExtendFlags(splitNodes, newLeafSet, recontourLeaves);
+            }
+
+            for (const leaf of recontourLeaves) {
+                if (leaf.children === null && leaf.state === 'surface') {
+                    leaf.extractDualContour(sandbox.scene);
                 }
             }
         }
 
         function reinforceSpherePoC2(hitPoint, brushRadius) {
-            const effPad = brushRadius + CELL_SIZE * 3.5;
-            const minLX = Math.floor((hitPoint.x - effPad) / LEAF_SIZE);
-            const maxLX = Math.floor((hitPoint.x + effPad) / LEAF_SIZE);
-            const minLY = Math.floor((hitPoint.y - effPad) / LEAF_SIZE);
-            const maxLY = Math.floor((hitPoint.y + effPad) / LEAF_SIZE);
-            const minLZ = Math.floor((hitPoint.z - effPad) / LEAF_SIZE);
-            const maxLZ = Math.floor((hitPoint.z + effPad) / LEAF_SIZE);
+            const op = { type: 'reinforce', x: hitPoint.x, y: hitPoint.y, z: hitPoint.z, radius: brushRadius };
+            editHistory.push(op);
+
+            const effPad = brushRadius + Math.max(45.0, CELL_SIZE * 3.5);
+            const minLX = Math.floor((op.x - effPad) / LEAF_SIZE);
+            const maxLX = Math.floor((op.x + effPad) / LEAF_SIZE);
+            const minLY = Math.floor((op.y - effPad) / LEAF_SIZE);
+            const maxLY = Math.floor((op.y + effPad) / LEAF_SIZE);
+            const minLZ = Math.floor((op.z - effPad) / LEAF_SIZE);
+            const maxLZ = Math.floor((op.z + effPad) / LEAF_SIZE);
+
+            const splitNodes = [];
+            const newLeaves = [];
+            const recontourLeaves = new Set();
+
+            function visitForReinforce(node) {
+                const reachPad = Math.max(op.radius + node.cellSize * 2.0, splitPad(node, op.radius));
+                if (!nodeIntersectsSphere(node, op.x, op.y, op.z, reachPad)) return;
+
+                if (node.children !== null) {
+                    for (let i = 0; i < 8; i++) {
+                        visitForReinforce(node.children[i]);
+                    }
+                    return;
+                }
+
+                if (node.state !== 'surface' || !node.density) return;
+
+                if (
+                    node.cellSize > FINE_CELL_LIMIT &&
+                    node.level < MAX_SUBDIV_LEVEL &&
+                    node.mesh !== null &&
+                    nodeBoxIntersectsSphere(node, op.x, op.y, op.z, splitPad(node, op.radius))
+                ) {
+                    splitLeafNode(node, op, splitNodes, newLeaves);
+                    return;
+                }
+
+                const pRes = node.pRes;
+                const pRes2 = node.pRes2;
+                const invCell = 1.0 / node.cellSize;
+                const rSq = op.radius * op.radius;
+                const minPX = Math.max(0, Math.floor((op.x - op.radius - node.minX) * invCell + 2));
+                const maxPX = Math.min(pRes - 1, Math.ceil((op.x + op.radius - node.minX) * invCell + 2));
+                const minPY = Math.max(0, Math.floor((op.y - op.radius - node.minY) * invCell + 2));
+                const maxPY = Math.min(pRes - 1, Math.ceil((op.y + op.radius - node.minY) * invCell + 2));
+                const minPZ = Math.max(0, Math.floor((op.z - op.radius - node.minZ) * invCell + 2));
+                const maxPZ = Math.min(pRes - 1, Math.ceil((op.z + op.radius - node.minZ) * invCell + 2));
+                if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) return;
+
+                let modified = false;
+                for (let z = minPZ; z <= maxPZ; z++) {
+                    const dz = node.minZ + (z - 2) * node.cellSize - op.z;
+                    const zOff = z * pRes2;
+                    for (let y = minPY; y <= maxPY; y++) {
+                        const dy = node.minY + (y - 2) * node.cellSize - op.y;
+                        const yzOff = zOff + y * pRes;
+                        for (let x = minPX; x <= maxPX; x++) {
+                            const dx = node.minX + (x - 2) * node.cellSize - op.x;
+                            const idx = yzOff + x;
+                            if (dx * dx + dy * dy + dz * dz <= rSq && node.density[idx] < 0.0) {
+                                node.material[idx] = 3; // Reinforced Titanium Bulkhead
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+                if (modified) {
+                    recontourLeaves.add(node);
+                }
+            }
 
             for (let lz = minLZ; lz <= maxLZ; lz++) {
                 for (let ly = minLY; ly <= maxLY; ly++) {
                     for (let lx = minLX; lx <= maxLX; lx++) {
-                        const leaf = svoLeafMap.get(`${lx},${ly},${lz}`);
-                        if (!leaf) continue;
-
-                        const pRes = leaf.pRes;
-                        const pRes2 = leaf.pRes2;
-                        const invCell = 1.0 / leaf.cellSize;
-                        const minPX = Math.max(0, Math.floor((hitPoint.x - brushRadius - leaf.minX) * invCell + 2));
-                        const maxPX = Math.min(pRes - 1, Math.ceil((hitPoint.x + brushRadius - leaf.minX) * invCell + 2));
-                        const minPY = Math.max(0, Math.floor((hitPoint.y - brushRadius - leaf.minY) * invCell + 2));
-                        const maxPY = Math.min(pRes - 1, Math.ceil((hitPoint.y + brushRadius - leaf.minY) * invCell + 2));
-                        const minPZ = Math.max(0, Math.floor((hitPoint.z - brushRadius - leaf.minZ) * invCell + 2));
-                        const maxPZ = Math.min(pRes - 1, Math.ceil((hitPoint.z + brushRadius - leaf.minZ) * invCell + 2));
-                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
-
-                        let modified = false;
-                        for (let z = minPZ; z <= maxPZ; z++) {
-                            const wz = leaf.minZ + (z - 2) * leaf.cellSize;
-                            const zOff = z * pRes2;
-                            for (let y = minPY; y <= maxPY; y++) {
-                                const wy = leaf.minY + (y - 2) * leaf.cellSize;
-                                const yzOff = zOff + y * pRes;
-                                for (let x = minPX; x <= maxPX; x++) {
-                                    const wx = leaf.minX + (x - 2) * leaf.cellSize;
-                                    const dist = Math.hypot(wx - hitPoint.x, wy - hitPoint.y, wz - hitPoint.z);
-                                    const idx = yzOff + x;
-                                    if (dist <= brushRadius && leaf.density[idx] < 0) {
-                                        leaf.material[idx] = 3; // Reinforced Titanium Bulkhead
-                                        modified = true;
-                                    }
-                                }
-                            }
-                        }
-                        if (modified) {
-                            leaf.extractDualContour(sandbox.scene);
-                        }
+                        const root = svoLeafMap.get(`0:${lx},${ly},${lz}`);
+                        if (root) visitForReinforce(root);
                     }
+                }
+            }
+
+            const newLeafSet = new Set(newLeaves);
+            for (let i = 0; i < newLeaves.length; i++) {
+                const nl = newLeaves[i];
+                if (nl.state === 'surface') {
+                    nl.extendFlags = computeDesiredExtendFlags(nl);
+                    recontourLeaves.add(nl);
+                }
+            }
+            if (splitNodes.length > 0) {
+                updateNeighborExtendFlags(splitNodes, newLeafSet, recontourLeaves);
+            }
+
+            for (const leaf of recontourLeaves) {
+                if (leaf.children === null && leaf.state === 'surface') {
+                    leaf.extractDualContour(sandbox.scene);
                 }
             }
         }
@@ -585,16 +1234,19 @@
             LEAF_RES = QUALITY_PRESETS_POC2[qualityKey] || 20;
             LEAF_SIZE = currentRadius * 0.48;
             CELL_SIZE = LEAF_SIZE / LEAF_RES;
+            FINE_CELL_SIZE = computeFineCellSize(CELL_SIZE);
         }
 
         function rebuildAllPoC2() {
             initSVO(sandbox.scene);
             const tunnelDir = new THREE.Vector3(0.14, 0.12, 1.0).normalize();
             const surfPt = findSurfacePoint(evalDensityPoC2, tunnelDir, currentRadius * 0.6, currentRadius * 1.4);
-            const scaleFactor = currentRadius / 2800.0;
-            carveSpherePoC2(surfPt, 220 * scaleFactor);
-            carveSpherePoC2(surfPt.clone().addScaledVector(tunnelDir, -160 * scaleFactor), 200 * scaleFactor);
-            reinforceSpherePoC2(surfPt.clone().addScaledVector(tunnelDir, -150 * scaleFactor), 250 * scaleFactor);
+            carveSpherePoC2(surfPt, 200);
+            carveSpherePoC2(surfPt.clone().addScaledVector(tunnelDir, -150), 180);
+            reinforceSpherePoC2(surfPt.clone().addScaledVector(tunnelDir, -140), 220);
+            if (typeof sandbox !== 'undefined' && sandbox) {
+                sandbox.updateCellSizeLabel();
+            }
         }
 
         // Shared Sandbox Setup
@@ -604,7 +1256,20 @@
             defaultRadius: currentRadius,
             getCollisionMesh: () => activeLeafMeshes,
             getVisualMesh: () => activeLeafMeshes,
-            getCellSize: () => `${CELL_SIZE.toFixed(1)}u (${LEAF_RES}³)`,
+            getCellSize: () => {
+                const leaves = collectLeaves();
+                let activeMinCell = CELL_SIZE;
+                for (let i = 0; i < leaves.length; i++) {
+                    const l = leaves[i];
+                    if ((l.state === 'surface' || l.mesh !== null) && l.cellSize < activeMinCell) {
+                        activeMinCell = l.cellSize;
+                    }
+                }
+                if (activeMinCell < CELL_SIZE - 0.05) {
+                    return `${activeMinCell.toFixed(1)}u fine / ${CELL_SIZE.toFixed(1)}u macro (${LEAF_RES}³)`;
+                }
+                return `${CELL_SIZE.toFixed(1)}u (${LEAF_RES}³)`;
+            },
 
             onCarve: async (hitPoint, hitNormal, brushRadius, mode) => {
                 carveSpherePoC2(hitPoint, brushRadius);
@@ -629,6 +1294,9 @@
 
             onScaleChange: (scaleKey, radius) => {
                 currentRadius = radius;
+                LEAF_SIZE = currentRadius * 0.48;
+                CELL_SIZE = LEAF_SIZE / LEAF_RES;
+                FINE_CELL_SIZE = computeFineCellSize(CELL_SIZE);
                 rebuildAllPoC2();
             },
 

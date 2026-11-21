@@ -6,7 +6,18 @@
  */
 
 self.onmessage = function(e) {
-    const { requestId, chunkId, res, voxelData, materialData, minBounds, cellSize } = e.data;
+    const {
+        requestId,
+        chunkId,
+        res,
+        voxelData,
+        materialData,
+        minBounds,
+        cellSize,
+        extendPosX = false,
+        extendPosY = false,
+        extendPosZ = false
+    } = e.data;
     // voxelData is Float32Array of dimension (res + 5)^3 (2-voxel halo on each side)
     // Sample index px=2 corresponds to minBounds; px=res+2 corresponds to maxBounds.
     const pRes = res + 5;
@@ -39,10 +50,14 @@ self.onmessage = function(e) {
     const materials = [];
     const indices = [];
 
-    // Cells in [1 .. res + 1] mapped into flat array of size (res + 3)^3
-    const cellCount = res + 3;
+    // Cells in [1 .. res + 2] mapped into flat array of size (res + 4)^3
+    const cellCount = res + 4;
     const cellCount2 = cellCount * cellCount;
     const cellVertexIndex = new Int32Array(cellCount * cellCount * cellCount).fill(-1);
+
+    const endX = extendPosX ? res + 2 : res + 1;
+    const endY = extendPosY ? res + 2 : res + 1;
+    const endZ = extendPosZ ? res + 2 : res + 1;
 
     function getCellKey(cx, cy, cz) {
         return cx + cy * cellCount + cz * cellCount2;
@@ -50,10 +65,10 @@ self.onmessage = function(e) {
 
     const cVals = new Float32Array(8);
 
-    // Step 1: For each cell [1 .. res+1], check 8 corners and generate dual vertex if sign changes
-    for (let cz = 1; cz <= res + 1; cz++) {
-        for (let cy = 1; cy <= res + 1; cy++) {
-            for (let cx = 1; cx <= res + 1; cx++) {
+    // Step 1: For each cell [1 .. end], check 8 corners and generate dual vertex if sign changes
+    for (let cz = 1; cz <= endZ; cz++) {
+        for (let cy = 1; cy <= endY; cy++) {
+            for (let cx = 1; cx <= endX; cx++) {
                 let mask = 0;
                 let rockCount = 0;
                 let oreCount = 0;
@@ -167,10 +182,10 @@ self.onmessage = function(e) {
         }
     }
 
-    // Step 2: Emit quads across interior & lower-boundary edges [2 .. res + 1]
-    for (let pz = 2; pz <= res + 1; pz++) {
-        for (let py = 2; py <= res + 1; py++) {
-            for (let px = 2; px <= res + 1; px++) {
+    // Step 2: Emit quads across interior & boundary edges [2 .. end]
+    for (let pz = 2; pz <= endZ; pz++) {
+        for (let py = 2; py <= endY; py++) {
+            for (let px = 2; px <= endX; px++) {
                 const d0 = getDensity(px, py, pz);
 
                 // Edge 1: Along X-axis: (px, py, pz) -> (px+1, py, pz)
