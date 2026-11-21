@@ -12,38 +12,7 @@
     <script type="module">
         import * as THREE from './vendor/three.module.js';
         import { PlanetaryBaseSandbox, findSurfacePoint } from './shared/planetary_base_sandbox.js';
-
-        // --- Fast 3D Simplex-Style Noise ---
-        class FastNoise3D {
-            constructor(seed = 1337) { this.seed = seed; }
-            hash(x, y, z) {
-                const s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + this.seed) * 43758.5453123;
-                return s - Math.floor(s);
-            }
-            noise(x, y, z) {
-                const X = Math.floor(x), Y = Math.floor(y), Z = Math.floor(z);
-                const xd = x - X, yd = y - Y, zd = z - Z;
-                const u = xd * xd * (3.0 - 2.0 * xd);
-                const v = yd * yd * (3.0 - 2.0 * yd);
-                const w = zd * zd * (3.0 - 2.0 * zd);
-                const c000 = this.hash(X, Y, Z), c100 = this.hash(X+1, Y, Z);
-                const c010 = this.hash(X, Y+1, Z), c110 = this.hash(X+1, Y+1, Z);
-                const c001 = this.hash(X, Y, Z+1), c101 = this.hash(X+1, Y, Z+1);
-                const c011 = this.hash(X, Y+1, Z+1), c111 = this.hash(X+1, Y+1, Z+1);
-                const x00 = c000*(1-u)+c100*u, x10 = c010*(1-u)+c110*u;
-                const x01 = c001*(1-u)+c101*u, x11 = c011*(1-u)+c111*u;
-                const y0 = x00*(1-v)+x10*v, y1 = x01*(1-v)+x11*v;
-                return y0*(1-w)+y1*w;
-            }
-            fbm(x, y, z, octaves = 3) {
-                let val = 0, amp = 0.5, freq = 1.0;
-                for (let i = 0; i < octaves; i++) {
-                    val += this.noise(x * freq, y * freq, z * freq) * amp;
-                    freq *= 2.0; amp *= 0.5;
-                }
-                return val;
-            }
-        }
+        import { FastNoise3D } from './shared/deterministic_noise.js';
 
         const noise = new FastNoise3D(999);
 

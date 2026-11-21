@@ -21,6 +21,18 @@
 
 import * as THREE from '../vendor/three.module.js';
 import { OrbitControls } from '../vendor/OrbitControls.js';
+import {
+    CARVE_OP_BYTE_LENGTH,
+    CARVE_OP_TYPE,
+    CARVE_OP_TYPE_NAME,
+    CarveOpReplicator,
+    encodeCarveOp,
+    decodeCarveOp,
+    encodeCarveOpBatch,
+    decodeCarveOpBatch,
+    compareCarveOps,
+    generateMultiplayerStressOps
+} from './carve_op_replicator.js';
 
 /**
  * Shared Procedural 3D Triplanar Asteroid, Mineral Vein & Hex-Armor Bulkhead Material
@@ -464,6 +476,22 @@ export class PlanetaryBaseSandbox {
         if (this.isBenchmarkMode) {
             this.initAutomatedBenchmark();
         }
+
+        // Multiplayer 28-byte binary CarveOp Replicator
+        this.simTick = 0;
+        this.replicator = new CarveOpReplicator({ localPlayerId: 1 });
+        window.__CARVE_REPLICATOR__ = this.replicator;
+        window.__CARVE_CODEC__ = {
+            CARVE_OP_BYTE_LENGTH,
+            CARVE_OP_TYPE,
+            CARVE_OP_TYPE_NAME,
+            encodeCarveOp,
+            decodeCarveOp,
+            encodeCarveOpBatch,
+            decodeCarveOpBatch,
+            compareCarveOps,
+            generateMultiplayerStressOps
+        };
 
         window.__SANDBOX__ = this;
 
@@ -1512,16 +1540,24 @@ export class PlanetaryBaseSandbox {
 
             const t0 = performance.now();
             let toolResult = null;
+            let recordedOpType = null;
+            let recordedMatId = 0;
 
             if (this.activeTool === 'carve' || (this.activeTool === 'raider' && !isReinforced)) {
+                recordedOpType = CARVE_OP_TYPE.carve;
+                recordedMatId = 0;
                 if (this.config.onCarve) {
                     toolResult = await this.config.onCarve(hitPoint, hitNormal, this.brushRadius, 'carve');
                 }
             } else if (this.activeTool === 'reinforce') {
+                recordedOpType = CARVE_OP_TYPE.reinforce;
+                recordedMatId = 3;
                 if (this.config.onReinforce) {
                     toolResult = await this.config.onReinforce(hitPoint, hitNormal, this.brushRadius);
                 }
             } else if (this.activeTool === 'breach') {
+                recordedOpType = CARVE_OP_TYPE.breach;
+                recordedMatId = 0;
                 if (this.config.onBreach) {
                     toolResult = await this.config.onBreach(hitPoint, hitNormal, this.brushRadius);
                 } else if (this.config.onCarve) {
@@ -1529,6 +1565,19 @@ export class PlanetaryBaseSandbox {
                 }
             } else if (this.activeTool === 'machinery') {
                 this.placeMachineryAt(hitPoint, hitNormal);
+            }
+
+            if (recordedOpType !== null && this.replicator) {
+                this.simTick++;
+                this.replicator.recordLocalOp({
+                    simTick: this.simTick,
+                    opType: recordedOpType,
+                    materialId: recordedMatId,
+                    x: hitPoint.x,
+                    y: hitPoint.y,
+                    z: hitPoint.z,
+                    radius: this.brushRadius
+                });
             }
 
             const elapsed = performance.now() - t0;
@@ -1551,6 +1600,82 @@ export class PlanetaryBaseSandbox {
             }
             this._isExecutingTool = false;
         }
+    }
+
+    /**
+     * Deterministically replay an array of CarveOps or a 28-byte binary batch buffer
+     * in canonical (simTick, playerId, seqId) order. Used for late-join sync and
+     * 30-pilot simultaneous multiplayer stress testing.
+     */
+    async replayCarveOps(opsOrBuffer, options = {}) {
+        const startWall = performance.now();
+        let totalMainThreadMs = 0.0;
+        let maxMainThreadMs = 0.0;
+        const tmpPoint = new THREE.Vector3();
+        const tmpNormal = new THREE.Vector3();
+
+        const replayRes = await this.replicator.replayOps(
+            opsOrBuffer,
+            async (op) => {
+                tmpPoint.set(op.x, op.y, op.z);
+                const len = tmpPoint.length();
+                if (len > 1e-6) {
+                    tmpNormal.copy(tmpPoint).multiplyScalar(1.0 / len);
+                } else {
+                    tmpNormal.set(0, 1, 0);
+                }
+
+                const opStart = performance.now();
+                let res = null;
+                if (op.opType === CARVE_OP_TYPE.reinforce) {
+                    if (this.config.onReinforce) {
+                        res = await this.config.onReinforce(tmpPoint.clone(), tmpNormal.clone(), op.radius);
+                    }
+                } else if (op.opType === CARVE_OP_TYPE.breach) {
+                    if (this.config.onBreach) {
+                        res = await this.config.onBreach(tmpPoint.clone(), tmpNormal.clone(), op.radius);
+                    } else if (this.config.onCarve) {
+                        res = await this.config.onCarve(tmpPoint.clone(), tmpNormal.clone(), op.radius, 'breach');
+                    }
+                } else {
+                    if (this.config.onCarve) {
+                        res = await this.config.onCarve(tmpPoint.clone(), tmpNormal.clone(), op.radius, 'carve');
+                    }
+                }
+                const opElapsed = performance.now() - opStart;
+                const mtMs = (res && typeof res.mainThreadMs === 'number') ? res.mainThreadMs : opElapsed;
+                totalMainThreadMs += mtMs;
+                if (mtMs > maxMainThreadMs) maxMainThreadMs = mtMs;
+                if (op.simTick > this.simTick) this.simTick = op.simTick;
+            },
+            options
+        );
+
+        const elapsedMs = Math.max(0.01, performance.now() - startWall);
+        const appliedCount = replayRes.appliedCount;
+        const totalBytes = replayRes.totalBytes;
+        const elapsedSec = elapsedMs / 1000.0;
+        const opsPerSec = appliedCount / elapsedSec;
+        const bandwidthKBs = (totalBytes / 1024.0) / elapsedSec;
+        const avgOpMs = appliedCount > 0 ? (elapsedMs / appliedCount) : 0.0;
+        const avgMainThreadMs = appliedCount > 0 ? (totalMainThreadMs / appliedCount) : 0.0;
+
+        this.auditVisualCollisionError();
+
+        return {
+            appliedCount,
+            totalBytes,
+            elapsedMs: parseFloat(elapsedMs.toFixed(2)),
+            avgOpMs: parseFloat(avgOpMs.toFixed(2)),
+            avgMainThreadMs: parseFloat(avgMainThreadMs.toFixed(2)),
+            maxMainThreadMs: parseFloat(maxMainThreadMs.toFixed(2)),
+            opsPerSec: parseFloat(opsPerSec.toFixed(1)),
+            bandwidthKBs: parseFloat(bandwidthKBs.toFixed(2)),
+            visualCollisionError: this.visualCollisionError,
+            visualCollisionErrorNumeric: this.visualCollisionErrorNumeric,
+            triangles: this.triangles,
+            drawCalls: this.drawCalls
+        };
     }
 
     placeMachineryAt(point, normal) {

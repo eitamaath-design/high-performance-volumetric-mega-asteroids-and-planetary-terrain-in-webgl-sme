@@ -132,6 +132,7 @@ function normalizeResult(key, raw) {
 function parseCliArgs(argv) {
     const args = argv.slice(2);
     const matrixMode = args.includes('--matrix');
+    const stress30pMode = args.includes('--stress30p');
     const framesArg = args.find(a => a.startsWith('--frames='));
     let frames = 450;
     let hasFramesFlag = false;
@@ -144,7 +145,105 @@ function parseCliArgs(argv) {
     }
     const qualityArg = args.find(a => a.startsWith('--quality='));
     const quality = qualityArg ? qualityArg.split('=')[1] : null;
-    return { matrixMode, frames, hasFramesFlag, quality };
+    const scaleArg = args.find(a => a.startsWith('--scale='));
+    const scale = scaleArg ? scaleArg.split('=')[1] : '30p';
+    const pilotsArg = args.find(a => a.startsWith('--pilots='));
+    const pilots = pilotsArg ? Math.max(1, parseInt(pilotsArg.split('=')[1], 10) || 30) : 30;
+    const ticksArg = args.find(a => a.startsWith('--ticks='));
+    const ticks = ticksArg ? Math.max(1, parseInt(ticksArg.split('=')[1], 10) || 10) : 10;
+    return { matrixMode, stress30pMode, frames, hasFramesFlag, quality, scale, pilots, ticks };
+}
+
+async function runStress30pTarget(browser, target, { scale = '30p', quality = 'medium', pilots = 30, ticks = 10 }) {
+    console.log(`\n=== Running 30-Pilot Multiplayer Stress Test: ${target.key} (${pilots} pilots x ${ticks} ticks @ ${scale}/${quality}) ===`);
+    const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+    const page = await context.newPage();
+
+    let pageError = null;
+    page.on('pageerror', err => {
+        console.error(`[Page Error (${target.key} stress30p)]`, err.message);
+        pageError = err;
+    });
+
+    const url = `http://localhost:${PORT}/${target.path}?scale=${encodeURIComponent(scale)}&quality=${encodeURIComponent(quality)}`;
+    await page.goto(url, { waitUntil: 'networkidle' });
+    await page.waitForFunction(() => Boolean(window.__SANDBOX__ && window.__CARVE_REPLICATOR__ && window.__CARVE_CODEC__), { timeout: 60000 });
+    // Wait for initial scene settle
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+    const result = await page.evaluate(async ({ pilotCount, tickCount }) => {
+        const sb = window.__SANDBOX__;
+        const codec = window.__CARVE_CODEC__;
+        const ops = codec.generateMultiplayerStressOps({
+            pilotCount,
+            radius: sb.currentRadius,
+            ticks: tickCount,
+            seed: 2026
+        });
+
+        // Deterministically shuffle out-of-order to verify canonical (simTick, playerId, seqId) replay
+        const shuffled = ops.slice();
+        let rngState = 987654321 | 0;
+        for (let i = shuffled.length - 1; i > 0; i--) {
+            rngState = (rngState + 0x6d2b79f5) | 0;
+            let t = Math.imul(rngState ^ (rngState >>> 15), 1 | rngState);
+            t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+            const j = ((t ^ (t >>> 14)) >>> 0) % (i + 1);
+            const tmp = shuffled[i];
+            shuffled[i] = shuffled[j];
+            shuffled[j] = tmp;
+        }
+
+        // Encode shuffled ops into compact 28-byte binary batch buffer
+        const batchBuffer = codec.encodeCarveOpBatch(shuffled);
+        const replayStats = await sb.replayCarveOps(batchBuffer, { deduplicate: true, recordToLog: true });
+
+        // Wait one frame for renderer telemetry update
+        await new Promise(resolve => requestAnimationFrame(resolve));
+        sb.auditVisualCollisionError();
+
+        const heapMemoryMB = (window.performance && window.performance.memory)
+            ? parseFloat((window.performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(2))
+            : 0;
+
+        return {
+            poc: sb.config.pocId,
+            scale: sb.currentScaleKey,
+            quality: sb.currentQuality,
+            radius: sb.currentRadius,
+            pilotCount,
+            ticks: tickCount,
+            bytesPerOp: codec.CARVE_OP_BYTE_LENGTH,
+            batchByteLength: batchBuffer.byteLength,
+            appliedCount: replayStats.appliedCount,
+            totalBytes: replayStats.totalBytes,
+            elapsedMs: replayStats.elapsedMs,
+            avgOpMs: replayStats.avgOpMs,
+            avgMainThreadMs: replayStats.avgMainThreadMs,
+            maxMainThreadMs: replayStats.maxMainThreadMs,
+            opsPerSec: replayStats.opsPerSec,
+            bandwidthKBs: replayStats.bandwidthKBs,
+            steadyState20HzKBs: parseFloat(((pilotCount * 20 * codec.CARVE_OP_BYTE_LENGTH) / 1024).toFixed(2)),
+            visualCollisionError: sb.visualCollisionError,
+            visualCollisionErrorNumeric: sb.visualCollisionErrorNumeric,
+            triangles: sb.triangles,
+            drawCalls: sb.drawCalls,
+            heapMemoryMB
+        };
+    }, { pilotCount: pilots, tickCount: ticks });
+
+    if (pageError) {
+        throw new Error(`Page error encountered during stress30p of ${target.key}: ${pageError.message}`);
+    }
+
+    console.log(
+        `[OK] ${target.key}: ${result.appliedCount} ops (${result.totalBytes} B) | ` +
+        `${result.opsPerSec} ops/s | ${result.bandwidthKBs} KB/s (20Hz steady: ${result.steadyState20HzKBs} KB/s) | ` +
+        `avgMainThread=${result.avgMainThreadMs}ms | parity=${result.visualCollisionError}`
+    );
+
+    await context.close();
+    return result;
 }
 
 function buildQueryParams({ scale = null, frames = 450, hasFramesFlag = false, quality = null }) {
@@ -181,7 +280,45 @@ async function main() {
                 platform: process.platform
             };
 
-            if (cli.matrixMode) {
+            if (cli.stress30pMode) {
+                const pocTargets = [
+                    { key: 'poc1', path: 'pocs/poc1_chunked_octree_surface_nets.html' },
+                    { key: 'poc2', path: 'pocs/poc2_sparse_voxel_octree_mesh_patching.html' },
+                    { key: 'poc3', path: 'pocs/poc3_hierarchical_lod_clipmaps.html' },
+                    { key: 'poc4', path: 'pocs/poc4_gpu_sdf_raymarching_hybrid.html' }
+                ];
+                const stressQuality = cli.quality || 'medium';
+                const targets = {};
+                const results = [];
+
+                for (const target of pocTargets) {
+                    const res = await runStress30pTarget(browser, target, {
+                        scale: cli.scale,
+                        quality: stressQuality,
+                        pilots: cli.pilots,
+                        ticks: cli.ticks
+                    });
+                    if (res.visualCollisionErrorNumeric > 0.001) {
+                        throw new Error(`Visual-collision parity regression in ${target.key} stress30p: ${res.visualCollisionError}`);
+                    }
+                    targets[target.key] = res;
+                    results.push(res);
+                }
+
+                const stressOut = {
+                    generatedAt: new Date().toISOString(),
+                    environment,
+                    scale: cli.scale,
+                    quality: stressQuality,
+                    pilots: cli.pilots,
+                    ticks: cli.ticks,
+                    targets,
+                    results
+                };
+                const stressPath = path.join(ROOT_DIR, 'benchmarks', 'stress30p_results.json');
+                fs.writeFileSync(stressPath, JSON.stringify(stressOut, null, 2));
+                console.log(`\n[SUCCESS] 30-pilot multiplayer stress test complete! Results written to ${stressPath}`);
+            } else if (cli.matrixMode) {
                 const scales = ['10p', '30p', '50p'];
                 const pocTargets = [
                     { key: 'poc1', path: 'pocs/poc1_chunked_octree_surface_nets.html' },

@@ -113,9 +113,12 @@ Subterranean caves support structural reinforcement and tactical defense:
   - `Engine Foundry`: Assembles upgraded impulse thrusters and anti-gravity dampeners.
   - `Ore Refinery`: Converts harvested mineral veins into titanium bulkheads and munitions.
 - **Exterior Orbital Resource Nodes:** Orbiting crystal clusters and satellite asteroids floating in exterior orbital space ($1.3\text{--}2.2 \times R$) providing raw materials for base expansion.
-- **P2P Multiplayer Replication:** Instead of broadcasting entire voxel volumes, nodes broadcast compact carve operations:
-  $$\text{CarveOp} = \langle \text{tick}, \text{opType}, \mathbf{p}_{\text{hit}}(x,y,z), R_{\text{brush}}, \text{materialId} \rangle \quad (\sim 28\text{ bytes per tick})$$
-  Every peer applies the analytical CSG operation deterministically into their local sparse grid.
+- **P2P Multiplayer Replication & Cross-Engine Determinism:**
+  - **Cross-Engine Deterministic 3D Noise (`pocs/shared/deterministic_noise.js`):** Replaces duplicated inline `Math.sin` noise implementations across PoCs 1–4 with a shared ESM `DeterministicNoise3D` (exported with drop-in `FastNoise3D` alias) using a pure 32-bit integer bit-mix hash (`Math.imul` + XOR-shifts normalized via `(h >>> 0) / 4294967296.0`) and per-octave cell caching (`_octCache`). Eliminates V8/SpiderMonkey/JavaScriptCore transcendental `Math.sin` drift so every peer generates bit-identical asteroid macro topology and ore fields across `10p`/`30p`/`50p` (`8000u+`) coordinates.
+  - **28-Byte Binary `CarveOp` Codec & Canonical Replay (`pocs/shared/carve_op_replicator.js`):** Instead of broadcasting entire voxel volumes, nodes broadcast compact fixed-width 28-byte little-endian `DataView` packets (`CARVE_OP_BYTE_LENGTH = 28`):
+    $$\text{CarveOp} = \langle \text{uint32 simTick}, \text{uint16 playerId}, \text{uint8 opType}, \text{uint8 materialId}, \text{float32 } (x,y,z,R_{\text{brush}}), \text{uint32 seqId} \rangle \quad (28\text{ bytes})$$
+    Provides `encodeCarveOp`/`decodeCarveOp`, `encodeCarveOpBatch`/`decodeCarveOpBatch`, canonical `(simTick, playerId, seqId)` ordering (`compareCarveOps`), `CarveOpReplicator` (local recording, binary late-join snapshot export/import, and deterministic out-of-order replay), and `generateMultiplayerStressOps({ pilotCount, radius, ticks, seed })`.
+  - **Sandbox Replication Hook (`pocs/shared/planetary_base_sandbox.js`):** Exposes `sandbox.replicator` (`window.__CARVE_REPLICATOR__`) and `window.__CARVE_CODEC__` so every live carve/reinforce/breach tick automatically records a float32-quantized 28-byte `CarveOp` packet and supports `sandbox.replayCarveOps(opsOrBuffer)` for deterministic late-join replay and 30-pilot simultaneous stress testing.
 
 ### 2.5 Detailed Architectural Alternatives Evaluated
 
@@ -165,11 +168,11 @@ Subterranean caves support structural reinforcement and tactical defense:
 | **Visual-to-Collision Error** | $> 30.00\text{u}$ (Fatal mismatch) | **$0.00\text{u}$ (Identical Mesh BVH)** | **$0.00\text{u}$ (Identical Mesh BVH)** | **$0.00\text{u}$ (Identical Mesh BVH)** | **$0.00\text{u}$ (Shared $C^2$ B-Spline SDF)** |
 | **Base Wall Reinforcement** | Single-material only | Multi-material vertex color & mask | Multi-material QEF sharp corners | Multi-material subterranean chunks | Orthogonal 4-Channel RGBA Volume (R: SDF, G: Ore, B: Armor) |
 | **Scalability (20–30+ Players)** | Unscalable (Bandwidth/CPU blowup) | High (Independent spatial chunks) | High (Sparse tree branches) | **Maximum (Planetary $R=8000\text{u}+$ scale)** | Medium (VRAM texture limits) |
-| **Carve Latency (Main-Thread / Async)** | $1.48\text{ ms}$ (Coarse sync) | **$5.25\text{ ms}$ sync** / $27.28\text{ ms}$ worker | **$5.63\text{ ms}$ sync** / $24.82\text{ ms}$ worker | **$3.20\text{ ms}$ sync** / $15.42\text{ ms}$ worker | **$1.52\text{ ms}$ (Sub-box upload)** |
-| **Main-Thread Frame Work (Avg)** | N/A (Legacy harness) | **$0.49\text{ ms}$** ($18.10\text{ ms}$ P99) | **$0.42\text{ ms}$** ($16.50\text{ ms}$ P99) | **$0.32\text{ ms}$** ($10.10\text{ ms}$ P99) | **$0.17\text{ ms}$** ($0.50\text{ ms}$ P99) |
-| **Average Frame Rate** | $58.8\text{ FPS}$ | **$58.9\text{ FPS}$** | **$59.2\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
+| **Carve Latency (Main-Thread / Async)** | $1.63\text{ ms}$ (Coarse sync) | **$4.35\text{ ms}$ sync** / $27.73\text{ ms}$ worker | **$4.17\text{ ms}$ sync** / $20.70\text{ ms}$ worker | **$2.72\text{ ms}$ sync** / $17.42\text{ ms}$ worker | **$1.60\text{ ms}$ (Sub-box upload)** |
+| **Main-Thread Frame Work (Avg)** | N/A (Legacy harness) | **$0.49\text{ ms}$** ($19.20\text{ ms}$ P99) | **$0.40\text{ ms}$** ($15.20\text{ ms}$ P99) | **$0.35\text{ ms}$** ($8.80\text{ ms}$ P99) | **$0.17\text{ ms}$** ($0.50\text{ ms}$ P99) |
+| **Average Frame Rate** | $58.8\text{ FPS}$ | **$58.9\text{ FPS}$** | **$59.6\text{ FPS}$** | **$59.9\text{ FPS}$** | **$60.0\text{ FPS}$** |
 | **Draw Calls (Batched Octants)** | 1 | **22** (down from 167) | **22** (down from 181) | **17** (down from 80) | **15** |
-| **JS Heap Memory** | $28.04\text{ MB}$ (Wasteful static heap) | $31.57\text{ MB}$ | $29.75\text{ MB}$ | **$22.03\text{ MB}$** | $28.04\text{ MB}$ |
+| **JS Heap Memory** | $28.04\text{ MB}$ (Wasteful static heap) | $31.57\text{ MB}$ | $28.04\text{ MB}$ | **$26.32\text{ MB}$** | $28.04\text{ MB}$ |
 | **License & Dependencies** | MIT / Three.js MarchingCubes | MIT / Pure Three.js r170 | MIT / Pure Three.js r170 | MIT / Pure Three.js r170 | MIT / Pure Three.js r170 |
 
 ### 3.2 Decision Summary & Rockets Implementation Blueprint
@@ -225,6 +228,10 @@ Subterranean caves support structural reinforcement and tactical defense:
 10. **Scale-Independent Subterranean Resolution & Adaptive LOD Subdivision Gate:** Across `10p` ($R=2800\text{u}$), `30p` ($R=4800\text{u}$), and `50p` ($R=8000\text{u}$), subterranean carve fidelity remains decoupled from planetary radius:
    - PoC 3 (`SUBTERRANEAN_CHUNK_SIZE = 128.0`) must yield identical subterranean cell sizes (`4.6u` `ultra`, `5.8u` `high`, `8.0u` `medium`, `10.7u` `low`) across `10p`/`30p`/`50p`, maintain watertight macro collars via sagitta-safe `MACRO_COLLAR_INSET` (`4.0u–12.0u`), prune fully void unarmored chunks into `voidChunkKeys`, and enforce `subterraneanChunks.size <= 512`.
    - PoC 1 & PoC 2 must retain coarse uncarved macro shells (`CHUNK_SIZE = currentRadius * 0.45`, `LEAF_SIZE = currentRadius * 0.48`), selectively subdivide only carved/reinforced octree regions via `2×2×2` splits down to `cellSize <= 20.0u` (up to depth 4 at `50p`) with lossless `editHistory` CSG replay, seal coarse-to-fine LOD boundaries via `extendPosX`/`Y`/`Z` without cracks or double-surface overlap (atomic worker swap in PoC 1; synchronous parent disposal in PoC 2), and maintain `avgMainThreadCarveMs < 16.6ms` and `visualCollisionErrorNumeric <= 0.001`.
+11. **Multiplayer Determinism, 28-Byte Binary `CarveOp` Codec & 30-Pilot Stress Gate:**
+   - `DeterministicNoise3D` (`pocs/shared/deterministic_noise.js`) must contain zero `Math.sin` calls, use pure 32-bit `Math.imul` integer bit-mixing, and return bit-exact identical outputs across repeated evaluations and large `8000u+` coordinates in `[0, 1]`.
+   - `encodeCarveOp` / `decodeCarveOp` (`pocs/shared/carve_op_replicator.js`) must produce exact 28-byte little-endian binary round-trips across `carve` (`0`), `reinforce` (`1`), and `breach` (`2`) op types, and `compareCarveOps` / `CarveOpReplicator.replayOps` must resolve arbitrarily shuffled out-of-order packets into the identical canonical `(simTick, playerId, seqId)` execution order.
+   - `node benchmarks/run_all_benchmarks.cjs --stress30p` must complete cleanly across PoCs 1–4 under 30 simultaneous pilots with zero page errors and `visualCollisionErrorNumeric <= 0.001` (`0.00u` parity).
 
 ### 5.2 Automated & In-Showcase Benchmark Harnesses
 - **CLI Headless Benchmark Suite:** Runs all five comparative environments (`rockets_baseline`, `poc1`, `poc2`, `poc3`, `poc4`) under headless Playwright, performing continuous automated carve cycles, sampling all post-warmup frame intervals and main-thread work times, triangles, and heap memory, writing all 5 per-target JSON files plus `benchmarks/summary_results.json`:
@@ -235,6 +242,10 @@ Subterranean caves support structural reinforcement and tactical defense:
   ```bash
   node benchmarks/run_all_benchmarks.cjs --matrix
   ```
+  Passing `--stress30p` (with optional `--pilots=<N>`, `--ticks=<N>`, `--scale=<scale>`, `--quality=<tier>`) runs a 30-pilot simultaneous out-of-order binary `CarveOp` replay stress test across `poc1`–`poc4`, reporting `opsPerSec`, wire `bandwidthKBs`, `avgMainThreadMs`, and `0.00u` parity into `benchmarks/stress30p_results.json`:
+  ```bash
+  node benchmarks/run_all_benchmarks.cjs --stress30p
+  ```
 - **In-Showcase Parameterized Benchmark Suite (`pocs/index.html`):** On initialization (outside `file://`), `pocs/index.html` fetches `benchmarks/summary_results.json` (via relative path from `pocs/`, with graceful fallback to embedded defaults if unavailable) to synchronize the Comparison Matrix and active telemetry header. Users can also configure **Scale** (`10p`, `30p`, `50p`), **Resolution/Quality** (`low`, `medium`, `high`, `ultra`), and **Laser Brush Radius** (`40u–360u`) directly inside the Showcase UI and trigger `runAllModesBenchmark()`, which sequentially loads `poc1`–`poc4` with `?benchmark=true&scale=...&quality=...&radius=...&frames=150`, aggregates `BENCHMARK_COMPLETE` postMessage telemetry, and displays `avgMainThreadWorkMs` / `avgMainThreadCarveMs` alongside FPS and async latency in the live Comparison Matrix and Showcase benchmark runner table.
 
 ### 5.3 Benchmark Telemetry Inventory
@@ -244,18 +255,27 @@ Subterranean caves support structural reinforcement and tactical defense:
 | Metric | Rockets Baseline (Monolithic 64³) | Option 1: Chunked Surface Nets (PoC 1) | Option 2: Adaptive QEF SVO (PoC 2) | Option 3: Clipmap Shell & Portals (PoC 3) | Option 4: 3D GPU SDF Raymarching (PoC 4) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Status** | Verified Legacy | Verified / Next-Gen | Verified / Next-Gen | Verified / Next-Gen | Verified / Next-Gen |
-| **Average FPS** | $58.8\text{ FPS}$ | **$58.9\text{ FPS}$** | **$59.2\text{ FPS}$** | **$60.0\text{ FPS}$** | **$60.0\text{ FPS}$** |
-| **Average Frame Time** | $17.00\text{ ms}$ | $16.98\text{ ms}$ | $16.90\text{ ms}$ | **$16.67\text{ ms}$** | **$16.67\text{ ms}$** |
-| **P99 Frame Time** | $16.80\text{ ms}$ | $33.30\text{ ms}$ | $33.30\text{ ms}$ | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** |
-| **Main-Thread Frame Work (Avg)** (`avgMainThreadWorkMs`) | N/A (Legacy) | **$0.49\text{ ms}$** | **$0.42\text{ ms}$** | **$0.32\text{ ms}$** | **$0.17\text{ ms}$** |
-| **Main-Thread Frame Work (P99)** (`p99MainThreadWorkMs`) | N/A (Legacy) | $18.10\text{ ms}$ | $16.50\text{ ms}$ | **$10.10\text{ ms}$** | **$0.50\text{ ms}$** |
-| **Main-Thread Carve Blocking** (`avgMainThreadCarveMs`) | $1.48\text{ ms}$ | **$5.25\text{ ms}$** (Sync dispatch) | **$5.63\text{ ms}$** (Sync dispatch) | **$3.20\text{ ms}$** (Sync dispatch) | **$1.52\text{ ms}$** |
-| **Carve Latency** (`avgCarveLatency`) | $1.48\text{ ms}$ | $27.28\text{ ms}$ (Async worker) | $24.82\text{ ms}$ (Async worker) | $15.42\text{ ms}$ (Async worker) | **$1.52\text{ ms}$** |
+| **Average FPS** | $58.8\text{ FPS}$ | **$58.9\text{ FPS}$** | **$59.6\text{ FPS}$** | **$59.9\text{ FPS}$** | **$60.0\text{ FPS}$** |
+| **Average Frame Time** | $17.00\text{ ms}$ | $16.98\text{ ms}$ | $16.78\text{ ms}$ | **$16.71\text{ ms}$** | **$16.67\text{ ms}$** |
+| **P99 Frame Time** | $16.80\text{ ms}$ | $33.40\text{ ms}$ | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** | **$16.80\text{ ms}$** |
+| **Main-Thread Frame Work (Avg)** (`avgMainThreadWorkMs`) | N/A (Legacy) | **$0.49\text{ ms}$** | **$0.40\text{ ms}$** | **$0.35\text{ ms}$** | **$0.17\text{ ms}$** |
+| **Main-Thread Frame Work (P99)** (`p99MainThreadWorkMs`) | N/A (Legacy) | $19.20\text{ ms}$ | $15.20\text{ ms}$ | **$8.80\text{ ms}$** | **$0.50\text{ ms}$** |
+| **Main-Thread Carve Blocking** (`avgMainThreadCarveMs`) | $1.63\text{ ms}$ | **$4.35\text{ ms}$** (Sync dispatch) | **$4.17\text{ ms}$** (Sync dispatch) | **$2.72\text{ ms}$** (Sync dispatch) | **$1.60\text{ ms}$** |
+| **Carve Latency** (`avgCarveLatency`) | $1.63\text{ ms}$ | $27.73\text{ ms}$ (Async worker) | $20.70\text{ ms}$ (Async worker) | $17.42\text{ ms}$ (Async worker) | **$1.60\text{ ms}$** |
 | **Sampled Post-Warmup Frames** (`sampledFrames`) | 450 | 421 | 421 | 421 | 421 |
 | **Visual-Collision Error** | $> 30.00\text{u}$ | **$0.00\text{u}$** | **$0.00\text{u}$** | **$0.00\text{u}$** | **$0.00\text{u}$** |
-| **Active Triangles** | 6,936 | 94,896 | 80,500 | 57,108 | 1,244 (Proxy) |
+| **Active Triangles** | 6,936 | 88,856 | 71,890 | 62,161 | 1,244 (Proxy) |
 | **Draw Calls** | 1 | **22** | **22** | **17** | **15** |
-| **JS Heap Memory** | $28.04\text{ MB}$ | $31.57\text{ MB}$ | $29.75\text{ MB}$ | **$22.03\text{ MB}$** | $28.04\text{ MB}$ |
+| **JS Heap Memory** | $28.04\text{ MB}$ | $31.57\text{ MB}$ | $28.04\text{ MB}$ | **$26.32\text{ MB}$** | $28.04\text{ MB}$ |
+
+#### 30-Pilot Simultaneous Multiplayer Stress Test (`benchmarks/stress30p_results.json`, 30 pilots × 10 ticks = 300 out-of-order 28-byte ops @ `30p` / `medium`, 8,400 B total)
+
+| PoC | Applied Ops | Replay Throughput (`opsPerSec`) | Wire Bandwidth (`bandwidthKBs` / 20Hz Steady) | Avg Main-Thread Work (`avgMainThreadMs`) | Draw Calls | Visual-Collision Parity |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **PoC 1** | 300 (`8,400 B`) | $169.4\text{ ops/s}$ | $4.63\text{ KB/s}$ ($16.41\text{ KB/s}$ @ 20Hz) | **$3.77\text{ ms}$** | 17 | **$0.00\text{u}$** |
+| **PoC 2** | 300 (`8,400 B`) | $150.0\text{ ops/s}$ | $4.10\text{ KB/s}$ ($16.41\text{ KB/s}$ @ 20Hz) | **$2.14\text{ ms}$** | 18 | **$0.00\text{u}$** |
+| **PoC 3** | 300 (`8,400 B`) | $212.2\text{ ops/s}$ | $5.80\text{ KB/s}$ ($16.41\text{ KB/s}$ @ 20Hz) | **$2.68\text{ ms}$** | 20 | **$0.00\text{u}$** |
+| **PoC 4** | 300 (`8,400 B`) | **$55,555.6\text{ ops/s}$** | $1,519.10\text{ KB/s}$ ($16.41\text{ KB/s}$ @ 20Hz) | **$0.02\text{ ms}$** | 11 | **$0.00\text{u}$** |
 
 #### Multi-Scale Benchmark Matrix (`benchmarks/matrix_results.json`, 450 frames / `421` sampled per cell, `medium` preset)
 *(Legacy monolithic 64³/48³ baseline is fixed at $R=2800\text{u}$ (`10p`) and unscalable to `30p`/`50p`.)*
@@ -297,6 +317,9 @@ node benchmarks/run_all_benchmarks.cjs
 
 # Run multi-scale benchmark matrix sweep (10p, 30p, 50p across PoCs 1-4 -> matrix_results.json)
 node benchmarks/run_all_benchmarks.cjs --matrix
+
+# Run 30-pilot simultaneous multiplayer CarveOp stress test across PoCs 1-4 -> stress30p_results.json
+node benchmarks/run_all_benchmarks.cjs --stress30p
 ```
 To run the automated knowledge base housekeeping and file inventory audit:
 ```bash
@@ -328,7 +351,9 @@ python C:\Users\eitama\.gemini\config\skills\knowledge-base\scripts\kb_housekeep
 | `package-lock.json` | Locked dependency manifest for Playwright-core and Three.js |
 | `.gitignore` | Git exclusion rules for node_modules, cache, and OS artifacts |
 | `pocs/index.html` | Comprehensive interactive SME Gallery, architecture switcher, `summary_results.json` matrix sync, and live benchmark runner table |
-| `pocs/shared/planetary_base_sandbox.js` | Shared interactive 3D engine: Flight mode, 5 tools, `createTriplanarAsteroidMaterial` (`THREE.FrontSide` default, distance-attenuated micro-bump, dynamic X-Ray `THREE.DoubleSide` flip), cached HUD DOM refs (`this._hudEls`), live `auditVisualCollisionError()`, unified X-Ray `THREE.Plane`, unbounded benchmark recorder, postMessage bridge |
+| `pocs/shared/planetary_base_sandbox.js` | Shared interactive 3D engine: Flight mode, 5 tools, `createTriplanarAsteroidMaterial` (`THREE.FrontSide` default, distance-attenuated micro-bump, dynamic X-Ray `THREE.DoubleSide` flip), cached HUD DOM refs (`this._hudEls`), live `auditVisualCollisionError()`, unified X-Ray `THREE.Plane`, `CarveOpReplicator` (`window.__CARVE_REPLICATOR__`, `replayCarveOps()`), unbounded benchmark recorder, postMessage bridge |
+| `pocs/shared/deterministic_noise.js` | Cross-engine deterministic 3D value/FBM noise (`DeterministicNoise3D` / `FastNoise3D` alias) using pure 32-bit `Math.imul` + XOR-shift integer bit-mixing (zero `Math.sin`) and per-octave cell caching |
+| `pocs/shared/carve_op_replicator.js` | 28-byte little-endian `DataView` binary `CarveOp` codec (`CARVE_OP_BYTE_LENGTH = 28`), canonical `(simTick, playerId, seqId)` ordering (`compareCarveOps`), `CarveOpReplicator` late-join snapshot & out-of-order replay, and `generateMultiplayerStressOps` |
 | `pocs/shared/chunk_batch_manager.js` | 8-octant pooled growable `BufferGeometry` VBO batcher (`ChunkBatchManager`) using `setDrawRange` + `addUpdateRange`, accurate active-range bounds for `THREE.Raycaster` (`0.00u` parity), and `<= 8` terrain draw calls across PoCs 1–3 |
 | `pocs/shared/meshing_worker_pool.js` | Bounded (`2..4`) ESM Web Worker pool (`MeshingWorkerPool`) with FIFO `jobQueue`, per-worker `inFlight` `Map`, `setEpoch()` pre-dispatch cancellation, `onerror`/`onmessageerror` terminate + respawn, transferable-safe `maxRetries = 2` retry/rejection, and telemetry |
 | `pocs/poc1_chunked_octree_surface_nets.html` | Option 1: Adaptive Octree Surface Nets (`cellSize <= 20.0u` fine / coarse macro, `editHistory` replay, atomic worker swap, `MAX_ACTIVE_CHUNKS = 512` LRU cap) + `ChunkBatchManager` (`window.__POC1_BATCH_MANAGER__`) + `MeshingWorkerPool` (`window.__POC1_WORKER_POOL__`, `window.__POC1_CHUNKS__`, `window.__POC1_GET_LEAVES__`) |
@@ -340,7 +365,7 @@ python C:\Users\eitama\.gemini\config\skills\knowledge-base\scripts\kb_housekeep
 | `pocs/vendor/OrbitControls.js` | Vendored Three.js r170 OrbitControls ESM module |
 | `pocs/vendor/MarchingCubes.js` | Vendored Three.js r170 MarchingCubes module for Rockets baseline |
 | `benchmarks/rockets_baseline.html` | Baseline benchmark measuring legacy Rockets monolithic 64³ MarchingCubes |
-| `benchmarks/run_all_benchmarks.cjs` | Automated Playwright benchmark orchestrator executing all 5 targets (`summary_results.json`, including `visualCollisionErrorNumeric`) and `--matrix` multi-scale sweeps (`matrix_results.json`) |
+| `benchmarks/run_all_benchmarks.cjs` | Automated Playwright benchmark orchestrator executing all 5 targets (`summary_results.json`, including `visualCollisionErrorNumeric`), `--matrix` multi-scale sweeps (`matrix_results.json`), and `--stress30p` 30-pilot simultaneous `CarveOp` replay stress tests (`stress30p_results.json`) |
 | `benchmarks/run_benchmarks.cjs` | Standalone benchmark runner script |
 | `benchmarks/run_benchmarks.js` | CommonJS/ESM benchmark test server and browser runner |
 | `benchmarks/baseline_results.json` | Telemetry results for legacy Rockets monolithic 64³ baseline |
@@ -350,6 +375,7 @@ python C:\Users\eitama\.gemini\config\skills\knowledge-base\scripts\kb_housekeep
 | `benchmarks/poc4_sdf_raymarching_results.json` | Telemetry results for Option 4 3D GPU SDF Raymarching |
 | `benchmarks/summary_results.json` | Aggregated 5-target normalized benchmark summary (`sampledFrames: 421` for PoCs 1–4, 450 for baseline) loaded by `pocs/index.html` |
 | `benchmarks/matrix_results.json` | Multi-scale (`10p`, `30p`, `50p`) 450-frame benchmark matrix sweep (`421` sampled frames per cell) across PoCs 1–4 |
+| `benchmarks/stress30p_results.json` | 30-pilot simultaneous multiplayer binary `CarveOp` replay stress test telemetry across PoCs 1–4 |
 | `reports/alt_1_chunked-octree-surface-nets-with-async-web-workers.md` | Deep dive technical report on Option 1 Chunked Surface Nets |
 | `reports/alt_2_sparse-voxel-octree-with-dirty-aabb-mesh-patching.md` | Deep dive technical report on Option 2 SVO Dual Contouring |
 | `reports/alt_3_hierarchical-lod-clipmaps-for-volumetric-asteroids.md` | Deep dive technical report on Option 3 Clipmap Macro Shells |
