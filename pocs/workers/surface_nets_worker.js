@@ -3,8 +3,8 @@
  * Supports:
  *  - mode: 'surface_nets' (default): Dual-Grid Surface Nets with configurable 1- or 2-voxel halo,
  *    LOD boundary sealing (extendPosX/Y/Z), and optional carveField exterior-crust culling (PoC 1 & PoC 3).
- *  - mode: 'dual_contour': Adaptive QEF Dual Contouring with 3-iteration scalar Gauss-Seidel
- *    regularized gradient descent and LOD boundary sealing (PoC 2).
+ *  - mode: 'dual_contour': Adaptive QEF Dual Contouring with zero-allocation closed-form
+ *    regularized 3x3 symmetric QEF solver and LOD boundary sealing (PoC 2).
  *
  * Uses reusable growable scratch TypedArrays to eliminate per-chunk GC churn,
  * returning exact-sized sliced copies as zero-copy Transferable ArrayBuffers.
@@ -30,6 +30,66 @@ let _mats = new Uint8Array(16384);
 let _extFlags = new Uint8Array(16384);
 let _indices = new Uint32Array(65536 * 3);
 const _triGradOut = new Float32Array(3);
+const _qefOut = new Float32Array(3);
+
+/**
+ * Closed-form zero-allocation 3x3 regularized QEF solver centered at mass point (mx, my, mz).
+ * Minimizes E(u) = sum_i (n_i . (u + p_mass - p_i))^2 + lambda * ||u||^2
+ * where M = A^T A + lambda * I is strictly symmetric positive definite (SPD).
+ */
+function solveQEF3x3(edgePts, edgeNorms, edgeCount, mx, my, mz, lambda, out) {
+    let a00 = lambda, a01 = 0.0, a02 = 0.0;
+    let a11 = lambda, a12 = 0.0;
+    let a22 = lambda;
+    let b0 = 0.0, b1 = 0.0, b2 = 0.0;
+
+    for (let p = 0; p < edgeCount; p++) {
+        const off = p * 3;
+        const nx = edgeNorms[off];
+        const ny = edgeNorms[off + 1];
+        const nz = edgeNorms[off + 2];
+        const dx = edgePts[off] - mx;
+        const dy = edgePts[off + 1] - my;
+        const dz = edgePts[off + 2] - mz;
+        const rhs = nx * dx + ny * dy + nz * dz;
+
+        a00 += nx * nx;
+        a01 += nx * ny;
+        a02 += nx * nz;
+        a11 += ny * ny;
+        a12 += ny * nz;
+        a22 += nz * nz;
+
+        b0 += nx * rhs;
+        b1 += ny * rhs;
+        b2 += nz * rhs;
+    }
+
+    // Exact symmetric 3x3 cofactor / determinant inversion (zero heap allocations)
+    const c00 = a11 * a22 - a12 * a12;
+    const c01 = a02 * a12 - a01 * a22;
+    const c02 = a01 * a12 - a02 * a11;
+    const c11 = a00 * a22 - a02 * a02;
+    const c12 = a01 * a02 - a00 * a12;
+    const c22 = a00 * a11 - a01 * a01;
+
+    const det = a00 * c00 + a01 * c01 + a02 * c02;
+    if (det > 1e-8) {
+        const invDet = 1.0 / det;
+        const ux = (c00 * b0 + c01 * b1 + c02 * b2) * invDet;
+        const uy = (c01 * b0 + c11 * b1 + c12 * b2) * invDet;
+        const uz = (c02 * b0 + c12 * b1 + c22 * b2) * invDet;
+        if (Number.isFinite(ux) && Number.isFinite(uy) && Number.isFinite(uz)) {
+            out[0] = mx + ux;
+            out[1] = my + uy;
+            out[2] = mz + uz;
+            return;
+        }
+    }
+    out[0] = mx;
+    out[1] = my;
+    out[2] = mz;
+}
 
 function sampleTrilinearGradient(voxelData, pRes, pRes2, fx, fy, fz, out) {
     const maxC = pRes - 2;
@@ -502,41 +562,26 @@ function runDualContour(data) {
                 const invN = 1.0 / edgeCount;
                 mx *= invN; my *= invN; mz *= invN;
 
-                // Stable regularized QEF gradient descent (zero-allocation scalar math)
-                let qx = mx, qy = my, qz = mz;
-                const lambda = 0.12;
-                const stepSize = 0.35;
-
-                for (let iter = 0; iter < 3; iter++) {
-                    let gx = 0, gy = 0, gz = 0;
-                    for (let p = 0; p < edgeCount; p++) {
-                        const off = p * 3;
-                        const nx = _edgeNorms[off], ny = _edgeNorms[off + 1], nz = _edgeNorms[off + 2];
-                        const dx = qx - _edgePts[off], dy = qy - _edgePts[off + 1], dz = qz - _edgePts[off + 2];
-                        const dotVal = (nx * dx + ny * dy + nz * dz) * invN;
-                        gx += nx * dotVal;
-                        gy += ny * dotVal;
-                        gz += nz * dotVal;
-                    }
-                    gx += (qx - mx) * lambda;
-                    gy += (qy - my) * lambda;
-                    gz += (qz - mz) * lambda;
-                    qx -= gx * stepSize;
-                    qy -= gy * stepSize;
-                    qz -= gz * stepSize;
-                }
+                // Closed-form regularized 3x3 QEF solve in local cell coordinates centered at mass point
+                const isArmorCell = armorCount > 0;
+                const lambda = isArmorCell ? 0.004 : 0.025;
+                solveQEF3x3(_edgePts, _edgeNorms, edgeCount, mx, my, mz, lambda, _qefOut);
+                let qx = _qefOut[0];
+                let qy = _qefOut[1];
+                let qz = _qefOut[2];
 
                 // Clamp QEF vertex strictly inside world bounds of cell (cx, cy, cz)
                 const cellMinX = minX + (cx - 2) * cellSize;
                 const cellMinY = minY + (cy - 2) * cellSize;
                 const cellMinZ = minZ + (cz - 2) * cellSize;
+                const cellPad = isArmorCell ? cellSize * 0.005 : pad;
 
-                if (qx < cellMinX + pad) qx = cellMinX + pad;
-                else if (qx > cellMinX + cellSize - pad) qx = cellMinX + cellSize - pad;
-                if (qy < cellMinY + pad) qy = cellMinY + pad;
-                else if (qy > cellMinY + cellSize - pad) qy = cellMinY + cellSize - pad;
-                if (qz < cellMinZ + pad) qz = cellMinZ + pad;
-                else if (qz > cellMinZ + cellSize - pad) qz = cellMinZ + cellSize - pad;
+                if (qx < cellMinX + cellPad) qx = cellMinX + cellPad;
+                else if (qx > cellMinX + cellSize - cellPad) qx = cellMinX + cellSize - cellPad;
+                if (qy < cellMinY + cellPad) qy = cellMinY + cellPad;
+                else if (qy > cellMinY + cellSize - cellPad) qy = cellMinY + cellSize - cellPad;
+                if (qz < cellMinZ + cellPad) qz = cellMinZ + cellPad;
+                else if (qz > cellMinZ + cellSize - cellPad) qz = cellMinZ + cellSize - cellPad;
 
                 // Smooth trilinearly-interpolated SDF gradient at solved QEF dual vertex
                 const invCellSize = 1.0 / cellSize;

@@ -42,6 +42,7 @@
         const svoLeafMap = new Map();
         const editHistory = [];
         let opSerialChain = Promise.resolve();
+        let collapsedSubtreeCount = 0;
         const _poc2CoarseGrid = new Float32Array(5 * 5 * 5);
         const _poc2SinOreX = new Float32Array(32);
 
@@ -62,11 +63,175 @@
             return leaves;
         }
 
+        function getOctreeStats() {
+            let totalNodes = 0;
+            let internalNodes = 0;
+            let activeLeaves = 0;
+            let collapsedHomogeneous = 0;
+            let emptyLeaves = 0;
+            let solidLeaves = 0;
+            const stack = Array.from(svoLeafMap.values());
+            while (stack.length > 0) {
+                const node = stack.pop();
+                if (!node) continue;
+                totalNodes++;
+                if (node.children !== null) {
+                    internalNodes++;
+                    for (let i = 0; i < 8; i++) {
+                        stack.push(node.children[i]);
+                    }
+                } else if (node.nodeState === 'mixed') {
+                    activeLeaves++;
+                } else {
+                    collapsedHomogeneous++;
+                    if (node.nodeState === 'empty') emptyLeaves++;
+                    else if (node.nodeState === 'solid') solidLeaves++;
+                }
+            }
+            return {
+                totalNodes,
+                internalNodes,
+                activeLeaves,
+                collapsedHomogeneous,
+                emptyLeaves,
+                solidLeaves,
+                collapsedSubtrees: collapsedSubtreeCount
+            };
+        }
+
+        /**
+         * Recursively collapses internal SVO nodes whose 8 children are all
+         * homogeneous unarmored 'empty' or 'solid' leaves into a single buffer-free leaf.
+         */
+        function collapseOctreeNode(node) {
+            if (!node) return 'empty';
+            if (node.children === null) {
+                if (node.density === null && node.nodeState === 'mixed') {
+                    node.nodeState = node.state === 'solid' ? 'solid' : 'empty';
+                }
+                return node.nodeState;
+            }
+            let uniformState = null;
+            let canCollapse = true;
+            for (let i = 0; i < 8; i++) {
+                const child = node.children[i];
+                const cs = collapseOctreeNode(child);
+                if (
+                    child.children !== null ||
+                    child.hasMesh ||
+                    child.hasArmor ||
+                    (cs !== 'empty' && cs !== 'solid')
+                ) {
+                    canCollapse = false;
+                } else if (uniformState === null) {
+                    uniformState = cs;
+                } else if (uniformState !== cs) {
+                    canCollapse = false;
+                }
+            }
+            if (canCollapse && uniformState !== null) {
+                node.children = null;
+                node.state = uniformState === 'empty' ? 'void' : 'solid';
+                node.nodeState = uniformState;
+                node.density = null;
+                node.material = null;
+                node.hasMesh = false;
+                collapsedSubtreeCount++;
+                return uniformState;
+            }
+            node.nodeState = 'internal';
+            return 'internal';
+        }
+
+        /**
+         * Applies axis-aligned planar/chamfered titanium bulkhead CSG + material = 3
+         * to a surface SVO leaf. Shared by both editHistory replay and incremental reinforce.
+         */
+        function applyReinforceBulkheadToNode(node, op) {
+            if (!node.density || !node.material) return false;
+            const pRes = node.pRes;
+            const pRes2 = node.pRes2;
+            const invCell = 1.0 / node.cellSize;
+            const bulkheadHalf = op.radius * 0.82;
+            const armorShell = bulkheadHalf + node.cellSize * 2.5;
+            const reach = Math.max(op.radius, armorShell);
+            const rSq = op.radius * op.radius;
+
+            const minPX = Math.max(0, Math.floor((op.minX - reach - node.minX) * invCell + 2));
+            const maxPX = Math.min(pRes - 1, Math.ceil((op.maxX + reach - node.minX) * invCell + 2));
+            const minPY = Math.max(0, Math.floor((op.minY - reach - node.minY) * invCell + 2));
+            const maxPY = Math.min(pRes - 1, Math.ceil((op.maxY + reach - node.minY) * invCell + 2));
+            const minPZ = Math.max(0, Math.floor((op.minZ - reach - node.minZ) * invCell + 2));
+            const maxPZ = Math.min(pRes - 1, Math.ceil((op.maxZ + reach - node.minZ) * invCell + 2));
+            if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) return false;
+
+            let segDx = 0, segDy = 0, segDz = 0, segInvLenSq = 0;
+            if (op.hasCapsule) {
+                segDx = op.x - op.ax;
+                segDy = op.y - op.ay;
+                segDz = op.z - op.az;
+                const lenSq = segDx * segDx + segDy * segDy + segDz * segDz;
+                segInvLenSq = lenSq > 1e-8 ? 1.0 / lenSq : 0.0;
+            }
+
+            let modified = false;
+            for (let z = minPZ; z <= maxPZ; z++) {
+                const wz = node.minZ + (z - 2) * node.cellSize;
+                const zOff = z * pRes2;
+                for (let y = minPY; y <= maxPY; y++) {
+                    const wy = node.minY + (y - 2) * node.cellSize;
+                    const yzOff = zOff + y * pRes;
+                    for (let x = minPX; x <= maxPX; x++) {
+                        const wx = node.minX + (x - 2) * node.cellSize;
+                        let cx = op.x, cy = op.y, cz = op.z;
+                        if (op.hasCapsule && segInvLenSq > 0.0) {
+                            let t = ((wx - op.ax) * segDx + (wy - op.ay) * segDy + (wz - op.az) * segDz) * segInvLenSq;
+                            if (t < 0.0) t = 0.0;
+                            else if (t > 1.0) t = 1.0;
+                            cx = op.ax + t * segDx;
+                            cy = op.ay + t * segDy;
+                            cz = op.az + t * segDz;
+                        }
+                        const adx = Math.abs(wx - cx);
+                        const ady = Math.abs(wy - cy);
+                        const adz = Math.abs(wz - cz);
+                        const lInf = adx > ady ? (adx > adz ? adx : adz) : (ady > adz ? ady : adz);
+                        const dSq = adx * adx + ady * ady + adz * adz;
+                        if (lInf > armorShell && dSq > rSq) continue;
+
+                        const idx = yzOff + x;
+                        let dCur = node.density[idx];
+
+                        // Planar axis-aligned titanium bulkhead CSG cavity:
+                        // squares off curved rock walls into crisp 90-degree orthogonal planes without creating floating islands
+                        if (lInf <= armorShell) {
+                            const dBoxCavity = bulkheadHalf - lInf;
+                            if (dBoxCavity > dCur) {
+                                dCur = dBoxCavity;
+                                node.density[idx] = dCur;
+                                modified = true;
+                            }
+                        }
+
+                        if (dCur < 0.0 && (lInf <= armorShell || dSq <= rSq)) {
+                            if (node.material[idx] !== 3) {
+                                node.material[idx] = 3; // Reinforced Titanium Bulkhead
+                                modified = true;
+                            }
+                            node.hasArmor = true;
+                        }
+                    }
+                }
+            }
+            return modified;
+        }
+
         // Bounded ESM Worker Pool (2..4 workers, QEF Dual Contouring mode, epoch cancellation, crash recovery)
         const workerPool = new MeshingWorkerPool(new URL('workers/surface_nets_worker.js', window.location.href).href);
         window.__POC2_WORKER_POOL__ = workerPool;
         window.__POC2_LEAVES__ = svoLeafMap;
         window.__POC2_GET_LEAVES__ = () => collectLeaves();
+        window.__POC2_OCTREE_STATS__ = () => getOctreeStats();
 
         const leafMaterial = createTriplanarAsteroidMaterial({ vertexColors: true, useMatWeights: true, radius: currentRadius });
         const batchManager = new ChunkBatchManager(null, leafMaterial);
@@ -209,6 +374,7 @@
                 );
                 this.children = null;
                 this.state = 'uninit'; // 'surface' | 'solid' | 'void'
+                this.nodeState = 'empty'; // 'empty' | 'solid' | 'mixed' | 'internal'
                 this.extendFlags = { x: false, y: false, z: false };
                 this.hasMesh = false;
                 this.hasArmor = false;
@@ -254,6 +420,7 @@
 
                 if (cDist - halfDiag > maxCrustR) {
                     this.state = 'void';
+                    this.nodeState = 'empty';
                     this.density = null;
                     this.material = null;
                     return;
@@ -272,6 +439,7 @@
                     }
                     if (!hasEdit) {
                         this.state = 'solid';
+                        this.nodeState = 'solid';
                         this.density = null;
                         this.material = null;
                         return;
@@ -305,6 +473,7 @@
                     const slack = this.level >= 2 ? 20.0 : 45.0;
                     if (cDist - halfDiag > currentRadius + maxOff + slack) {
                         this.state = 'void';
+                        this.nodeState = 'empty';
                         this.density = null;
                         this.material = null;
                         return;
@@ -320,6 +489,7 @@
                         }
                         if (!hasEdit) {
                             this.state = 'solid';
+                            this.nodeState = 'solid';
                             this.density = null;
                             this.material = null;
                             return;
@@ -441,35 +611,7 @@
                             }
                         }
                     } else if (op.type === 'reinforce') {
-                        const rSq = op.radius * op.radius;
-                        const minPX = Math.max(0, Math.floor((op.minX - op.radius - this.minX) * invCell + 2));
-                        const maxPX = Math.min(pRes - 1, Math.ceil((op.maxX + op.radius - this.minX) * invCell + 2));
-                        const minPY = Math.max(0, Math.floor((op.minY - op.radius - this.minY) * invCell + 2));
-                        const maxPY = Math.min(pRes - 1, Math.ceil((op.maxY + op.radius - this.minY) * invCell + 2));
-                        const minPZ = Math.max(0, Math.floor((op.minZ - op.radius - this.minZ) * invCell + 2));
-                        const maxPZ = Math.min(pRes - 1, Math.ceil((op.maxZ + op.radius - this.minZ) * invCell + 2));
-                        if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) continue;
-                        for (let z = minPZ; z <= maxPZ; z++) {
-                            const wz = this.minZ + (z - 2) * this.cellSize;
-                            const dz = wz - op.z;
-                            const zOff = z * pRes2;
-                            for (let y = minPY; y <= maxPY; y++) {
-                                const wy = this.minY + (y - 2) * this.cellSize;
-                                const dy = wy - op.y;
-                                const yzOff = zOff + y * pRes;
-                                for (let x = minPX; x <= maxPX; x++) {
-                                    const wx = this.minX + (x - 2) * this.cellSize;
-                                    const dSq = op.hasCapsule
-                                        ? distPointToSegmentSq(wx, wy, wz, op.ax, op.ay, op.az, op.x, op.y, op.z)
-                                        : ((wx - op.x) * (wx - op.x) + dy * dy + dz * dz);
-                                    const dIdx = yzOff + x;
-                                    if (dSq <= rSq && this.density[dIdx] < 0.0) {
-                                        this.material[dIdx] = 3;
-                                        this.hasArmor = true;
-                                    }
-                                }
-                            }
-                        }
+                        applyReinforceBulkheadToNode(this, op);
                     }
                 }
 
@@ -482,8 +624,10 @@
                 }
                 if (hasNeg && hasPos) {
                     this.state = 'surface';
+                    this.nodeState = 'mixed';
                 } else {
                     this.state = hasNeg ? 'solid' : 'void';
+                    this.nodeState = hasNeg ? 'solid' : 'empty';
                     this.density = null;
                     this.material = null;
                 }
@@ -510,15 +654,16 @@
                     }
                     if (this.density && !this.hasArmor) {
                         let hasNeg = false;
+                        let hasPos = false;
                         const dArr = this.density;
                         for (let i = 0; i < dArr.length; i++) {
-                            if (dArr[i] < 0.0) {
-                                hasNeg = true;
-                                break;
-                            }
+                            if (dArr[i] < 0.0) hasNeg = true;
+                            else hasPos = true;
+                            if (hasNeg && hasPos) break;
                         }
-                        if (!hasNeg) {
-                            this.state = 'void';
+                        if (!hasNeg || !hasPos) {
+                            this.state = hasNeg ? 'solid' : 'void';
+                            this.nodeState = hasNeg ? 'solid' : 'empty';
                             this.density = null;
                             this.material = null;
                         }
@@ -633,6 +778,7 @@
             workerPool.setEpoch(worldEpoch);
             opSerialChain = Promise.resolve();
             editHistory.length = 0;
+            collapsedSubtreeCount = 0;
             batchManager.setScene(scene);
             batchManager.clear();
             svoLeafMap.clear();
@@ -679,6 +825,7 @@
             node.needsRebuild = false;
             node.density = null;
             node.material = null;
+            node.nodeState = 'internal';
             node.children = new Array(8);
             splitNodes.push(node);
 
@@ -700,6 +847,7 @@
                         node.children[cIdx++] = child;
                         if (child.isDefinitelyVoid()) {
                             child.state = 'void';
+                            child.nodeState = 'empty';
                             newLeaves.push(child);
                         } else if (
                             child.cellSize > FINE_CELL_LIMIT &&
@@ -923,6 +1071,16 @@
                         entry.value.leaf.applyMeshResult(sandbox.scene, entry.value.result, { deferFlush: true });
                     }
                 }
+                for (let lz = minLZ; lz <= maxLZ; lz++) {
+                    for (let ly = minLY; ly <= maxLY; ly++) {
+                        for (let lx = minLX; lx <= maxLX; lx++) {
+                            const root = svoLeafMap.get(`0:${lx},${ly},${lz}`);
+                            if (root && root.children !== null) {
+                                collapseOctreeNode(root);
+                            }
+                        }
+                    }
+                }
                 batchManager.flush(sandbox.scene);
                 return { mainThreadMs };
             });
@@ -973,42 +1131,7 @@
                         return;
                     }
 
-                    const pRes = node.pRes;
-                    const pRes2 = node.pRes2;
-                    const invCell = 1.0 / node.cellSize;
-                    const rSq = op.radius * op.radius;
-                    const minPX = Math.max(0, Math.floor((op.minX - op.radius - node.minX) * invCell + 2));
-                    const maxPX = Math.min(pRes - 1, Math.ceil((op.maxX + op.radius - node.minX) * invCell + 2));
-                    const minPY = Math.max(0, Math.floor((op.minY - op.radius - node.minY) * invCell + 2));
-                    const maxPY = Math.min(pRes - 1, Math.ceil((op.maxY + op.radius - node.minY) * invCell + 2));
-                    const minPZ = Math.max(0, Math.floor((op.minZ - op.radius - node.minZ) * invCell + 2));
-                    const maxPZ = Math.min(pRes - 1, Math.ceil((op.maxZ + op.radius - node.minZ) * invCell + 2));
-                    if (minPX > maxPX || minPY > maxPY || minPZ > maxPZ) return;
-
-                    let modified = false;
-                    for (let z = minPZ; z <= maxPZ; z++) {
-                        const wz = node.minZ + (z - 2) * node.cellSize;
-                        const dz = wz - op.z;
-                        const zOff = z * pRes2;
-                        for (let y = minPY; y <= maxPY; y++) {
-                            const wy = node.minY + (y - 2) * node.cellSize;
-                            const dy = wy - op.y;
-                            const yzOff = zOff + y * pRes;
-                            for (let x = minPX; x <= maxPX; x++) {
-                                const wx = node.minX + (x - 2) * node.cellSize;
-                                const dSq = op.hasCapsule
-                                    ? distPointToSegmentSq(wx, wy, wz, op.ax, op.ay, op.az, op.x, op.y, op.z)
-                                    : ((wx - op.x) * (wx - op.x) + dy * dy + dz * dz);
-                                const idx = yzOff + x;
-                                if (dSq <= rSq && node.density[idx] < 0.0) {
-                                    node.material[idx] = 3; // Reinforced Titanium Bulkhead
-                                    node.hasArmor = true;
-                                    modified = true;
-                                }
-                            }
-                        }
-                    }
-                    if (modified) {
+                    if (applyReinforceBulkheadToNode(node, op)) {
                         recontourLeaves.add(node);
                     }
                 }
@@ -1054,6 +1177,16 @@
                     const entry = settled[i];
                     if (entry.status === 'fulfilled' && entry.value && entry.value.leaf && entry.value.result) {
                         entry.value.leaf.applyMeshResult(sandbox.scene, entry.value.result, { deferFlush: true });
+                    }
+                }
+                for (let lz = minLZ; lz <= maxLZ; lz++) {
+                    for (let ly = minLY; ly <= maxLY; ly++) {
+                        for (let lx = minLX; lx <= maxLX; lx++) {
+                            const root = svoLeafMap.get(`0:${lx},${ly},${lz}`);
+                            if (root && root.children !== null) {
+                                collapseOctreeNode(root);
+                            }
+                        }
                     }
                 }
                 batchManager.flush(sandbox.scene);
