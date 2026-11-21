@@ -515,7 +515,12 @@ export class PlanetaryBaseSandbox {
 
         // Machinery & Exterior nodes collection
         this.placedMachinery = [];
+        this.shieldBubbles = [];
         this.orbitalNodes = [];
+        this.harvestedOre = 0;
+        this.isHudVisible = true;
+        this._upVec = new THREE.Vector3(0, 1, 0);
+        this._previewNorm = new THREE.Vector3();
 
         this.initThree();
         this.initClippingPlanes();
@@ -695,6 +700,45 @@ export class PlanetaryBaseSandbox {
         this.brushCursorMesh.visible = false;
         this.brushCursorMesh.raycast = () => {}; // Never intercept tool raycasts
         this.scene.add(this.brushCursorMesh);
+
+        // Holographic Machinery Placement Preview (surface-normal-aligned translucent cyan wireframe)
+        this.machineryPreviewMesh = new THREE.Group();
+        this.machineryPreviewMat = new THREE.MeshBasicMaterial({
+            color: 0x00ffdd,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.48,
+            depthWrite: false
+        });
+        const holoBaseGeo = new THREE.CylinderGeometry(20, 24, 10, 12);
+        holoBaseGeo.translate(0, 5, 0);
+        const holoBase = new THREE.Mesh(holoBaseGeo, this.machineryPreviewMat);
+        holoBase.raycast = () => {};
+        this.machineryPreviewMesh.add(holoBase);
+
+        const holoDomeGeo = new THREE.SphereGeometry(20, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.5);
+        holoDomeGeo.translate(0, 10, 0);
+        const holoDome = new THREE.Mesh(holoDomeGeo, this.machineryPreviewMat);
+        holoDome.raycast = () => {};
+        this.machineryPreviewMesh.add(holoDome);
+
+        const holoRingGeo = new THREE.RingGeometry(26, 30, 24);
+        holoRingGeo.rotateX(-Math.PI / 2);
+        const holoRingMat = new THREE.MeshBasicMaterial({
+            color: 0x00ffff,
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0.55,
+            depthWrite: false
+        });
+        const holoRing = new THREE.Mesh(holoRingGeo, holoRingMat);
+        holoRing.position.y = 0.5;
+        holoRing.raycast = () => {};
+        this.machineryPreviewMesh.add(holoRing);
+
+        this.machineryPreviewMesh.visible = false;
+        this.machineryPreviewMesh.raycast = () => {};
+        this.scene.add(this.machineryPreviewMesh);
     }
 
     initShip() {
@@ -745,7 +789,14 @@ export class PlanetaryBaseSandbox {
             const node = new THREE.Mesh(nodeGeo, mat);
             node.position.set(Math.cos(angle) * dist, (Math.sin(i * 4.1) * 300), Math.sin(angle) * dist);
             node.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, 0);
-            node.userData = { orbitAngle: angle, orbitDist: dist, orbitSpeed: 0.0008 + Math.random() * 0.0006 };
+            node.userData = {
+                orbitAngle: angle,
+                orbitDist: dist,
+                orbitSpeed: 0.0008 + Math.random() * 0.0006,
+                maxHp: 5,
+                hp: 5,
+                oreYield: 25
+            };
             this.orbitalNodesGroup.add(node);
             this.orbitalNodes.push(node);
         }
@@ -835,7 +886,7 @@ export class PlanetaryBaseSandbox {
 
             <!-- Controls Hint -->
             <div style="background:rgba(0, 40, 60, 0.45); border:1px solid rgba(0, 240, 255, 0.22); border-radius:5px; padding:5px 8px; margin-bottom:8px; font-size:10px; color:#93c5fd; line-height:1.45;">
-                <b>Mouse Drag:</b> Rotate &bull; <b>WASD / Q E:</b> Move Camera &bull; <b>Space:</b> Fire Laser
+                <b>Mouse Drag:</b> Rotate &bull; <b>WASD/QE:</b> Move &bull; <b>Space:</b> Fire &bull; <b>[ / ]:</b> Brush &bull; <b>[H]:</b> HUD
             </div>
 
             <!-- Tool Selector -->
@@ -946,9 +997,13 @@ export class PlanetaryBaseSandbox {
                     <span>Triangles / Draws:</span>
                     <span id="tel-tris" style="color:#93c5fd;">0 / 0</span>
                 </div>
-                <div style="display:flex; justify-content:space-between;">
+                <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
                     <span>Subterranean Machinery:</span>
                     <span id="tel-machinery-count" style="color:#38bdf8;">0 installed</span>
+                </div>
+                <div style="display:flex; justify-content:space-between;">
+                    <span>Harvested Orbital Ore:</span>
+                    <span id="tel-ore" style="color:#fbbf24; font-weight:bold;">0 u</span>
                 </div>
             </div>
 
@@ -959,6 +1014,20 @@ export class PlanetaryBaseSandbox {
         `;
         document.body.appendChild(this.hud);
 
+        // Subtle restore pill shown only when HUD is toggled off with [H]
+        this.hudRestorePill = document.createElement('button');
+        this.hudRestorePill.id = 'sandbox-hud-pill';
+        this.hudRestorePill.type = 'button';
+        this.hudRestorePill.innerText = 'Press [H] to show HUD';
+        this.hudRestorePill.style.cssText = `
+            display: none; position: absolute; top: 12px; left: 12px; z-index: 100;
+            background: rgba(10, 16, 28, 0.78); border: 1px solid rgba(0, 240, 255, 0.35);
+            border-radius: 999px; padding: 5px 12px; font-family: monospace; font-size: 11px;
+            color: #93c5fd; cursor: pointer; user-select: none; backdrop-filter: blur(6px);
+        `;
+        this.hudRestorePill.addEventListener('click', () => this.toggleHUD());
+        document.body.appendChild(this.hudRestorePill);
+
         // Cache all HUD DOM references once to eliminate per-frame/per-event querySelector lookups
         this._hudEls = {
             status: this.hud.querySelector('#hud-status'),
@@ -968,6 +1037,7 @@ export class PlanetaryBaseSandbox {
             carve: this.hud.querySelector('#tel-carve-dur'),
             cellSize: this.hud.querySelector('#tel-cell-size'),
             machineryCount: this.hud.querySelector('#tel-machinery-count'),
+            ore: this.hud.querySelector('#tel-ore'),
             raiderAlert: this.hud.querySelector('#raider-alert'),
             sliderRadius: this.hud.querySelector('#slider-radius'),
             lblRadius: this.hud.querySelector('#lbl-radius'),
@@ -1108,6 +1178,9 @@ export class PlanetaryBaseSandbox {
             if (e.key === '3') this.setActiveTool('raider');
             if (e.key === '4') this.setActiveTool('breach');
             if (e.key === '5') this.setActiveTool('machinery');
+            if (e.key === '[') this.adjustBrushRadius(-20);
+            if (e.key === ']') this.adjustBrushRadius(20);
+            if (k === 'h') this.toggleHUD();
             if (k === 'v') this.toggleWireframe();
             if (k === 'x') this.toggleXRay();
             if (k === 'f') this.toggleFlightMode();
@@ -1157,6 +1230,33 @@ export class PlanetaryBaseSandbox {
         this.sparkMat.color.setHex(activeColor);
         if (this.brushCursorMat) {
             this.brushCursorMat.color.setHex(activeColor);
+        }
+        if (tool === 'machinery') {
+            if (this.brushCursorMesh) this.brushCursorMesh.visible = false;
+        } else {
+            if (this.machineryPreviewMesh) this.machineryPreviewMesh.visible = false;
+        }
+        this._brushDirty = true;
+    }
+
+    adjustBrushRadius(delta) {
+        const nextRadius = Math.max(40, Math.min(360, Math.round(this.brushRadius + delta)));
+        this.brushRadius = nextRadius;
+        if (this._hudEls?.sliderRadius) this._hudEls.sliderRadius.value = String(nextRadius);
+        if (this._hudEls?.lblRadius) this._hudEls.lblRadius.innerText = `${nextRadius}u`;
+        if (this.brushCursorMesh && this.brushCursorMesh.visible) {
+            this.brushCursorMesh.scale.setScalar(nextRadius);
+        }
+        this._brushDirty = true;
+    }
+
+    toggleHUD() {
+        this.isHudVisible = !this.isHudVisible;
+        if (this.hud) {
+            this.hud.style.display = this.isHudVisible ? '' : 'none';
+        }
+        if (this.hudRestorePill) {
+            this.hudRestorePill.style.display = this.isHudVisible ? 'none' : 'block';
         }
     }
 
@@ -1239,6 +1339,7 @@ export class PlanetaryBaseSandbox {
 
             this._currentCamArmDist = 52.5;
             if (this.brushCursorMesh) this.brushCursorMesh.visible = false;
+            if (this.machineryPreviewMesh) this.machineryPreviewMesh.visible = false;
             if (this.laserBeam) this.laserBeam.visible = false;
             if (this.sparkPoints) this.sparkPoints.visible = false;
             if (this.alignmentMarker) this.alignmentMarker.visible = false;
@@ -1346,6 +1447,7 @@ export class PlanetaryBaseSandbox {
             this._brushDirty = false;
             this._lastToolHit = null;
             if (this.brushCursorMesh) this.brushCursorMesh.visible = false;
+            if (this.machineryPreviewMesh) this.machineryPreviewMesh.visible = false;
         });
 
         dom.addEventListener('pointerup', () => {
@@ -1395,8 +1497,30 @@ export class PlanetaryBaseSandbox {
     }
 
     updateBrushPreview() {
-        if (!this.brushCursorMesh) return;
         const hit = this.performRaycast();
+        if (this.activeTool === 'machinery') {
+            if (this.brushCursorMesh) this.brushCursorMesh.visible = false;
+            if (!this.machineryPreviewMesh) return;
+            if (hit && hit.point) {
+                if (hit.face && hit.object) {
+                    this._previewNorm.copy(hit.face.normal).transformDirection(hit.object.matrixWorld).normalize();
+                } else if (hit.normal) {
+                    this._previewNorm.copy(hit.normal).normalize();
+                } else {
+                    this._previewNorm.copy(hit.point).normalize();
+                }
+                if (this._previewNorm.lengthSq() < 1e-8) this._previewNorm.set(0, 1, 0);
+                this.machineryPreviewMesh.position.copy(hit.point);
+                this.machineryPreviewMesh.quaternion.setFromUnitVectors(this._upVec, this._previewNorm);
+                this.machineryPreviewMesh.visible = true;
+            } else {
+                this.machineryPreviewMesh.visible = false;
+            }
+            return;
+        }
+
+        if (this.machineryPreviewMesh) this.machineryPreviewMesh.visible = false;
+        if (!this.brushCursorMesh) return;
         if (hit && hit.point) {
             this.brushCursorMesh.position.copy(hit.point);
             this.brushCursorMesh.scale.setScalar(this.brushRadius);
@@ -1404,6 +1528,66 @@ export class PlanetaryBaseSandbox {
         } else {
             this.brushCursorMesh.visible = false;
         }
+    }
+
+    raycastOrbitalNodes() {
+        if (!this.orbitalNodes || this.orbitalNodes.length === 0) return null;
+        if (this.isFlightMode) {
+            this._flightRaycaster.near = 0.0;
+            this._flightRaycaster.far = 450;
+            this._flightRaycaster.set(this.shipGroup.position, this._shipForward);
+            const hits = this._flightRaycaster.intersectObjects(this.orbitalNodes, false);
+            return hits.length > 0 ? hits[0] : null;
+        }
+        this.raycaster.near = 0.1;
+        this.raycaster.far = Infinity;
+        this.raycaster.setFromCamera(this.mousePos, this.camera);
+        const hits = this.raycaster.intersectObjects(this.orbitalNodes, false);
+        return hits.length > 0 ? hits[0] : null;
+    }
+
+    harvestOrbitalNode(nodeHit) {
+        const node = nodeHit.object;
+        const hitPoint = nodeHit.point;
+        const hitNormal = nodeHit.face
+            ? nodeHit.face.normal.clone().transformDirection(node.matrixWorld).normalize()
+            : hitPoint.clone().sub(node.position).normalize();
+
+        const origin = this.isFlightMode
+            ? this.shipGroup.position
+            : this.camera.position.clone().add(new THREE.Vector3(0, -20, 0));
+        this.renderLaserBeam(origin, hitPoint);
+        this.spawnSparks(hitPoint, hitNormal, 30);
+
+        if (node.userData.maxHp === undefined) node.userData.maxHp = 5;
+        if (node.userData.hp === undefined) node.userData.hp = node.userData.maxHp;
+        const oreGain = node.userData.oreYield || 25;
+
+        node.userData.hp -= 1;
+        this.harvestedOre += oreGain;
+        if (this._hudEls?.ore) {
+            this._hudEls.ore.innerText = `${this.harvestedOre} u`;
+        }
+
+        if (node.userData.hp <= 0) {
+            // Depleted: flash burst & respawn at a fresh orbital angle
+            this.spawnSparks(node.position, hitNormal, 65);
+            node.userData.orbitAngle = (node.userData.orbitAngle || 0) + Math.PI * (0.65 + Math.random() * 0.7);
+            const dist = node.userData.orbitDist || (this.currentRadius * 1.55);
+            node.position.set(
+                Math.cos(node.userData.orbitAngle) * dist,
+                (Math.random() - 0.5) * 600,
+                Math.sin(node.userData.orbitAngle) * dist
+            );
+            node.userData.hp = node.userData.maxHp;
+            node.scale.setScalar(1.0);
+        } else {
+            const scaleRatio = Math.max(0.45, node.userData.hp / node.userData.maxHp);
+            node.scale.setScalar(scaleRatio);
+        }
+
+        this._lastToolHit = null;
+        this.lastCarveTick = performance.now();
     }
 
     updateMousePos(e) {
@@ -1559,6 +1743,20 @@ export class PlanetaryBaseSandbox {
         if (recordBenchmark) this._pendingBenchmarkCarves++;
         try {
             const hit = forcedHit || this.performRaycast();
+
+            // Check exterior orbital resource node harvesting when using carve or raider laser
+            if (!forcedHit && (this.activeTool === 'carve' || this.activeTool === 'raider')) {
+                const nodeHit = this.raycastOrbitalNodes();
+                if (nodeHit && (!hit || nodeHit.distance < hit.distance)) {
+                    if (this.brushCursorMesh) {
+                        this.brushCursorMesh.visible = false;
+                        this._brushDirty = false;
+                    }
+                    this.harvestOrbitalNode(nodeHit);
+                    return;
+                }
+            }
+
             if (!hit) {
                 this._lastToolHit = null;
                 this.laserBeam.visible = false;
@@ -1569,14 +1767,32 @@ export class PlanetaryBaseSandbox {
                     this.brushCursorMesh.visible = false;
                     this._brushDirty = false;
                 }
+                if (this.machineryPreviewMesh && !forcedHit) {
+                    this.machineryPreviewMesh.visible = false;
+                    this._brushDirty = false;
+                }
                 return;
             }
 
-            if (this.brushCursorMesh && !this.isFlightMode && !this.isBenchmarkMode && hit.point) {
-                this.brushCursorMesh.position.copy(hit.point);
-                this.brushCursorMesh.scale.setScalar(this.brushRadius);
-                this.brushCursorMesh.visible = true;
-                this._brushDirty = false;
+            if (!this.isFlightMode && !this.isBenchmarkMode && hit.point) {
+                if (this.activeTool === 'machinery') {
+                    if (this.brushCursorMesh) this.brushCursorMesh.visible = false;
+                    if (this.machineryPreviewMesh) {
+                        const n = hit.face && hit.object
+                            ? this._previewNorm.copy(hit.face.normal).transformDirection(hit.object.matrixWorld).normalize()
+                            : (hit.normal ? this._previewNorm.copy(hit.normal).normalize() : this._previewNorm.copy(hit.point).normalize());
+                        this.machineryPreviewMesh.position.copy(hit.point);
+                        this.machineryPreviewMesh.quaternion.setFromUnitVectors(this._upVec, n);
+                        this.machineryPreviewMesh.visible = true;
+                    }
+                    this._brushDirty = false;
+                } else if (this.brushCursorMesh) {
+                    if (this.machineryPreviewMesh) this.machineryPreviewMesh.visible = false;
+                    this.brushCursorMesh.position.copy(hit.point);
+                    this.brushCursorMesh.scale.setScalar(this.brushRadius);
+                    this.brushCursorMesh.visible = true;
+                    this._brushDirty = false;
+                }
             }
 
             const hitPoint = hit.point;
@@ -1767,8 +1983,28 @@ export class PlanetaryBaseSandbox {
 
         // Align with surface normal
         const up = new THREE.Vector3(0, 1, 0);
-        const quat = new THREE.Quaternion().setFromUnitVectors(up, normal);
+        const normUnit = normal.clone().normalize();
+        const quat = new THREE.Quaternion().setFromUnitVectors(up, normUnit);
         mesh.quaternion.copy(quat);
+
+        // Attach translucent pulsing cyan/blue energy shield bubble for Shield Generator Dome
+        if (this.selectedMachinery === 'shield') {
+            const shieldGeo = new THREE.SphereGeometry(140, 24, 16);
+            const shieldMat = new THREE.MeshBasicMaterial({
+                color: 0x00d8ff,
+                transparent: true,
+                opacity: 0.16,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending,
+                side: THREE.DoubleSide
+            });
+            const shieldBubble = new THREE.Mesh(shieldGeo, shieldMat);
+            shieldBubble.name = 'shield-energy-field';
+            shieldBubble.raycast = () => {};
+            shieldBubble.userData.phase = Math.random() * Math.PI * 2;
+            mesh.add(shieldBubble);
+            this.shieldBubbles.push(shieldBubble);
+        }
 
         this.scene.add(mesh);
         this.placedMachinery.push(mesh);
@@ -1777,7 +2013,7 @@ export class PlanetaryBaseSandbox {
         }
 
         // Small placement spark burst
-        this.spawnSparks(point, normal, 50);
+        this.spawnSparks(point, normUnit, 50);
     }
 
     flashRaiderAlert() {
@@ -2271,6 +2507,17 @@ export class PlanetaryBaseSandbox {
             node.rotation.x += 0.005;
             node.rotation.y += 0.008;
         });
+
+        // Gently pulse Shield Generator Dome energy fields
+        if (this.shieldBubbles.length > 0) {
+            const pulseT = now * 0.0025;
+            for (let i = 0; i < this.shieldBubbles.length; i++) {
+                const bubble = this.shieldBubbles[i];
+                const wave = Math.sin(pulseT + (bubble.userData.phase || 0));
+                bubble.material.opacity = 0.14 + 0.04 * wave;
+                bubble.scale.setScalar(1.0 + 0.025 * wave);
+            }
+        }
 
         // Update Ship physics if flight mode is on
         this.updateShipPhysics(dt);

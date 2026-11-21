@@ -85,12 +85,33 @@
     .modal-body {
       padding: 24px; overflow-y: auto; font-size: 14px; line-height: 1.6; color: #cbd5e1;
     }
-    .modal-body h1, .modal-body h2, .modal-body h3 { color: #00f0ff; margin-top: 1.5em; }
-    .modal-body code { background: #1e293b; padding: 2px 6px; border-radius: 4px; color: #f59e0b; font-family: monospace; }
-    .modal-body pre { background: #070b14; padding: 12px; border-radius: 6px; border: 1px solid #1e293b; overflow-x: auto; }
-    .modal-body table { width: 100%; border-collapse: collapse; margin: 16px 0; }
-    .modal-body th, .modal-body td { border: 1px solid #1e293b; padding: 8px 12px; text-align: left; }
-    .modal-body th { background: #0f172a; color: #00f0ff; }
+    .modal-body h1, .modal-body h2, .modal-body h3, .modal-body h4 { color: #00f0ff; margin-top: 1.4em; margin-bottom: 0.5em; }
+    .modal-body code { background: #1e293b; padding: 2px 6px; border-radius: 4px; color: #f59e0b; font-family: monospace; font-size: 0.92em; }
+    .modal-body pre.md-code {
+      background: #070b14; padding: 14px 16px; border-radius: 8px;
+      border: 1px solid #1e3050; overflow-x: auto; margin: 14px 0;
+      box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.45);
+    }
+    .modal-body pre.md-code code {
+      background: transparent; padding: 0; border-radius: 0;
+      color: #a5f3fc; font-size: 12.5px; line-height: 1.55; display: block; white-space: pre;
+    }
+    .modal-body .md-table-wrap {
+      width: 100%; overflow-x: auto; margin: 16px 0;
+      border: 1px solid #1e3050; border-radius: 8px; background: rgba(7, 11, 20, 0.72);
+    }
+    .modal-body .md-table {
+      width: 100%; border-collapse: collapse; margin: 0; font-size: 12.5px;
+    }
+    .modal-body .md-table th, .modal-body .md-table td {
+      border: 1px solid #1e293b; padding: 8px 12px; text-align: left; vertical-align: top;
+    }
+    .modal-body .md-table th {
+      background: #0f172a; color: #00f0ff; font-weight: bold; white-space: nowrap;
+    }
+    .modal-body .md-table tbody tr:nth-child(even) { background: rgba(15, 23, 42, 0.55); }
+    .modal-body .md-table tbody tr:hover { background: rgba(0, 240, 255, 0.06); }
+    .modal-body hr { border: none; border-top: 1px solid #1e293b; margin: 18px 0; }
   </style>
 </head>
 <body>
@@ -771,16 +792,111 @@
       synthesis: '../reports/COMPARATIVE_SYNTHESIS_AND_RECOMMENDATIONS.md'
     };
 
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function formatInlineMarkdown(text) {
+      const inlineCodes = [];
+      let out = text.replace(/`([^`]+)`/g, (_, code) => {
+        const idx = inlineCodes.length;
+        inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
+        return `\u0000IC${idx}\u0000`;
+      });
+      out = out
+        .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+        .replace(/\*(.+?)\*/g, '<i>$1</i>')
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:#38bdf8;">$1</a>');
+      return out.replace(/\u0000IC(\d+)\u0000/g, (_, idx) => inlineCodes[Number(idx)]);
+    }
+
+    function splitTableRow(line) {
+      const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+      return trimmed.split('|').map(cell => cell.trim());
+    }
+
+    function isTableSeparatorRow(line) {
+      const trimmed = line.trim();
+      if (!trimmed.includes('|')) return false;
+      const cells = splitTableRow(trimmed);
+      return cells.length > 0 && cells.every(c => /^:?-{3,}:?$/.test(c));
+    }
+
     function parseSimpleMarkdown(md) {
-      let html = md
+      const normalized = String(md || '').replace(/\r\n/g, '\n');
+
+      // 1. Extract fenced code blocks before any table or inline transforms
+      const codeBlocks = [];
+      const withoutCode = normalized.replace(/```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
+        const idx = codeBlocks.length;
+        const langClass = lang ? ` class="language-${escapeHtml(lang)}"` : '';
+        codeBlocks.push(`<pre class="md-code"><code${langClass}>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
+        return `\n@@CODE_BLOCK_${idx}@@\n`;
+      });
+
+      // 2. Extract GitHub-style Markdown tables line-by-line
+      const tableBlocks = [];
+      const lines = withoutCode.split('\n');
+      const outLines = [];
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        const nextLine = i + 1 < lines.length ? lines[i + 1] : '';
+        if (line.includes('|') && isTableSeparatorRow(nextLine)) {
+          const headers = splitTableRow(line);
+          const aligns = splitTableRow(nextLine).map(sep => {
+            if (sep.startsWith(':') && sep.endsWith(':')) return 'center';
+            if (sep.endsWith(':')) return 'right';
+            return 'left';
+          });
+          i += 2;
+          const bodyRows = [];
+          while (i < lines.length && lines[i].trim() !== '' && lines[i].includes('|') && !lines[i].trim().startsWith('@@CODE_BLOCK_')) {
+            bodyRows.push(splitTableRow(lines[i]));
+            i++;
+          }
+          const theadHtml = '<thead><tr>' + headers.map((h, ci) => {
+            const al = aligns[ci] || 'left';
+            return `<th style="text-align:${al};">${formatInlineMarkdown(h)}</th>`;
+          }).join('') + '</tr></thead>';
+          const tbodyHtml = '<tbody>' + bodyRows.map(row => {
+            return '<tr>' + headers.map((_, ci) => {
+              const al = aligns[ci] || 'left';
+              const val = ci < row.length ? row[ci] : '';
+              return `<td style="text-align:${al};">${formatInlineMarkdown(val)}</td>`;
+            }).join('') + '</tr>';
+          }).join('') + '</tbody>';
+          const tIdx = tableBlocks.length;
+          tableBlocks.push(`<div class="md-table-wrap"><table class="md-table">${theadHtml}${tbodyHtml}</table></div>`);
+          outLines.push(`@@TABLE_BLOCK_${tIdx}@@`);
+        } else {
+          outLines.push(line);
+          i++;
+        }
+      }
+
+      // 3. Apply block & inline transforms to non-table/non-code lines
+      let html = outLines.join('\n')
+        .replace(/^#### (.*$)/gim, '<h4>$1</h4>')
         .replace(/^### (.*$)/gim, '<h3>$1</h3>')
         .replace(/^## (.*$)/gim, '<h2>$1</h2>')
         .replace(/^# (.*$)/gim, '<h1>$1</h1>')
-        .replace(/\*\*(.*?)\*\*/gim, '<b>$1</b>')
-        .replace(/\*(.*?)\*/gim, '<i>$1</i>')
-        .replace(/`([^`]+)`/gim, '<code>$1</code>')
-        .replace(/\n\n/gim, '<p></p>')
-        .replace(/\n/gim, '<br>');
+        .replace(/^---$/gim, '<hr>');
+
+      html = formatInlineMarkdown(html)
+        .replace(/\n\n+/g, '<p></p>')
+        .replace(/\n/g, '<br>');
+
+      // Clean up stray <br> around block placeholders & headings
+      html = html
+        .replace(/(?:<br>)*@@TABLE_BLOCK_(\d+)@@(?:<br>)*/g, (_, idx) => tableBlocks[Number(idx)])
+        .replace(/(?:<br>)*@@CODE_BLOCK_(\d+)@@(?:<br>)*/g, (_, idx) => codeBlocks[Number(idx)]);
+
       return html;
     }
 

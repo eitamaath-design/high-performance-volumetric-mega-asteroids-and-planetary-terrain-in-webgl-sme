@@ -556,8 +556,43 @@
             return outGrad;
         }
 
+        function showWebGL2RequiredNotice() {
+            if (document.getElementById('webgl2-guard-overlay')) return;
+            const overlay = document.createElement('div');
+            overlay.id = 'webgl2-guard-overlay';
+            overlay.style.cssText = `
+                position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center;
+                background: rgba(4, 6, 12, 0.94); backdrop-filter: blur(8px); padding: 24px;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace, sans-serif; color: #e2e8f0;
+            `;
+            overlay.innerHTML = `
+                <div style="max-width: 560px; width: 100%; background: rgba(13, 20, 36, 0.96); border: 1px solid rgba(0, 240, 255, 0.45); border-radius: 12px; padding: 24px 28px; box-shadow: 0 0 36px rgba(0, 240, 255, 0.18);">
+                    <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+                        <span style="display:inline-block; padding:3px 8px; border-radius:4px; background:rgba(245, 158, 11, 0.15); border:1px solid rgba(245, 158, 11, 0.45); color:#fbbf24; font-size:11px; font-weight:bold;">WEBGL2 REQUIRED</span>
+                        <h2 style="margin:0; font-size:16px; color:#00f0ff;">Option 4: 3D GPU SDF Raymarching Unavailable</h2>
+                    </div>
+                    <p style="font-size:13px; line-height:1.6; color:#cbd5e1; margin:0 0 14px 0;">
+                        Option 4 relies on WebGL2 <code>Data3DTexture</code> (<code>sampler3D</code>) and GLSL 3.00 ES shaders for real-time C² tricubic B-spline volume raymarching. Your current browser or GPU context does not expose WebGL2.
+                    </p>
+                    <p style="font-size:12px; color:#94a3b8; margin:0 0 12px 0;">
+                        You can switch directly to any of the mesh-based architectures that run on WebGL1 &amp; WebGL2:
+                    </p>
+                    <div style="display:flex; flex-direction:column; gap:8px;">
+                        <a href="poc1_chunked_octree_surface_nets.html" style="display:block; padding:10px 14px; border-radius:8px; background:#0f172a; border:1px solid #38bdf8; color:#38bdf8; text-decoration:none; font-size:12px; font-weight:bold;">Option 1: Chunked Octree Surface Nets + Web Workers &rarr;</a>
+                        <a href="poc2_sparse_voxel_octree_mesh_patching.html" style="display:block; padding:10px 14px; border-radius:8px; background:#0f172a; border:1px solid #fbbf24; color:#fbbf24; text-decoration:none; font-size:12px; font-weight:bold;">Option 2: Adaptive QEF SVO + Dual Contouring &rarr;</a>
+                        <a href="poc3_hierarchical_lod_clipmaps.html" style="display:block; padding:10px 14px; border-radius:8px; background:#0f172a; border:1px solid #34d399; color:#34d399; text-decoration:none; font-size:12px; font-weight:bold;">Option 3: Clipmap Macro Shell &amp; Subterranean Manifolds &rarr;</a>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+        }
+
         // Setup Raymarching Volume Mesh
         function setupRaymarcher(scene) {
+            if (!sandbox || !sandbox.renderer || !sandbox.renderer.capabilities || !sandbox.renderer.capabilities.isWebGL2) {
+                showWebGL2RequiredNotice();
+                return false;
+            }
             if (sandbox && sandbox.renderer) {
                 const gl = sandbox.renderer.getContext();
                 if (gl) {
@@ -1027,6 +1062,7 @@
             volumeBoxMesh = new THREE.Mesh(boxGeo, raymarchMaterial);
             volumeBoxMesh.frustumCulled = false;
             scene.add(volumeBoxMesh);
+            return true;
         }
 
         function carveSpherePoC4(hitPoint, brushRadius, mode = 'carve', prevHit = null) {
@@ -1374,8 +1410,10 @@
         }
         window.measureVisualCollisionError = measureVisualCollisionError;
 
-        // Shared Sandbox Setup
-        const sandbox = new PlanetaryBaseSandbox({
+        // Shared Sandbox Setup (with non-crashing WebGL2 fallback guard)
+        let sandbox = null;
+        try {
+            sandbox = new PlanetaryBaseSandbox({
             pocId: 'poc4',
             pocTitle: 'Option 4: 3D GPU SDF Raymarching',
             defaultRadius: currentRadius,
@@ -1397,6 +1435,7 @@
 
             // Analytical CPU C2 B-Spline Sphere-Marching Raycast (< 0.001u parity with GPU shader)
             customRaycast: (raycaster, camera, mousePos) => {
+                if (!raymarchMaterial || !volumeTexture) return null;
                 if (camera && mousePos) {
                     raycaster.setFromCamera(mousePos, camera);
                 }
@@ -1528,15 +1567,23 @@
                     raymarchMaterial.uniforms.uXRayOffset.value = plane.constant;
                 }
             }
-        });
+            });
+        } catch (_err) {
+            showWebGL2RequiredNotice();
+        }
 
-        currentRadius = sandbox.currentRadius;
-        applyQualityPoC4(sandbox.currentQuality);
-        setupRaymarcher(sandbox.scene);
+        window.__POC4_SETUP_RAYMARCHER__ = setupRaymarcher;
+        if (sandbox) {
+            currentRadius = sandbox.currentRadius;
+            applyQualityPoC4(sandbox.currentQuality);
+            const webgl2Ready = setupRaymarcher(sandbox.scene);
 
-        // Starter tunnel entrance + reinforced titanium wall showcase
-        createStarterTunnelPoC4();
-        sandbox.updateCellSizeLabel();
+            // Starter tunnel entrance + reinforced titanium wall showcase
+            if (webgl2Ready) {
+                createStarterTunnelPoC4();
+                sandbox.updateCellSizeLabel();
+            }
+        }
     </script>
 </body>
 </html>
